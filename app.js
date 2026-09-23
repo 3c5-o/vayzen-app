@@ -176,12 +176,13 @@ function renderHero(){
     const bits=[];
     if(x.release_year)bits.push("<span>"+esc(x.release_year)+"</span>");
     if(x.quality)bits.push("<span>"+esc(x.quality)+"</span>");
+    if(Number(x.rating)>0)bits.push("<span>★ "+Number(x.rating).toFixed(1)+"</span>");
     if(genreList(x)[0])bits.push("<span>"+esc(genreList(x)[0])+"</span>");
     if(Number(x.view_count)>0)bits.push("<span>"+Number(x.view_count).toLocaleString("ar-IQ")+" مشاهدة</span>");
     heroMeta.innerHTML=bits.join("");
   }
   $("#heroText").textContent=x.description||"شاهد التفاصيل واكتشف المزيد على VAYZEN.";
-  $("#heroMedia").style.backgroundImage=`url("${mediaUrl(type==="movie"?"movie_poster":"series_poster",x.id)}")`;
+  $("#heroMedia").style.backgroundImage=`url("${mediaUrl(type==="movie"?"movie_backdrop":"series_backdrop",x.id)}")`;
   $("#heroDetails").onclick=()=>openDetails(type,x.id);
   $("#heroPlay").onclick=()=>type==="movie"?openPlayer({type:"movie",id:x.id,title:x.title,publicId:x.public_id,quality:x.quality||"",src:mediaUrl("movie_video",x.id)}):openDetails(type,x.id);
 }
@@ -287,10 +288,11 @@ async function openDetails(type,id){
   const item=itemBy(type,id);if(!item)return;
   state.detail={type,id};
   const poster=mediaUrl(type==="movie"?"movie_poster":"series_poster",id);
+  const backdrop=mediaUrl(type==="movie"?"movie_backdrop":"series_backdrop",id);
   const genreTags=genreList(item).slice(0,4).map(g=>`<span class="tag">${esc(g)}</span>`).join("");
   $("#detailContent").innerHTML=`
     <div class="detail-hero">
-      <div class="detail-bg" style="background-image:url('${poster}')"></div>
+      <div class="detail-bg" style="background-image:url('${backdrop}')"></div>
       <div class="detail-summary">
         <div class="detail-poster"><img src="${poster}" alt=""></div>
         <div class="detail-copy">
@@ -301,6 +303,7 @@ async function openDetails(type,id){
             ${item.language?`<span>${esc(item.language)}</span>`:""}
             ${item.country?`<span>${esc(item.country)}</span>`:""}
             ${type==="movie"&&item.duration_minutes?`<span>${esc(item.duration_minutes)} دقيقة</span>`:""}
+            ${Number(item.rating)>0?`<span>★ ${Number(item.rating).toFixed(1)}/10${Number(item.rating_count)>0?" • "+Number(item.rating_count).toLocaleString("ar-IQ")+" تقييم":""}</span>`:""}
             ${Number(item.view_count)>0?`<span>${Number(item.view_count).toLocaleString("ar-IQ")} مشاهدة</span>`:""}
           </div>
           <p>${esc(item.description||"لا يوجد وصف متاح.")}</p>
