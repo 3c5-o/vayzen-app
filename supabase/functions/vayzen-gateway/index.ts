@@ -1,6 +1,9 @@
 import { createClient } from "npm:@supabase/supabase-js@2.95.0";
 
-const MAX_VIDEO_BYTES = 800 * 1024 * 1024;
+const MAX_VIDEO_MB = 2000;
+const MAX_VIDEO_BYTES = MAX_VIDEO_MB * 1024 * 1024;
+const COPY_RETRY_DELAYS_MS = [350, 1000, 2200] as const;
+const BATCH_RESUME_AFTER_MS = 120_000;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 function envMap(name:string){
   try{return JSON.parse(Deno.env.get(name) ?? "{}") as Record<string,string>;}catch{return {};}
@@ -518,7 +521,7 @@ async function showMenu(chatId:string|number,text="لوحة إدارة VAYZEN",a
 }
 
 async function getSession(userId:number){
-  const {data}=await db.from("bot_sessions").select("flow,step,draft")
+  const {data}=await db.from("bot_sessions").select("flow,step,draft,updated_at")
     .eq("telegram_user_id",userId).maybeSingle();
   return data??null;
 }
@@ -571,15 +574,81 @@ function sizeLabel(v:any){
   return n>=1024**3?`${(n/1024**3).toFixed(2)} GB`:`${(n/1024**2).toFixed(1)} MB`;
 }
 
-async function copyTo(key:string,fromChatId:number,messageId:number,caption:string){
+function videoLimitLabel(){return "2GB"}
+function validateVideoFile(file:any){
+  if(!file?.file_id)throw new Error("أرسل ملف فيديو صالح.");
+  const size=Number(file.file_size||0);
+  if(size>MAX_VIDEO_BYTES)throw new Error(`الفيديو أكبر من الحد الأقصى ${videoLimitLabel()}.`);
+  if(size<0)throw new Error("حجم ملف الفيديو غير صالح.");
+  return file;
+}
+function retryDelayForTelegram(err:any,attempt:number){
+  const text=err instanceof Error?err.message:String(err||"");
+  const m=text.match(/retry after\s+(\d+)/i);
+  if(m)return Math.min(10_000,Math.max(500,Number(m[1])*1000));
+  return COPY_RETRY_DELAYS_MS[Math.min(attempt-1,COPY_RETRY_DELAYS_MS.length-1)]||2200;
+}
+function sleep(ms:number){return new Promise(resolve=>setTimeout(resolve,ms))}
+async function transferJob(jobKey:string){
+  const {data}=await db.from("media_transfer_jobs")
+    .select("id,status,target_channel_id,target_message_id,attempts,max_attempts,last_error,updated_at")
+    .eq("job_key",jobKey).maybeSingle();
+  return data??null;
+}
+async function markTransferRolledBack(place:any){
+  if(!place?.channel_id||!place?.message_id)return;
+  try{
+    await db.from("media_transfer_jobs").update({
+      status:"rolled_back",updated_at:new Date().toISOString()
+    }).eq("target_channel_id",Number(place.channel_id)).eq("target_message_id",Number(place.message_id)).eq("status","completed");
+  }catch{}
+}
+
+async function copyTo(key:string,fromChatId:number,messageId:number,caption:string,fileSize?:number|null){
   const ch=await channel(key);
-  const r=await tg("copyMessage",{
-    chat_id:ch.telegram_channel_id,
-    from_chat_id:fromChatId,
-    message_id:messageId,
-    caption,
-  });
-  return {channel_id:Number(ch.telegram_channel_id),message_id:Number(r.message_id)};
+  const jobKey=await sha256Text(["copy",key,String(fromChatId),String(messageId),caption].join("|"));
+  const existing:any=await transferJob(jobKey);
+  if(existing?.status==="completed"&&existing.target_channel_id&&existing.target_message_id){
+    return {channel_id:Number(existing.target_channel_id),message_id:Number(existing.target_message_id),transfer_job_id:existing.id,reused:true};
+  }
+
+  const {data:job,error:jobError}=await db.from("media_transfer_jobs").upsert({
+    job_key:jobKey,operation:"copy_message",status:"pending",channel_key:key,
+    from_chat_id:fromChatId,source_message_id:messageId,
+    file_size:fileSize??null,max_attempts:COPY_RETRY_DELAYS_MS.length,
+    last_error:null
+  },{onConflict:"job_key"}).select("id,status,attempts,max_attempts").single();
+  if(jobError||!job)throw jobError??new Error("تعذر تجهيز عملية نقل الوسائط.");
+
+  let lastErr:any=null;
+  const maxAttempts=Math.max(1,Number(job.max_attempts||COPY_RETRY_DELAYS_MS.length));
+  for(let attempt=Math.max(1,Number(job.attempts||0)+1);attempt<=maxAttempts;attempt++){
+    await db.from("media_transfer_jobs").update({
+      status:"processing",attempts:attempt,started_at:new Date().toISOString(),last_error:null
+    }).eq("id",job.id);
+    try{
+      const r=await tg("copyMessage",{
+        chat_id:ch.telegram_channel_id,
+        from_chat_id:fromChatId,
+        message_id:messageId,
+        caption,
+      });
+      const place={channel_id:Number(ch.telegram_channel_id),message_id:Number(r.message_id),transfer_job_id:job.id};
+      await db.from("media_transfer_jobs").update({
+        status:"completed",target_channel_id:place.channel_id,target_message_id:place.message_id,
+        completed_at:new Date().toISOString(),last_error:null
+      }).eq("id",job.id);
+      return place;
+    }catch(err){
+      lastErr=err;
+      const message=err instanceof Error?err.message:String(err);
+      await db.from("media_transfer_jobs").update({
+        status:attempt>=maxAttempts?"failed":"pending",last_error:message.slice(0,500)
+      }).eq("id",job.id);
+      if(attempt<maxAttempts)await sleep(retryDelayForTelegram(err,attempt));
+    }
+  }
+  throw lastErr??new Error("فشل نقل ملف الوسائط بعد عدة محاولات.");
 }
 
 function normalizeVariant(value:any){
@@ -610,7 +679,10 @@ async function saveAsset(entity_type:string,entity_id:string,kind:string,file:an
 
 async function deleteCopiedMessage(place:any){
   if(!place?.channel_id||!place?.message_id)return;
-  try{await tg("deleteMessage",{chat_id:place.channel_id,message_id:place.message_id});}catch{}
+  try{
+    await tg("deleteMessage",{chat_id:place.channel_id,message_id:place.message_id});
+    await markTransferRolledBack(place);
+  }catch{}
 }
 
 async function cleanupEntity(entityType:"movie"|"series"|"episode",entityId:string,places:any[]=[]){
@@ -705,7 +777,7 @@ async function publishMovie(userId:number,chatId:number,d:any){
       await saveAsset("movie",movie.id,"backdrop",remote.file,remote.place);
     }
     for(const v of videos){
-      const place=await copyTo("movies_storage",chatId,v.source_message_id,`${movie.public_id} | ${d.title} | ${variantLabel(v.variant)} | ${sizeLabel(v.file?.file_size)}`);
+      const place=await copyTo("movies_storage",chatId,v.source_message_id,`${movie.public_id} | ${d.title} | ${variantLabel(v.variant)} | ${sizeLabel(v.file?.file_size)}`,v.file?.file_size);
       videoPlaces.push(place);
       await saveAsset("movie",movie.id,"video",v.file,place,v.variant);
     }
@@ -803,7 +875,7 @@ async function publishEpisode(userId:number,chatId:number,d:any){
   let assetWritten=false,seasonPromoted=false;
   try{
     place=await copyTo("series_storage",chatId,d.video_source_message_id,
-      `${ep.public_id} | ${series.title} | موسم ${d.season_number} | حلقة ${d.episode_number} | ${variantLabel(variant)}`);
+      `${ep.public_id} | ${series.title} | موسم ${d.season_number} | حلقة ${d.episode_number} | ${variantLabel(variant)}`,d.video?.file_size);
     await saveAsset("episode",ep.id,"video",d.video,place,variant);
     assetWritten=true;
     const {error:publishError}=await db.from("episodes").update({status:"published",quality:d.quality||variantLabel(variant),updated_at:new Date().toISOString()}).eq("id",ep.id);
@@ -879,7 +951,7 @@ async function replaceStoredAsset(opts:{
 }){
   const variant=normalizeVariant(opts.variant||"default");
   const oldAsset:any=await currentAsset(opts.entityType,opts.entityId,opts.kind,variant);
-  const place=await copyTo(opts.channelKey,opts.chatId,opts.sourceMessageId,opts.caption);
+  const place=await copyTo(opts.channelKey,opts.chatId,opts.sourceMessageId,opts.caption,opts.file?.file_size);
   try{
     await saveAsset(opts.entityType,opts.entityId,opts.kind,opts.file,place,variant);
   }catch(err){
