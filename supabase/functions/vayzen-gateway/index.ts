@@ -2,12 +2,16 @@ import { createClient } from "npm:@supabase/supabase-js@2.95.0";
 
 const MAX_VIDEO_BYTES = 500 * 1024 * 1024;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
-const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+function envMap(name:string){
+  try{return JSON.parse(Deno.env.get(name) ?? "{}") as Record<string,string>;}catch{return {};}
+}
+const secretMap = envMap("SUPABASE_SECRET_KEYS");
+const SERVICE_KEY = secretMap["default"] ?? Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const BOT_SECRET = Deno.env.get("TELEGRAM_BOT_SECRET") ?? "";
 const STREAM_GATEWAY = Deno.env.get("STREAM_GATEWAY") ?? "";
 const STREAM_SIGNING_SECRET = Deno.env.get("STREAM_SIGNING_SECRET") ?? "";
-const publishableMap = JSON.parse(Deno.env.get("SUPABASE_PUBLISHABLE_KEYS") ?? "{}");
+const publishableMap = envMap("SUPABASE_PUBLISHABLE_KEYS");
 const PUBLIC_KEY = publishableMap["default"] ?? "";
 
 const db = createClient(SUPABASE_URL, SERVICE_KEY, {
@@ -499,8 +503,7 @@ async function media(type:string,id:string,req?:Request){
     const exp=Math.floor(Date.now()/1000)+600;
     const payload=`${a.channel_id}:${a.channel_message_id}:${exp}`;
     const sig=await hmacHex(payload);
-    const origin=req?.headers.get("origin")||"";
-    const gatewayBase=origin&&/^https?:\/\//i.test(origin)?origin.replace(/\/$/,""):STREAM_GATEWAY;
+    const gatewayBase=STREAM_GATEWAY.replace(/\/$/,"");
     return Response.redirect(`${gatewayBase}/stream/${a.channel_id}/${a.channel_message_id}?exp=${exp}&sig=${sig}`,307);
   }
   if(!a.telegram_file_id) return json({error:"poster file id missing"},409);
