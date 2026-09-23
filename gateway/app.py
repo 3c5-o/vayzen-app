@@ -272,7 +272,8 @@ async def stream(channel_id: int, message_id: int, request: Request, exp: int, s
                                     timeout=STREAM_CHUNK_TIMEOUT,
                                 )
                             except StopAsyncIteration:
-                                remaining = 0
+                                if remaining > 0:
+                                    raise RuntimeError("Telegram stream ended before requested range completed")
                                 break
                             if not chunk:
                                 raise RuntimeError("Telegram returned an empty media chunk")
