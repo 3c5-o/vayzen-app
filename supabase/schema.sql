@@ -129,6 +129,8 @@ create table if not exists public.content_requests (
   title text not null check (char_length(btrim(title)) between 1 and 160),
   note text not null default '',
   status text not null default 'new' check (status in ('new','reviewing','added','rejected','duplicate')),
+  linked_entity_type text check (linked_entity_type is null or linked_entity_type in ('movie','series')),
+  linked_entity_id uuid,
   handled_by bigint,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -166,6 +168,15 @@ create table if not exists public.system_logs (
   message text not null,
   details jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now()
+);
+
+create table if not exists public.api_rate_limits (
+  key_hash text not null,
+  action text not null,
+  window_start bigint not null,
+  request_count integer not null default 0 check (request_count >= 0),
+  updated_at timestamptz not null default now(),
+  primary key (key_hash, action, window_start)
 );
 
 create table if not exists public.app_settings (
@@ -241,6 +252,7 @@ create index if not exists media_channel_message_idx on public.media_assets(chan
 create index if not exists media_entity_idx on public.media_assets(entity_type,entity_id);
 create index if not exists requests_status_created_idx on public.content_requests(status,created_at desc);
 create index if not exists reports_status_created_idx on public.reports(status,created_at desc);
+create index if not exists api_rate_limits_updated_idx on public.api_rate_limits(updated_at);
 
 alter table public.movies enable row level security;
 alter table public.series enable row level security;
@@ -255,6 +267,7 @@ alter table public.reports enable row level security;
 alter table public.admin_logs enable row level security;
 alter table public.system_logs enable row level security;
 alter table public.app_settings enable row level security;
+alter table public.api_rate_limits enable row level security;
 
 drop policy if exists "public read published movies" on public.movies;
 create policy "public read published movies" on public.movies
@@ -287,7 +300,7 @@ for select to anon,authenticated using (
 
 grant select on public.movies,public.series,public.seasons,public.episodes to anon,authenticated;
 revoke all on public.media_assets,public.telegram_channels,public.admin_users,public.bot_sessions,
-public.content_requests,public.reports,public.admin_logs,public.system_logs,public.app_settings
+public.content_requests,public.reports,public.admin_logs,public.system_logs,public.app_settings,public.api_rate_limits
 from anon,authenticated;
 
 
@@ -314,3 +327,39 @@ revoke all on function public.bump_view_count(text,uuid) from public;
 revoke all on function public.bump_view_count(text,uuid) from anon;
 revoke all on function public.bump_view_count(text,uuid) from authenticated;
 grant execute on function public.bump_view_count(text,uuid) to service_role;
+
+
+-- Production hardening and request linking
+alter table if exists public.profiles
+  add column if not exists is_disabled boolean not null default false;
+
+alter table public.content_requests
+  add column if not exists linked_entity_type text,
+  add column if not exists linked_entity_id uuid;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname='content_requests_linked_entity_type_check'
+      and conrelid='public.content_requests'::regclass
+  ) then
+    alter table public.content_requests
+      add constraint content_requests_linked_entity_type_check
+      check (linked_entity_type is null or linked_entity_type in ('movie','series'));
+  end if;
+end $$;
+
+insert into public.app_settings(key,value)
+values('app', jsonb_build_object('name','VAYZEN','version','1.0.0','max_video_mb',800))
+on conflict (key) do update
+set value=jsonb_set(public.app_settings.value,'{max_video_mb}','800'::jsonb,true), updated_at=now();
+
+insert into public.app_settings(key,value)
+values('limits', jsonb_build_object(
+  'max_video_mb',800,
+  'request_daily',5,
+  'report_hourly',10,
+  'view_window_minutes',15
+))
+on conflict (key) do update set value=excluded.value,updated_at=now();
