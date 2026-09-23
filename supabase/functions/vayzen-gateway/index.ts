@@ -381,8 +381,126 @@ function adminErrorText(err:any){
 async function contentByPublicId(type:string,publicId:string){
   const table=type==="movie"?"movies":type==="series"?"series":null;
   if(!table)return null;
-  const {data}=await db.from(table).select("id,public_id,title,status,is_featured,view_count,created_at").eq("public_id",publicId.toUpperCase()).maybeSingle();
+  const fields=type==="movie"
+    ?"id,public_id,title,original_title,description,release_year,genres,language,country,duration_minutes,quality,status,is_featured,view_count,created_at,updated_at"
+    :"id,public_id,title,original_title,description,release_year,genres,language,country,quality,status,is_featured,view_count,created_at,updated_at";
+  const {data}=await db.from(table).select(fields).eq("public_id",publicId.toUpperCase()).maybeSingle();
   return data??null;
+}
+
+async function episodeByPublicId(publicId:string){
+  const {data:ep}=await db.from("episodes")
+    .select("id,public_id,season_id,episode_number,title,description,duration_minutes,quality,status,view_count,created_at,updated_at")
+    .eq("public_id",publicId.toUpperCase()).maybeSingle();
+  if(!ep)return null;
+  const {data:season}=await db.from("seasons").select("id,series_id,season_number,title,status").eq("id",ep.season_id).maybeSingle();
+  const {data:series}=season?await db.from("series").select("id,public_id,title,status").eq("id",season.series_id).maybeSingle():{data:null};
+  return {...ep,season,series};
+}
+
+async function currentAsset(entityType:string,entityId:string,kind:string){
+  const {data}=await db.from("media_assets")
+    .select("channel_id,channel_message_id,telegram_file_id,file_size,mime_type")
+    .eq("entity_type",entityType).eq("entity_id",entityId).eq("kind",kind).eq("variant","default").maybeSingle();
+  return data??null;
+}
+
+async function replaceStoredAsset(opts:{
+  adminId:number;chatId:number;entityType:"movie"|"series"|"episode";entityId:string;publicId:string;
+  kind:"poster"|"video";channelKey:string;sourceMessageId:number;file:any;caption:string;
+}){
+  const oldAsset:any=await currentAsset(opts.entityType,opts.entityId,opts.kind);
+  const place=await copyTo(opts.channelKey,opts.chatId,opts.sourceMessageId,opts.caption);
+  try{
+    await saveAsset(opts.entityType,opts.entityId,opts.kind,opts.file,place);
+  }catch(err){
+    await deleteCopiedMessage(place);
+    throw err;
+  }
+  if(oldAsset?.channel_id&&oldAsset?.channel_message_id){
+    await deleteCopiedMessage({channel_id:oldAsset.channel_id,message_id:oldAsset.channel_message_id});
+  }
+  await adminLog(opts.adminId,"asset_replace",opts.entityType,opts.entityId,opts.publicId,{kind:opts.kind});
+}
+
+async function sendContentEditMenu(chatId:number,type:string,publicId:string){
+  const item:any=await contentByPublicId(type,publicId);
+  if(!item)return sendContentManager(chatId);
+  const rows:any[]=[
+    [{text:"الاسم",callback_data:`cef|${type}|${item.public_id}|title`},{text:"الوصف",callback_data:`cef|${type}|${item.public_id}|description`}],
+    [{text:"السنة",callback_data:`cef|${type}|${item.public_id}|release_year`},{text:"التصنيفات",callback_data:`cef|${type}|${item.public_id}|genres`}],
+    [{text:"اللغة",callback_data:`cef|${type}|${item.public_id}|language`},{text:"الدولة",callback_data:`cef|${type}|${item.public_id}|country`}],
+    [{text:"الجودة",callback_data:`cef|${type}|${item.public_id}|quality`}],
+  ];
+  if(type==="movie")rows.push([{text:"المدة",callback_data:`cef|${type}|${item.public_id}|duration_minutes`}]);
+  rows.push([{text:"رجوع",callback_data:`cm|${type}|${item.public_id}`}]);
+  return send(chatId,`تعديل ${item.public_id}\nاختر الحقل المطلوب:`,{inline_keyboard:rows});
+}
+
+async function sendSeriesEpisodes(chatId:number,seriesPublicId:string){
+  const series:any=await contentByPublicId("series",seriesPublicId);
+  if(!series)return sendContentManager(chatId);
+  const {data:seasons}=await db.from("seasons").select("id,season_number,title,status").eq("series_id",series.id).order("season_number",{ascending:true});
+  const rows:any[]=[];
+  let text=`${series.public_id} | ${series.title}\n\n`;
+  for(const season of seasons??[]){
+    const {data:eps}=await db.from("episodes").select("public_id,episode_number,title,status").eq("season_id",season.id).order("episode_number",{ascending:true});
+    text+=`الموسم ${season.season_number}: ${(eps??[]).length} حلقة\n`;
+    for(const ep of (eps??[]).slice(0,12)){
+      rows.push([{text:`${ep.status==="published"?"●":"○"} S${season.season_number} E${ep.episode_number} | ${String(ep.title||"").slice(0,24)}`,callback_data:`epi|${ep.public_id}`}]);
+    }
+  }
+  if(!rows.length)text+="لا توجد حلقات منشورة أو مخفية بعد.";
+  rows.push([{text:"إضافة حلقة",callback_data:"add_episode"},{text:"رجوع",callback_data:`cm|series|${series.public_id}`}]);
+  return send(chatId,text,{inline_keyboard:rows});
+}
+
+async function sendEpisodeItem(chatId:number,publicId:string){
+  const ep:any=await episodeByPublicId(publicId);
+  if(!ep)return send(chatId,"الحلقة غير موجودة.",{inline_keyboard:[[{text:"رجوع",callback_data:"content"}]]});
+  const nextStatus=ep.status==="published"?"hidden":"published";
+  const rows:any[]=[
+    [{text:nextStatus==="published"?"نشر الحلقة":"إخفاء الحلقة",callback_data:`eps|${ep.public_id}|${nextStatus}`}],
+    [{text:"تعديل الاسم",callback_data:`epe|${ep.public_id}|title`},{text:"تعديل الوصف",callback_data:`epe|${ep.public_id}|description`}],
+    [{text:"تعديل الجودة",callback_data:`epe|${ep.public_id}|quality`},{text:"استبدال الفيديو",callback_data:`epv|${ep.public_id}`}],
+    [{text:"حذف الحلقة",callback_data:`epd1|${ep.public_id}`}],
+    [{text:"رجوع للحلقات",callback_data:`se|${ep.series?.public_id||""}`}],
+  ];
+  return send(chatId,
+    `${ep.public_id}\n${ep.series?.title||"مسلسل"} • موسم ${ep.season?.season_number||"—"} • حلقة ${ep.episode_number}\n\nالعنوان: ${ep.title||"—"}\nالحالة: ${ep.status}\nالجودة: ${ep.quality||"—"}\nالمشاهدات: ${ep.view_count||0}`,
+    {inline_keyboard:rows}
+  );
+}
+
+async function sendUsersManager(chatId:number){
+  const {data,error}=await db.auth.admin.listUsers({page:1,perPage:8});
+  if(error)throw error;
+  const users=data?.users??[];
+  const ids=users.map((u:any)=>u.id);
+  const {data:profiles}=ids.length?await db.from("profiles").select("id,display_name,is_disabled,created_at").in("id",ids):{data:[] as any[]};
+  const map=new Map((profiles??[]).map((p:any)=>[p.id,p]));
+  const rows=users.map((u:any)=>{
+    const p:any=map.get(u.id);
+    const label=(p?.display_name||u.email||"مستخدم").slice(0,28);
+    return [{text:`${p?.is_disabled?"⛔":"●"} ${label}`,callback_data:`usr|${u.id}`}];
+  });
+  rows.push([{text:"رجوع للقائمة",callback_data:"menu"}]);
+  return send(chatId,`المستخدمون\n\nآخر ${users.length} حسابات:`,{inline_keyboard:rows});
+}
+
+async function sendUserItem(chatId:number,userId:string){
+  const {data,error}=await db.auth.admin.getUserById(userId);
+  if(error||!data?.user)return sendUsersManager(chatId);
+  const u:any=data.user;
+  const {data:p}=await db.from("profiles").select("display_name,is_disabled,created_at").eq("id",userId).maybeSingle();
+  const disabled=Boolean(p?.is_disabled);
+  return send(chatId,
+    `${p?.display_name||"مستخدم VAYZEN"}\n${u.email||"—"}\n\nالتسجيل: ${String(p?.created_at||u.created_at||"—").slice(0,19)}\nالحالة: ${disabled?"معطّل":"نشط"}`,
+    {inline_keyboard:[
+      [{text:disabled?"إعادة تفعيل الحساب":"تعطيل الحساب",callback_data:`usb|${userId}|${disabled?"0":"1"}`}],
+      [{text:"رجوع",callback_data:"users"}],
+    ]}
+  );
 }
 
 async function sendContentManager(chatId:number){
