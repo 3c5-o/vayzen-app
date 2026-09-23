@@ -2499,14 +2499,14 @@ function qualityRank(v:string){
 async function asset(type:string,id:string,variant="default"){
   if(!/^[0-9a-f-]{36}$/i.test(id)) return null;
   let entity_type="",kind="";
-  if(type==="movie_poster"||type==="movie_video"){
+  if(type==="movie_poster"||type==="movie_video"||type==="movie_backdrop"){
     const {data}=await db.from("movies").select("status").eq("id",id).maybeSingle();
     if(data?.status!=="published") return null;
-    entity_type="movie";kind=type==="movie_poster"?"poster":"video";
-  }else if(type==="series_poster"){
+    entity_type="movie";kind=type==="movie_poster"?"poster":type==="movie_backdrop"?"backdrop":"video";
+  }else if(type==="series_poster"||type==="series_backdrop"){
     const {data}=await db.from("series").select("status").eq("id",id).maybeSingle();
     if(data?.status!=="published") return null;
-    entity_type="series";kind="poster";
+    entity_type="series";kind=type==="series_backdrop"?"backdrop":"poster";
   }else if(type==="episode_video"){
     const {data:e}=await db.from("episodes").select("season_id,status").eq("id",id).maybeSingle();
     if(e?.status!=="published") return null;
@@ -2522,6 +2522,12 @@ async function asset(type:string,id:string,variant="default"){
     .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_size,variant")
     .eq("entity_type",entity_type).eq("entity_id",id).eq("kind",kind).eq("variant",requested).maybeSingle();
   if(direct)return direct;
+  if(kind==="backdrop"){
+    const {data:fallback}=await db.from("media_assets")
+      .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_size,variant")
+      .eq("entity_type",entity_type).eq("entity_id",id).eq("kind","poster").eq("variant","default").maybeSingle();
+    return fallback??null;
+  }
   if(kind!=="video"||requested!=="default")return null;
   const {data:list}=await db.from("media_assets")
     .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_size,variant")
@@ -2690,8 +2696,8 @@ async function recordView(req:Request){
 
 async function catalog(){
   const [m,s]=await Promise.all([
-    db.from("movies").select("id,public_id,title,original_title,description,release_year,genres,language,country,duration_minutes,quality,is_featured,view_count,created_at").eq("status","published").order("created_at",{ascending:false}),
-    db.from("series").select("id,public_id,title,original_title,description,release_year,genres,language,country,quality,is_featured,view_count,created_at").eq("status","published").order("created_at",{ascending:false})
+    db.from("movies").select("id,public_id,title,original_title,description,release_year,genres,language,country,duration_minutes,quality,is_featured,view_count,rating,rating_count,created_at").eq("status","published").order("created_at",{ascending:false}),
+    db.from("series").select("id,public_id,title,original_title,description,release_year,genres,language,country,quality,is_featured,view_count,rating,rating_count,created_at").eq("status","published").order("created_at",{ascending:false})
   ]);
   if(m.error)throw m.error;if(s.error)throw s.error;
   return json({ok:true,movies:m.data??[],series:s.data??[]});
@@ -2704,7 +2710,7 @@ async function seriesContent(url:URL){
   if(error)throw error;
   const out=[];
   for(const season of seasons??[]){
-    const {data:episodes,error:e}=await db.from("episodes").select("id,public_id,episode_number,title,description,duration_minutes,quality").eq("season_id",season.id).eq("status","published").order("episode_number",{ascending:true});
+    const {data:episodes,error:e}=await db.from("episodes").select("id,public_id,episode_number,title,description,duration_minutes,quality,rating,rating_count").eq("season_id",season.id).eq("status","published").order("episode_number",{ascending:true});
     if(e)throw e;
     out.push({...season,episodes:episodes??[]});
   }
