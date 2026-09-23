@@ -4,6 +4,7 @@ const MAX_VIDEO_MB = 2000;
 const MAX_VIDEO_BYTES = MAX_VIDEO_MB * 1024 * 1024;
 const COPY_RETRY_DELAYS_MS = [350, 1000, 2200] as const;
 const BATCH_RESUME_AFTER_MS = 120_000;
+const STREAM_LINK_TTL_SECONDS = 6 * 60 * 60;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 function envMap(name:string){
   try{return JSON.parse(Deno.env.get(name) ?? "{}") as Record<string,string>;}catch{return {};}
@@ -2929,7 +2930,7 @@ async function media(type:string,id:string,req?:Request){
     const gatewayBase=await streamGateway();
     if(!gatewayBase||!signingSecret) return json({error:"streaming gateway not configured"},503);
     if(a.file_size&&Number(a.file_size)>MAX_VIDEO_BYTES) return json({error:"file exceeds current 2GB limit"},413);
-    const exp=Math.floor(Date.now()/1000)+600;
+    const exp=Math.floor(Date.now()/1000)+STREAM_LINK_TTL_SECONDS;
     const payload=`${a.channel_id}:${a.channel_message_id}:${exp}`;
     const sig=await hmacHex(payload,signingSecret);
     return Response.redirect(`${gatewayBase}/stream/${a.channel_id}/${a.channel_message_id}?exp=${exp}&sig=${sig}`,307);
