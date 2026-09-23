@@ -47,9 +47,26 @@ function requestKey(){return state.user?.id||deviceKey()}
 
 async function rawApi(action,{method="GET",body=null,auth=false,params={},retry=true}={}){
   const q=new URLSearchParams({action,...params});
-  const headers={"Content-Type":"application/json"};
+  const headers={};
+  if(body!==null)headers["Content-Type"]="application/json";
   if(auth&&state.session?.access_token)headers.Authorization="Bearer "+state.session.access_token;
-  const r=await fetch(API+"?"+q.toString(),{method,headers,body:body?JSON.stringify(body):undefined,cache:"no-store"});
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),15000);
+  let r;
+  try{
+    r=await fetch(API+"?"+q.toString(),{
+      method,
+      headers,
+      body:body!==null?JSON.stringify(body):undefined,
+      cache:"no-store",
+      signal:controller.signal
+    });
+  }catch(err){
+    if(err?.name==="AbortError")throw new Error("انتهت مهلة الاتصال");
+    throw new Error("تعذر الاتصال بالخدمة");
+  }finally{
+    clearTimeout(timer);
+  }
   if(r.status===401&&auth&&retry&&state.session?.refresh_token){
     const ok=await refreshSession();
     if(ok)return rawApi(action,{method,body,auth,params,retry:false});
@@ -402,10 +419,15 @@ $("#autoplayNext").onchange=e=>{state.prefs.autoplayNext=e.target.checked;savePr
 $("#saveProgress").onchange=e=>{state.prefs.saveProgress=e.target.checked;savePrefs()};
 
 async function boot(){
-  loadPrefs();loadSession();
-  await loadCatalog();
-  await loadUserState();
-  setTimeout(()=>$("#splash").classList.add("hide"),850);
+  const splashTimer=setTimeout(()=>$("#splash")?.classList.add("hide"),900);
+  try{
+    loadPrefs();loadSession();
+    await loadCatalog();
+    await loadUserState();
+  }finally{
+    clearTimeout(splashTimer);
+    setTimeout(()=>$("#splash")?.classList.add("hide"),250);
+  }
 }
 window.addEventListener("online",()=>showToast("عاد الاتصال"));
 window.addEventListener("offline",()=>showToast("لا يوجد اتصال بالإنترنت"));
