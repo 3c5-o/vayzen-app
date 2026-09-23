@@ -130,6 +130,11 @@ function renderCatalog(){
 
   $("#latestMovies").innerHTML=state.movies.slice(0,10).map(x=>card(x,"movie",{compact:true})).join("")||'<div class="empty-card">لا توجد أفلام بعد.</div>';
   $("#latestSeries").innerHTML=state.series.slice(0,10).map(x=>card(x,"series",{compact:true})).join("")||'<div class="empty-card">لا توجد مسلسلات بعد.</div>';
+  const trending=[
+    ...state.movies.map(item=>({item,type:"movie"})),
+    ...state.series.map(item=>({item,type:"series"}))
+  ].sort((a,b)=>(Number(b.item.view_count)||0)-(Number(a.item.view_count)||0)||new Date(b.item.created_at)-new Date(a.item.created_at)).slice(0,10);
+  $("#trendingRail").innerHTML=trending.length?trending.map(x=>card(x.item,x.type,{compact:true})).join(""):'<div class="empty-card">يظهر الأكثر مشاهدة بعد بدء المشاهدات.</div>';
   $("#moviesGrid").innerHTML=movies.map(x=>card(x,"movie")).join("")||'<div class="empty-state">لا توجد نتائج مطابقة.</div>';
   $("#seriesGrid").innerHTML=series.map(x=>card(x,"series")).join("")||'<div class="empty-state">لا توجد نتائج مطابقة.</div>';
 
