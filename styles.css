@@ -1213,3 +1213,56 @@ body::before{
   .splash::before,.splash-ambient,.splash-ring,.splash-loader span,.hero-autoplay-progress span.running{animation:none!important}
   .hero-media,.hero-body{transition:none!important}
 }
+
+
+/* VAYZEN Release 1.0 — watch history / subtitles / episode state */
+.history-section{padding:4px 0 28px}
+.history-list{display:grid;gap:9px;padding:0 14px}
+.history-row{
+  display:flex;align-items:center;gap:10px;min-height:84px;padding:8px;
+  background:linear-gradient(145deg,#111217,#0b0c0f);border:1px solid var(--vz-line);
+  border-radius:14px;cursor:pointer;transition:transform .18s ease,border-color .18s ease
+}
+.history-row:active{transform:scale(.993);border-color:rgba(239,24,37,.28)}
+.history-thumb{
+  width:58px;height:78px;flex:0 0 auto;border-radius:9px;overflow:hidden;position:relative;
+  background:#15161b center/cover no-repeat;border:1px solid rgba(255,255,255,.07)
+}
+.history-thumb.episode{width:112px;height:68px}
+.history-thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.history-thumb::after{content:"";position:absolute;inset:0;background:linear-gradient(0deg,rgba(0,0,0,.5),transparent 60%)}
+.history-play{
+  position:absolute;z-index:2;left:50%;top:50%;transform:translate(-50%,-50%);
+  width:29px;height:29px;border-radius:50%;display:grid;place-items:center;
+  background:rgba(5,5,7,.72);border:1px solid rgba(255,255,255,.17)
+}
+.history-play svg{width:13px;height:13px;fill:#fff;stroke:#fff}
+.history-copy{flex:1;min-width:0}
+.history-copy b{display:block;font-size:10.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.history-copy small{display:block;color:#8e8f97;font-size:7.7px;margin-top:5px}
+.history-progress{height:3px;margin-top:8px;border-radius:99px;background:#28292f;overflow:hidden}
+.history-progress i{display:block;height:100%;background:linear-gradient(90deg,var(--vz-red),#ff5360)}
+.history-state{
+  flex:0 0 auto;padding:5px 7px;border-radius:7px;font-size:7px;font-weight:850;
+  color:#ff8a90;background:rgba(239,24,37,.1);border:1px solid rgba(239,24,37,.16)
+}
+.history-state.done{color:#9ee3b2;background:rgba(38,178,88,.09);border-color:rgba(38,178,88,.17)}
+.episode-watch-state{
+  flex:0 0 auto;white-space:nowrap;padding:4px 6px;border-radius:7px;
+  font-size:6.8px;font-weight:850;color:#8f9098;background:#17181d;border:1px solid rgba(255,255,255,.06)
+}
+.episode-watch-state.progress{color:#ffc66b;background:rgba(255,174,48,.08);border-color:rgba(255,174,48,.15)}
+.episode-watch-state.completed{color:#8be5a5;background:rgba(43,190,92,.08);border-color:rgba(43,190,92,.15)}
+.episode-row.watched{opacity:.82}
+.episode-row.watching{border-color:rgba(255,174,48,.14)}
+#subtitleSelect{max-width:150px}
+#subtitleSelect.hidden{display:none!important}
+
+@media (min-width:700px){
+  .history-list{padding-left:28px;padding-right:28px;grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media (max-width:420px){
+  .history-thumb.episode{width:92px;height:60px}
+  .history-state{display:none}
+  .episode-watch-state{font-size:6px;padding:4px 5px}
+}
