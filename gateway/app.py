@@ -22,6 +22,7 @@ if not VAYZEN_API_TARGET and SUPABASE_URL:
     VAYZEN_API_TARGET = f"{SUPABASE_URL}/functions/v1/vayzen-gateway"
 MAX_CONCURRENT_STREAMS = max(1, int(os.environ.get("MAX_CONCURRENT_STREAMS", "6")))
 CHUNK_SIZE = 512 * 1024
+MAX_RANGE_WINDOW = max(4, int(os.environ.get("MAX_RANGE_WINDOW_MB", "32"))) * 1024 * 1024
 
 client = TelegramClient(None, API_ID, API_HASH)
 channel_cache = {}
@@ -64,7 +65,10 @@ app.add_middleware(
 
 def parse_range(value: str | None, total: int):
     if not value:
-        return 0, total - 1, False
+        start = 0
+        end = min(total - 1, MAX_RANGE_WINDOW - 1)
+        return start, end, end < total - 1
+
     match = re.fullmatch(r"bytes=(\d*)-(\d*)", value.strip())
     if not match:
         raise HTTPException(status_code=416, detail="Invalid Range header")
@@ -73,14 +77,17 @@ def parse_range(value: str | None, total: int):
         suffix = int(last or "0")
         if suffix <= 0:
             raise HTTPException(status_code=416, detail="Invalid Range header")
+        suffix = min(suffix, MAX_RANGE_WINDOW)
         start = max(total - suffix, 0)
         end = total - 1
     else:
         start = int(first)
-        end = int(last) if last else total - 1
+        requested_end = int(last) if last else total - 1
+        end = min(requested_end, total - 1, start + MAX_RANGE_WINDOW - 1)
+
     if start < 0 or start >= total or end < start:
         raise HTTPException(status_code=416, detail="Range not satisfiable")
-    return start, min(end, total - 1), True
+    return start, end, True
 
 
 def verify_signature(channel_id: int, message_id: int, exp: int, sig: str):
@@ -198,6 +205,7 @@ async def health():
         "storage": "telegram",
         "range_streaming": True,
         "chunk_size_kb": CHUNK_SIZE // 1024,
+        "range_window_mb": MAX_RANGE_WINDOW // (1024 * 1024),
         "max_concurrent_streams": MAX_CONCURRENT_STREAMS,
         "signed_streams": bool(STREAM_SIGNING_SECRET),
         "cached_channels": len(channel_cache),
@@ -208,7 +216,11 @@ async def health():
 async def stream(channel_id: int, message_id: int, request: Request, exp: int, sig: str):
     verify_signature(channel_id, message_id, exp, sig)
     message, total, mime, name = await get_media(channel_id, message_id)
-    start, end, partial = parse_range(request.headers.get("range"), total)
+    range_header = request.headers.get("range")
+    if request.method == "HEAD" and not range_header:
+        start, end, partial = 0, total - 1, False
+    else:
+        start, end, partial = parse_range(range_header, total)
     length = end - start + 1
     headers = {
         "Accept-Ranges": "bytes",
