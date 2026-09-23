@@ -261,7 +261,10 @@ function botUiIconKey(button:TelegramInlineButton):BotUiIconKey|undefined{
   if(a==="stats")return "stats";
   if(a==="admins"||a.startsWith("adm"))return "admin";
   if(a==="admin_logs")return "content";
-  if(a==="system_status"||a==="bot_ui_settings"||a==="bot_ui_setup")return "settings";
+  if(a==="system_status"||a==="bot_ui_settings"||a==="bot_ui_setup"||a==="backups"||a==="backup_create")return "settings";
+  if(a==="jobs"||a.startsWith("job|")||a.startsWith("job_retry|"))return "content";
+  if(a==="trash"||a.startsWith("trash_"))return "delete";
+  if(a==="health"||a==="health_run"||a==="alerts"||a==="ops_run")return "report";
   if(a==="tmdb_settings"||a.startsWith("tmdb_")||a.startsWith("content_search")||a==="user_search"||t.includes("بحث"))return "search";
   if(a==="content"||a==="content_movies"||a==="content_series"||a.startsWith("cm|"))return "content";
   if(a.startsWith("q|")||a.startsWith("qa|")||a.startsWith("qv|")||a.startsWith("qr|")||t.includes("الجودات")||t.includes("الجودة"))return "quality";
@@ -277,7 +280,7 @@ function botUiButtonStyle(button:TelegramInlineButton):"primary"|"success"|"dang
   const t=String(button.text||"");
   if(a==="cancel"||a.includes("del")||a.startsWith("cd")||a.startsWith("sd")||a.startsWith("qd")||a.startsWith("epd")||a.includes("|rejected")||t.includes("حذف")||t.includes("رفض")||t.includes("تعطيل"))return "danger";
   if(a.startsWith("confirm")||a.includes("|published")||a.includes("|resolved")||a==="tmdb_token_test"||t.includes("نشر")||t.includes("استخدام هذه النتيجة")||t.includes("تم الحل")||t.includes("إعادة التفعيل"))return "success";
-  if(a==="add_movie"||a==="add_series"||a==="batch_episode"||a==="add_episode"||a==="content"||a==="requests"||a==="reports"||a==="users"||a==="stats"||a==="admins"||a==="system_status"||a==="tmdb_settings"||a==="bot_ui_settings"||a.startsWith("content_")||a==="user_search")return "primary";
+  if(a==="add_movie"||a==="add_series"||a==="batch_episode"||a==="add_episode"||a==="content"||a==="requests"||a==="reports"||a==="users"||a==="stats"||a==="admins"||a==="system_status"||a==="tmdb_settings"||a==="bot_ui_settings"||a==="jobs"||a==="health"||a==="alerts"||a==="backups"||a.startsWith("content_")||a==="user_search")return "primary";
   return undefined;
 }
 async function decorateInlineKeyboard(markup?:unknown){
@@ -508,8 +511,19 @@ function menuFor(admin:Admin){
     if(can(admin,"system"))row.push({text:"حالة النظام",callback_data:"system_status"});
     if(row.length)rows.push(row);
   }
+  if(can(admin,"system")||can(admin,"delete_content")){
+    const row:any[]=[];
+    if(can(admin,"system"))row.push({text:"عمليات الوسائط",callback_data:"jobs"});
+    if(can(admin,"delete_content"))row.push({text:"سلة المحذوفات",callback_data:"trash"});
+    if(row.length)rows.push(row);
+  }
+  if(can(admin,"system")){
+    rows.push([{text:"فحص الوسائط",callback_data:"health"},{text:"تنبيهات التشغيل",callback_data:"alerts"}]);
+  }
   if(can(admin,"logs"))rows.push([{text:"سجل الإدارة",callback_data:"admin_logs"}]);
-  if(admin.role==="owner")rows.push([{text:"هوية أزرار VAYZEN",callback_data:"bot_ui_settings"}]);
+  if(admin.role==="owner"){
+    rows.push([{text:"Backup البيانات",callback_data:"backups"},{text:"هوية أزرار VAYZEN",callback_data:"bot_ui_settings"}]);
+  }
   rows.push([{text:"إلغاء العملية",callback_data:"cancel"}]);
   return {inline_keyboard:rows};
 }
@@ -976,15 +990,15 @@ async function contentByPublicId(type:string,publicId:string){
   const table=type==="movie"?"movies":type==="series"?"series":null;
   if(!table)return null;
   const fields=type==="movie"
-    ?"id,public_id,title,original_title,description,release_year,genres,language,country,duration_minutes,quality,status,is_featured,view_count,external_source,external_id,rating,rating_count,release_date,created_at,updated_at"
-    :"id,public_id,title,original_title,description,release_year,genres,language,country,quality,status,is_featured,view_count,external_source,external_id,rating,rating_count,first_air_date,created_at,updated_at";
+    ?"id,public_id,title,original_title,description,release_year,genres,language,country,duration_minutes,quality,status,is_featured,view_count,external_source,external_id,rating,rating_count,release_date,deleted_at,deleted_by,deleted_previous_status,created_at,updated_at"
+    :"id,public_id,title,original_title,description,release_year,genres,language,country,quality,status,is_featured,view_count,external_source,external_id,rating,rating_count,first_air_date,deleted_at,deleted_by,deleted_previous_status,created_at,updated_at";
   const {data}=await db.from(table).select(fields).eq("public_id",publicId.toUpperCase()).maybeSingle();
   return data??null;
 }
 
 async function episodeByPublicId(publicId:string){
   const {data:ep}=await db.from("episodes")
-    .select("id,public_id,season_id,episode_number,title,description,duration_minutes,quality,status,view_count,created_at,updated_at")
+    .select("id,public_id,season_id,episode_number,title,description,duration_minutes,quality,status,view_count,deleted_at,deleted_by,deleted_previous_status,created_at,updated_at")
     .eq("public_id",publicId.toUpperCase()).maybeSingle();
   if(!ep)return null;
   const {data:season}=await db.from("seasons").select("id,series_id,season_number,title,status").eq("id",ep.season_id).maybeSingle();
@@ -2702,8 +2716,8 @@ async function callback(q:any){
   if(a.startsWith("epd1|")){
     if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,id]=a.split("|");
-    return send(chatId,`تأكيد حذف الحلقة ${id}؟`,{inline_keyboard:[
-      [{text:"تأكيد الحذف",callback_data:`epd2|${id}`}],
+    return send(chatId,`نقل الحلقة ${id} إلى سلة المحذوفات؟`,{inline_keyboard:[
+      [{text:"نقل إلى السلة",callback_data:`epd2|${id}`}],
       [{text:"تراجع",callback_data:`epi|${id}`}],
     ]});
   }
@@ -2711,11 +2725,7 @@ async function callback(q:any){
     if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,id]=a.split("|");
     const ep:any=await episodeByPublicId(id);if(!ep)return send(chatId,"الحلقة غير موجودة.");
-    const {data:assets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","episode").eq("entity_id",ep.id);
-    for(const x of assets??[])await deleteCopiedMessage({channel_id:x.channel_id,message_id:x.channel_message_id});
-    await db.from("media_assets").delete().eq("entity_type","episode").eq("entity_id",ep.id);
-    const {error}=await db.from("episodes").delete().eq("id",ep.id);if(error)throw error;
-    await adminLog(userId,"episode_delete","episode",ep.id,ep.public_id,{});
+    await softDeleteEpisode(userId,id);
     return ep.series?.public_id?sendSeriesEpisodes(chatId,ep.series.public_id):sendContentManager(chatId);
   }
   if(a.startsWith("cs|")){
@@ -2743,15 +2753,15 @@ async function callback(q:any){
   if(a.startsWith("cd1|")){
     if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,type,id]=a.split("|");
-    return send(chatId,`تأكيد حذف ${id}؟ الحذف يزيله من التطبيق ومن تخزين البوت قدر الإمكان.`,{inline_keyboard:[
-      [{text:"تأكيد الحذف",callback_data:`cd2|${type}|${id}`}],
+    return send(chatId,`نقل ${id} إلى سلة المحذوفات؟ يمكن استرجاعه لمدة 14 يومًا.`,{inline_keyboard:[
+      [{text:"نقل إلى السلة",callback_data:`cd2|${type}|${id}`}],
       [{text:"تراجع",callback_data:`cm|${type}|${id}`}],
     ]});
   }
   if(a.startsWith("cd2|")){
     if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,type,id]=a.split("|");
-    await deleteContent(userId,type,id);
+    await softDeleteContent(userId,type,id);
     return sendContentManager(chatId);
   }
 
@@ -2768,6 +2778,79 @@ async function callback(q:any){
     }catch(err){
       return send(chatId,adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:"admins"}]]});
     }
+  }
+
+  if(a==="jobs"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة عمليات الوسائط.");
+    return sendJobCenter(chatId);
+  }
+  if(a.startsWith("job|")){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة عمليات الوسائط.");
+    const [,id]=a.split("|");return sendJobItem(chatId,id);
+  }
+  if(a.startsWith("job_retry|")){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية إعادة المحاولة.");
+    const [,id]=a.split("|");
+    try{await retryMediaTransferJob(userId,id);return sendJobItem(chatId,id)}
+    catch(err){return send(chatId,`تعذر إعادة العملية.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"رجوع",callback_data:"jobs"}]]})}
+  }
+  if(a==="trash"){
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية سلة المحذوفات.");
+    return sendTrashManager(chatId,admin);
+  }
+  if(a.startsWith("trash_restore|")){
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية الاسترجاع.");
+    const [,type,id]=a.split("|");
+    try{await restoreTrashItem(userId,type,id);return sendTrashManager(chatId,admin)}
+    catch(err){return send(chatId,adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:"trash"}]]})}
+  }
+  if(a.startsWith("trash_purge1|")){
+    if(admin.role!=="owner")return send(chatId,"الحذف النهائي متاح للمالك فقط.");
+    const [,type,id]=a.split("|");
+    return send(chatId,"هذا الحذف نهائي وسيزيل الملفات من Telegram قدر الإمكان. تأكيد؟",{inline_keyboard:[
+      [{text:"حذف نهائي",callback_data:`trash_purge2|${type}|${id}`}],
+      [{text:"تراجع",callback_data:"trash"}]
+    ]});
+  }
+  if(a.startsWith("trash_purge2|")){
+    if(admin.role!=="owner")return send(chatId,"الحذف النهائي متاح للمالك فقط.");
+    const [,type,id]=a.split("|");
+    try{await purgeContentPermanent(userId,type,id);return sendTrashManager(chatId,admin)}
+    catch(err){return send(chatId,adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:"trash"}]]})}
+  }
+  if(a==="health"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية فحص الوسائط.");
+    return sendMediaHealthManager(chatId);
+  }
+  if(a==="health_run"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية فحص الوسائط.");
+    await send(chatId,"جاري فحص مكتبة الوسائط وTelegram Gateway...");
+    try{
+      const r=await runMediaHealthCheck(userId);
+      await runOperationalCheck();
+      await send(chatId,`اكتمل الفحص.\n\nتم فحصه: ${r.checked}\nسليم: ${r.healthy}\nتحذير: ${r.warnings}\nمشاكل: ${r.broken}`);
+      return sendMediaHealthManager(chatId);
+    }catch(err){return send(chatId,`فشل الفحص.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"رجوع",callback_data:"health"}]]})}
+  }
+  if(a==="alerts"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية التنبيهات.");
+    return sendAlertsManager(chatId);
+  }
+  if(a==="ops_run"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية الفحص التشغيلي.");
+    await runOperationalCheck();return sendAlertsManager(chatId);
+  }
+  if(a==="backups"){
+    if(admin.role!=="owner")return send(chatId,"النسخ الاحتياطية متاحة للمالك فقط.");
+    return sendBackupManager(chatId);
+  }
+  if(a==="backup_create"){
+    if(admin.role!=="owner")return send(chatId,"النسخ الاحتياطية متاحة للمالك فقط.");
+    await send(chatId,"جاري إنشاء Backup للبيانات وإرساله كملف JSON...");
+    try{
+      const b=await createMetadataBackup(userId,chatId);
+      return send(chatId,`تم إنشاء النسخة الاحتياطية.\n${b.code}\nالحجم: ${sizeLabel(b.size)}\nSHA256: ${b.checksum.slice(0,20)}…`,{inline_keyboard:[[{text:"رجوع للنسخ",callback_data:"backups"}]]});
+    }catch(err){return send(chatId,`فشل إنشاء النسخة.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"رجوع",callback_data:"backups"}]]})}
   }
 
   if(a==="admins"){
