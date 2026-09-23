@@ -1478,6 +1478,56 @@ async function callback(q:any){
     await setSession(userId,"tmdb_search","query",{type:"series"});
     return send(chatId,"أرسل اسم المسلسل للبحث في TMDb.");
   }
+  if(a.startsWith("tmdb_again|")){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
+    const [,short]=a.split("|");const type=short==="s"?"series":"movie";
+    await setSession(userId,"tmdb_search","query",{type});
+    return send(chatId,`أرسل اسم ${type==="movie"?"الفيلم":"المسلسل"} للبحث من جديد.`);
+  }
+  if(a.startsWith("tmdb_pick|")){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
+    const [,short,idRaw]=a.split("|");const type=short==="s"?"series":"movie";const tmdbId=Number(idRaw);
+    if(!Number.isInteger(tmdbId)||tmdbId<=0)return send(chatId,"TMDb ID غير صالح.");
+    const existing:any=await tmdbExisting(type,tmdbId);
+    if(existing)return send(chatId,`هذا المحتوى موجود مسبقًا في VAYZEN.\n${existing.title}\nID: ${existing.public_id}`,{inline_keyboard:[[{text:"إدارة المحتوى",callback_data:`cm|${type}|${existing.public_id}`},{text:"بحث جديد",callback_data:`tmdb_again|${short}`}]]});
+    try{
+      const {bundle,mapped}=await tmdbMappedDetails(type,tmdbId);
+      if(!mapped.title)return send(chatId,"تعذر قراءة اسم هذه النتيجة.");
+      const preview=await sendTmdbPreview(chatId,type,mapped,bundle);
+      await setSession(userId,"tmdb_preview","selected",{
+        type,tmdb_id:tmdbId,poster:preview.poster,poster_source_message_id:preview.poster_source_message_id
+      });
+      return;
+    }catch(err){return send(chatId,`تعذر جلب تفاصيل TMDb.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"بحث جديد",callback_data:`tmdb_again|${short}`},{text:"إلغاء",callback_data:"cancel"}]]});}
+  }
+  if(a.startsWith("tmdb_use|")){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
+    const [,short,idRaw]=a.split("|");const type=short==="s"?"series":"movie";const tmdbId=Number(idRaw);
+    const session=await getSession(userId);
+    if(!session||session.flow!=="tmdb_preview"||Number((session.draft as any)?.tmdb_id)!==tmdbId||String((session.draft as any)?.type)!==type){
+      return send(chatId,"انتهت معاينة TMDb. أعد البحث.",{inline_keyboard:[[{text:"بحث جديد",callback_data:`tmdb_again|${short}`}]]});
+    }
+    const existing:any=await tmdbExisting(type,tmdbId);
+    if(existing){await clearSession(userId);return send(chatId,`هذا المحتوى موجود مسبقًا.\nID: ${existing.public_id}`);}
+    try{
+      const {mapped}=await tmdbMappedDetails(type,tmdbId);
+      const preview:any=session.draft||{};
+      const draft:any={...mapped,tmdb_imported:true};
+      delete draft.poster_path;delete draft.backdrop_path;delete draft.poster_url;
+      if(preview.poster){draft.poster=preview.poster;draft.poster_source_message_id=preview.poster_source_message_id;}
+      if(type==="movie"){
+        if(!draft.poster){await setSession(userId,"movie","poster",draft);return send(chatId,"تم استيراد معلومات الفيلم، لكن TMDb ما عنده بوستر صالح. أرسل بوستر الفيلم.");}
+        await setSession(userId,"movie","quality",draft);
+        return send(chatId,`تم استيراد معلومات الفيلم من TMDb.\n\n${movieSummary(draft)}\n\nأرسل جودة أول فيديو، مثال 1080p.`);
+      }
+      if(!draft.poster){await setSession(userId,"series","poster",draft);return send(chatId,"تم استيراد معلومات المسلسل، لكن TMDb ما عنده بوستر صالح. أرسل بوستر المسلسل.");}
+      await setSession(userId,"series","confirm",draft);
+      return send(chatId,seriesSummary(draft),{inline_keyboard:[
+        [{text:"نشر المعلومات فقط",callback_data:"confirm_series"},{text:"استيراد المواسم والحلقات",callback_data:"confirm_series_tmdb_all"}],
+        [{text:"إلغاء",callback_data:"cancel"}]
+      ]});
+    }catch(err){return send(chatId,`تعذر استيراد TMDb.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"بحث جديد",callback_data:`tmdb_again|${short}`},{text:"إلغاء",callback_data:"cancel"}]]});}
+  }
   if(a==="batch_episode"){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
     await clearSession(userId);
@@ -2061,6 +2111,34 @@ async function message(m:any){
   if(!s) return showMenu(chatId);
   const d:any={...(s.draft??{})};
 
+  if(s.flow==="tmdb_settings"&&s.step==="token"){
+    if(admin.role!=="owner"){await clearSession(userId);return send(chatId,"إعدادات TMDb متاحة للمالك فقط.");}
+    const token=text.trim();
+    try{await tg("deleteMessage",{chat_id:chatId,message_id:m.message_id});}catch{}
+    if(!token)return send(chatId,"أرسل Access Token كنص.");
+    try{
+      const saved=await saveTmdbAccessToken(token);
+      await clearSession(userId);
+      await adminLog(userId,"tmdb_connect","settings",undefined,"tmdb",{token_hint:saved.token_hint});
+      return sendTmdbSettings(chatId);
+    }catch(err){
+      return send(chatId,`لم يتم حفظ التوكن لأن الاختبار فشل.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"إعادة المحاولة",callback_data:"tmdb_token_set"},{text:"إلغاء",callback_data:"tmdb_settings"}]]});
+    }
+  }
+
+  if(s.flow==="tmdb_search"&&(s.step==="query"||s.step==="results")){
+    if(!can(admin,"content")||!can(admin,"publish")){await clearSession(userId);return send(chatId,"لا تملك صلاحية إضافة المحتوى.");}
+    const type=String(d.type||"")==="series"?"series":"movie";
+    const q=text.trim().slice(0,120);
+    if(q.length<2)return send(chatId,"اكتب اسمًا من حرفين على الأقل.");
+    try{
+      await setSession(userId,"tmdb_search","results",{type,query:q});
+      return sendTmdbSearchResults(chatId,type,q);
+    }catch(err){
+      return send(chatId,`فشل البحث في TMDb.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"بحث جديد",callback_data:`tmdb_again|${type==="movie"?"m":"s"}`},{text:"إلغاء",callback_data:"cancel"}]]});
+    }
+  }
+
   if(s.flow==="add_admin"){
     if(!can(admin,"admins")){await clearSession(userId);return send(chatId,"لا تملك صلاحية إدارة المشرفين.");}
     if(s.step==="telegram_id"){
@@ -2296,8 +2374,17 @@ async function message(m:any){
     if(s.step==="language"){d.language=text;await setSession(userId,"movie","country",d);return send(chatId,"أرسل الدولة، أو - للتخطي.");}
     if(s.step==="country"){d.country=text==="-"?"":text;await setSession(userId,"movie","duration",d);return send(chatId,"أرسل مدة الفيلم بالدقائق، أو - للتخطي.");}
     if(s.step==="duration"){const n=positiveOrNull(text);if(text!=="-"&&!n)return send(chatId,"أرسل رقمًا صحيحًا أو -.");d.duration_minutes=n;await setSession(userId,"movie","quality",d);return send(chatId,"أرسل الجودة، مثال 1080p.");}
-    if(s.step==="quality"){d.quality=text;await setSession(userId,"movie","poster",d);return send(chatId,"أرسل بوستر الفيلم.");}
-    if(s.step==="poster"){const f=photoFrom(m);if(!f)return send(chatId,"أرسل صورة البوستر.");d.poster=f;d.poster_source_message_id=m.message_id;await setSession(userId,"movie","video",d);return send(chatId,"أرسل فيديو الفيلم. الحد الحالي 800MB.");}
+    if(s.step==="quality"){
+      d.quality=text;
+      if(d.poster){await setSession(userId,"movie","video",d);return send(chatId,`أرسل فيديو جودة ${variantLabel(normalizeVariant(text))}. الحد الحالي 800MB.`);}
+      await setSession(userId,"movie","poster",d);return send(chatId,"أرسل بوستر الفيلم.");
+    }
+    if(s.step==="poster"){
+      const f=photoFrom(m);if(!f)return send(chatId,"أرسل صورة البوستر.");
+      d.poster=f;d.poster_source_message_id=m.message_id;
+      if(d.tmdb_imported&&!d.quality){await setSession(userId,"movie","quality",d);return send(chatId,"أرسل جودة أول فيديو، مثال 1080p.");}
+      await setSession(userId,"movie","video",d);return send(chatId,"أرسل فيديو الفيلم. الحد الحالي 800MB.");
+    }
     if(s.step==="video"){
       const f=videoFrom(m);if(!f)return send(chatId,"أرسل ملف فيديو.");
       if(f.file_size&&f.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
@@ -2337,10 +2424,10 @@ async function message(m:any){
       const f=photoFrom(m);if(!f)return send(chatId,"أرسل صورة البوستر.");
       d.poster=f;d.poster_source_message_id=m.message_id;
       await setSession(userId,"series","confirm",d);
-      return send(chatId,seriesSummary(d),{inline_keyboard:[
-        [{text:"نشر المسلسل",callback_data:"confirm_series"},{text:"نشر ثم إضافة حلقات",callback_data:"confirm_series_batch"}],
-        [{text:"إلغاء",callback_data:"cancel"}]
-      ]});
+      const buttons=d.external_source==="tmdb"
+        ?[[{text:"نشر المعلومات فقط",callback_data:"confirm_series"},{text:"استيراد المواسم والحلقات",callback_data:"confirm_series_tmdb_all"}],[{text:"إلغاء",callback_data:"cancel"}]]
+        :[[{text:"نشر المسلسل",callback_data:"confirm_series"},{text:"نشر ثم إضافة حلقات",callback_data:"confirm_series_batch"}],[{text:"إلغاء",callback_data:"cancel"}]];
+      return send(chatId,seriesSummary(d),{inline_keyboard:buttons});
     }
   }
 
