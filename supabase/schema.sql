@@ -310,13 +310,32 @@ language plpgsql
 security definer
 set search_path=public
 as $$
+declare
+  v_series_id uuid;
 begin
   if p_entity_type='movie' then
-    update public.movies set view_count=view_count+1, updated_at=now()
+    update public.movies
+    set view_count=view_count+1, updated_at=now()
     where id=p_entity_id and status='published';
   elsif p_entity_type='episode' then
-    update public.episodes set view_count=view_count+1, updated_at=now()
+    update public.episodes
+    set view_count=view_count+1, updated_at=now()
     where id=p_entity_id and status='published';
+
+    select se.series_id into v_series_id
+    from public.episodes e
+    join public.seasons se on se.id=e.season_id
+    join public.series s on s.id=se.series_id
+    where e.id=p_entity_id
+      and e.status='published'
+      and se.status='published'
+      and s.status='published';
+
+    if v_series_id is not null then
+      update public.series
+      set view_count=view_count+1, updated_at=now()
+      where id=v_series_id;
+    end if;
   else
     raise exception 'invalid entity type';
   end if;
