@@ -1567,26 +1567,76 @@ async function sendContentItem(chatId:number,type:string,publicId:string){
   );
 }
 
-async function deleteContent(adminId:number,type:string,publicId:string){
+async function softDeleteContent(adminId:number,type:string,publicId:string){
   const item:any=await contentByPublicId(type,publicId);
   if(!item)throw new Error("المحتوى غير موجود");
-  const places:any[]=[];
+  if(item.deleted_at)return;
+  const table=type==="movie"?"movies":"series";
+  const {error}=await db.from(table).update({
+    deleted_at:new Date().toISOString(),
+    deleted_by:adminId,
+    deleted_previous_status:item.status||"published",
+    status:"archived",
+    is_featured:false,
+    updated_at:new Date().toISOString()
+  }).eq("id",item.id);
+  if(error)throw error;
+  await adminLog(adminId,"content_trash",type,item.id,item.public_id,{title:item.title,previous_status:item.status});
+}
 
-  if(type==="movie"){
-    const {data:assets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","movie").eq("entity_id",item.id);
+async function softDeleteEpisode(adminId:number,publicId:string){
+  const ep:any=await episodeByPublicId(publicId);
+  if(!ep)throw new Error("الحلقة غير موجودة");
+  const {error}=await db.from("episodes").update({
+    deleted_at:new Date().toISOString(),
+    deleted_by:adminId,
+    deleted_previous_status:ep.status||"published",
+    status:"archived",
+    updated_at:new Date().toISOString()
+  }).eq("id",ep.id);
+  if(error)throw error;
+  await adminLog(adminId,"episode_trash","episode",ep.id,ep.public_id,{previous_status:ep.status});
+}
+
+async function restoreTrashItem(adminId:number,type:string,id:string){
+  const table=type==="movie"?"movies":type==="series"?"series":type==="episode"?"episodes":null;
+  if(!table)throw new Error("نوع غير صالح");
+  const {data:item,error:readError}=await db.from(table)
+    .select("id,public_id,status,deleted_at,deleted_previous_status")
+    .eq("id",id).maybeSingle();
+  if(readError)throw readError;
+  if(!item?.deleted_at)throw new Error("العنصر غير موجود في السلة");
+  const restoreStatus=["published","hidden","draft"].includes(String(item.deleted_previous_status||""))
+    ?item.deleted_previous_status:"hidden";
+  const {error}=await db.from(table).update({
+    deleted_at:null,deleted_by:null,deleted_previous_status:null,
+    status:restoreStatus,updated_at:new Date().toISOString()
+  }).eq("id",id);
+  if(error)throw error;
+  await adminLog(adminId,"trash_restore",type,id,item.public_id,{status:restoreStatus});
+}
+
+async function purgeContentPermanent(adminId:number,type:string,id:string){
+  const table=type==="movie"?"movies":type==="series"?"series":type==="episode"?"episodes":null;
+  if(!table)throw new Error("نوع غير صالح");
+  const {data:item}=await db.from(table).select("id,public_id,deleted_at").eq("id",id).maybeSingle();
+  if(!item?.deleted_at)throw new Error("الحذف النهائي متاح فقط للعناصر الموجودة في السلة");
+  const places:any[]=[];
+  if(type==="movie"||type==="episode"){
+    const {data:assets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type",type).eq("entity_id",id);
     places.push(...(assets??[]).map((x:any)=>({channel_id:x.channel_id,message_id:x.channel_message_id})));
     for(const p of places)await deleteCopiedMessage(p);
-    await db.from("media_assets").delete().eq("entity_type","movie").eq("entity_id",item.id);
-    const {error}=await db.from("movies").delete().eq("id",item.id);if(error)throw error;
+    await db.from("media_assets").delete().eq("entity_type",type).eq("entity_id",id);
+    const {error}=await db.from(table).delete().eq("id",id);if(error)throw error;
   }else{
-    const {data:seasons}=await db.from("seasons").select("id").eq("series_id",item.id);
+    const {data:seasons}=await db.from("seasons").select("id").eq("series_id",id);
     const seasonIds=(seasons??[]).map((x:any)=>x.id);
     let episodeIds:string[]=[];
     if(seasonIds.length){
       const {data:eps}=await db.from("episodes").select("id").in("season_id",seasonIds);
       episodeIds=(eps??[]).map((x:any)=>x.id);
     }
-    const {data:seriesAssets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","series").eq("entity_id",item.id);
+    const {data:seriesAssets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","series").eq("entity_id",id);
     places.push(...(seriesAssets??[]).map((x:any)=>({channel_id:x.channel_id,message_id:x.channel_message_id})));
     if(episodeIds.length){
       const {data:episodeAssets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","episode").in("entity_id",episodeIds);
@@ -1594,10 +1644,103 @@ async function deleteContent(adminId:number,type:string,publicId:string){
       await db.from("media_assets").delete().eq("entity_type","episode").in("entity_id",episodeIds);
     }
     for(const p of places)await deleteCopiedMessage(p);
-    await db.from("media_assets").delete().eq("entity_type","series").eq("entity_id",item.id);
-    const {error}=await db.from("series").delete().eq("id",item.id);if(error)throw error;
+    await db.from("media_assets").delete().eq("entity_type","series").eq("entity_id",id);
+    const {error}=await db.from("series").delete().eq("id",id);if(error)throw error;
   }
-  await adminLog(adminId,"content_delete",type,item.id,item.public_id,{title:item.title});
+  await adminLog(adminId,"trash_purge",type,id,item.public_id,{});
+}
+
+async function purgeExpiredTrash(adminId:number){
+  const cutoff=new Date(Date.now()-14*24*60*60_000).toISOString();
+  const tasks:Array<{type:string,id:string}>=[];
+  for(const [table,type] of [["movies","movie"],["series","series"],["episodes","episode"]] as const){
+    const {data}=await db.from(table).select("id").not("deleted_at","is",null).lt("deleted_at",cutoff).limit(50);
+    for(const row of data??[])tasks.push({type,id:row.id});
+  }
+  for(const t of tasks){
+    try{await purgeContentPermanent(adminId,t.type,t.id)}catch{}
+  }
+  return tasks.length;
+}
+
+async function sendTrashManager(chatId:number,admin:Admin){
+  if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية سلة المحذوفات.");
+  await purgeExpiredTrash(Number(admin.telegram_user_id));
+  const [movies,series,episodes]=await Promise.all([
+    db.from("movies").select("id,public_id,title,deleted_at").not("deleted_at","is",null).order("deleted_at",{ascending:false}).limit(6),
+    db.from("series").select("id,public_id,title,deleted_at").not("deleted_at","is",null).order("deleted_at",{ascending:false}).limit(6),
+    db.from("episodes").select("id,public_id,title,deleted_at").not("deleted_at","is",null).order("deleted_at",{ascending:false}).limit(6)
+  ]);
+  const items=[
+    ...(movies.data??[]).map((x:any)=>({...x,type:"movie",label:"فيلم"})),
+    ...(series.data??[]).map((x:any)=>({...x,type:"series",label:"مسلسل"})),
+    ...(episodes.data??[]).map((x:any)=>({...x,type:"episode",label:"حلقة"}))
+  ].sort((a:any,b:any)=>Date.parse(b.deleted_at)-Date.parse(a.deleted_at)).slice(0,12);
+  const rows:any[]=items.map((x:any)=>[
+    {text:`استرجاع ${x.public_id}`,callback_data:`trash_restore|${x.type}|${x.id}`},
+    ...(admin.role==="owner"?[{text:"حذف نهائي",callback_data:`trash_purge1|${x.type}|${x.id}`}]:[])
+  ]);
+  rows.push([{text:"رجوع",callback_data:"menu"}]);
+  const lines=items.map((x:any)=>`• ${x.label} • ${x.public_id} • ${x.title||"—"}`).join("\n");
+  return send(chatId,`سلة المحذوفات\nالاحتفاظ: 14 يومًا\n\n${lines||"السلة فارغة."}`,{inline_keyboard:rows});
+}
+
+async function sendJobCenter(chatId:number){
+  const {data,error}=await db.from("media_transfer_jobs")
+    .select("id,status,entity_type,entity_public_id,kind,variant,file_size,attempts,max_attempts,last_error,updated_at")
+    .order("updated_at",{ascending:false}).limit(20);
+  if(error)throw error;
+  const jobs:any[]=data??[];
+  const counts=jobs.reduce((m:any,j:any)=>(m[j.status]=(m[j.status]||0)+1,m),{});
+  const rows:any[]=jobs.slice(0,10).map((j:any)=>[{text:
+    `${j.status==="completed"?"✓":j.status==="failed"?"!":j.status==="processing"?"…":"○"} ${j.entity_public_id||j.kind||"Job"} • ${sizeLabel(j.file_size)}`,
+    callback_data:`job|${j.id}`
+  }]);
+  rows.push([{text:"تحديث",callback_data:"jobs"},{text:"رجوع",callback_data:"menu"}]);
+  return send(chatId,
+    `مركز عمليات الوسائط\n\nمكتمل: ${counts.completed||0}\nقيد التنفيذ: ${counts.processing||0}\nبانتظار: ${counts.pending||0}\nفشل: ${counts.failed||0}\n\nآخر العمليات:`,
+    {inline_keyboard:rows}
+  );
+}
+
+async function sendJobItem(chatId:number,id:string){
+  const {data:j}=await db.from("media_transfer_jobs")
+    .select("id,status,channel_key,from_chat_id,source_message_id,target_channel_id,target_message_id,file_size,attempts,max_attempts,last_error,entity_type,entity_id,entity_public_id,kind,variant,caption,file_metadata,updated_at")
+    .eq("id",id).maybeSingle();
+  if(!j)return sendJobCenter(chatId);
+  const rows:any[]=[];
+  if(["failed","rolled_back"].includes(j.status)&&j.entity_type&&j.entity_id&&j.kind){
+    rows.push([{text:"إعادة المحاولة",callback_data:`job_retry|${j.id}`}]);
+  }
+  rows.push([{text:"رجوع للعمليات",callback_data:"jobs"}]);
+  return send(chatId,
+    `عملية وسائط\n\nالحالة: ${j.status}\nالمحتوى: ${j.entity_public_id||"—"}\nالنوع: ${j.kind||"—"}\nالجودة: ${j.variant||"—"}\nالحجم: ${sizeLabel(j.file_size)}\nالمحاولات: ${j.attempts}/${j.max_attempts}\nآخر خطأ: ${j.last_error?String(j.last_error).slice(0,220):"—"}`,
+    {inline_keyboard:rows}
+  );
+}
+
+async function retryMediaTransferJob(adminId:number,id:string){
+  const {data:j,error}=await db.from("media_transfer_jobs")
+    .select("*").eq("id",id).maybeSingle();
+  if(error||!j)throw error??new Error("العملية غير موجودة");
+  if(!["failed","rolled_back"].includes(j.status))throw new Error("العملية لا تحتاج إعادة محاولة");
+  if(!j.entity_type||!j.entity_id||!j.kind)throw new Error("هذه عملية قديمة ولا تحتوي سياقًا كافيًا لإعادة المحاولة التلقائية");
+  const file:any=j.file_metadata||{};
+  if(!file.file_id)throw new Error("بيانات الملف غير مكتملة");
+  const existsTable=j.entity_type==="movie"?"movies":j.entity_type==="series"?"series":"episodes";
+  const {data:entity}=await db.from(existsTable).select("id").eq("id",j.entity_id).maybeSingle();
+  if(!entity)throw new Error("المحتوى المرتبط لم يعد موجودًا");
+  const variant=normalizeVariant(j.variant||"default");
+  await db.from("media_transfer_jobs").update({status:"pending",attempts:0,last_error:null,updated_at:new Date().toISOString()}).eq("id",id);
+  const place=await copyTo(j.channel_key,Number(j.from_chat_id),Number(j.source_message_id),String(j.caption||j.entity_public_id||"VAYZEN"),Number(j.file_size||file.file_size||0),{
+    entityType:j.entity_type,entityId:j.entity_id,entityPublicId:j.entity_public_id||undefined,kind:j.kind,variant,file
+  });
+  await saveAsset(j.entity_type,j.entity_id,j.kind,file,place,variant);
+  if(j.kind==="video"&&["movie","episode"].includes(j.entity_type)){
+    const table=j.entity_type==="movie"?"movies":"episodes";
+    await db.from(table).update({quality:variantLabel(variant),updated_at:new Date().toISOString()}).eq("id",j.entity_id);
+  }
+  await adminLog(adminId,"media_job_retry",j.entity_type,j.entity_id,j.entity_public_id,{job_id:id,kind:j.kind,variant});
 }
 
 async function sendRequestsManager(chatId:number){
