@@ -494,6 +494,8 @@ async function deleteSeason(adminId:number,seriesPublicId:string,seasonNumber:nu
     const {data:assets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","episode").in("entity_id",ids);
     for(const a of assets??[])await deleteCopiedMessage({channel_id:a.channel_id,message_id:a.channel_message_id});
     await db.from("media_assets").delete().eq("entity_type","episode").in("entity_id",ids);
+    const {error:episodeDeleteError}=await db.from("episodes").delete().eq("season_id",season.id);
+    if(episodeDeleteError)throw episodeDeleteError;
   }
   const {error}=await db.from("seasons").delete().eq("id",season.id);if(error)throw error;
   await adminLog(adminId,"season_delete","series",series.id,series.public_id,{season_number:seasonNumber});
@@ -654,7 +656,7 @@ async function sendContentList(chatId:number,type:"movie"|"series"){
 }
 
 async function searchContent(chatId:number,query:string,type?:string){
-  const q=query.trim();
+  const q=query.trim().replace(/[%_,()]/g," ").replace(/\s+/g," ").trim();
   if(q.length<2)return send(chatId,"أرسل حرفين على الأقل.");
   const types=type&&["movie","series"].includes(type)?[type]:["movie","series"];
   const rows:any[]=[];
