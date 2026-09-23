@@ -106,7 +106,7 @@ const mainMenu={
     [{text:"إضافة حلقة",callback_data:"add_episode"}],
     [{text:"طلبات المستخدمين",callback_data:"requests"},{text:"البلاغات",callback_data:"reports"}],
     [{text:"إدارة المحتوى",callback_data:"content"},{text:"الإحصائيات",callback_data:"stats"}],
-    [{text:"حالة النظام",callback_data:"system_status"}],
+    [{text:"المستخدمون",callback_data:"users"},{text:"حالة النظام",callback_data:"system_status"}],
     [{text:"إلغاء العملية",callback_data:"cancel"}],
   ]
 };
@@ -840,6 +840,8 @@ async function userFromRequest(req:Request){
   const client=createClient(SUPABASE_URL,PUBLIC_KEY,{auth:{persistSession:false,autoRefreshToken:false}});
   const {data,error}=await client.auth.getUser(token);
   if(error||!data.user)return null;
+  const {data:profile}=await db.from("profiles").select("is_disabled").eq("id",data.user.id).maybeSingle();
+  if(profile?.is_disabled)return null;
   return {user:data.user,token};
 }
 
@@ -863,6 +865,8 @@ async function authLogin(req:Request){
   const client=createClient(SUPABASE_URL,PUBLIC_KEY,{auth:{persistSession:false,autoRefreshToken:false}});
   const {data,error}=await client.auth.signInWithPassword({email,password});
   if(error)return json({error:"بيانات الدخول غير صحيحة"},401);
+  const {data:profile}=await db.from("profiles").select("is_disabled").eq("id",data.user.id).maybeSingle();
+  if(profile?.is_disabled)return json({error:"هذا الحساب معطّل حاليًا"},403);
   return json({ok:true,user:{id:data.user.id,email:data.user.email},session:{access_token:data.session.access_token,refresh_token:data.session.refresh_token,expires_at:data.session.expires_at}});
 }
 
@@ -873,6 +877,8 @@ async function authRefresh(req:Request){
   const client=createClient(SUPABASE_URL,PUBLIC_KEY,{auth:{persistSession:false,autoRefreshToken:false}});
   const {data,error}=await client.auth.refreshSession({refresh_token:refreshToken});
   if(error||!data.session)return json({error:"session expired"},401);
+  const {data:profile}=await db.from("profiles").select("is_disabled").eq("id",data.user?.id||"").maybeSingle();
+  if(profile?.is_disabled)return json({error:"account disabled"},403);
   return json({ok:true,session:{access_token:data.session.access_token,refresh_token:data.session.refresh_token,expires_at:data.session.expires_at}});
 }
 
