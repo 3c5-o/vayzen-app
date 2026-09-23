@@ -654,8 +654,8 @@ async function contentByPublicId(type:string,publicId:string){
   const table=type==="movie"?"movies":type==="series"?"series":null;
   if(!table)return null;
   const fields=type==="movie"
-    ?"id,public_id,title,original_title,description,release_year,genres,language,country,duration_minutes,quality,status,is_featured,view_count,created_at,updated_at"
-    :"id,public_id,title,original_title,description,release_year,genres,language,country,quality,status,is_featured,view_count,created_at,updated_at";
+    ?"id,public_id,title,original_title,description,release_year,genres,language,country,duration_minutes,quality,status,is_featured,view_count,external_source,external_id,rating,rating_count,release_date,created_at,updated_at"
+    :"id,public_id,title,original_title,description,release_year,genres,language,country,quality,status,is_featured,view_count,external_source,external_id,rating,rating_count,first_air_date,created_at,updated_at";
   const {data}=await db.from(table).select(fields).eq("public_id",publicId.toUpperCase()).maybeSingle();
   return data??null;
 }
@@ -1217,6 +1217,9 @@ async function sendContentItem(chatId:number,type:string,publicId:string){
     [type==="movie"
       ?{text:"إدارة الجودات",callback_data:`q|movie|${item.public_id}`}
       :{text:"المواسم والحلقات",callback_data:`se|${item.public_id}`}],
+    ...(type==="series"&&item.external_source==="tmdb"&&item.external_id
+      ?[[{text:"تحديث مواسم وحلقات TMDb",callback_data:`tmdb_sync|${item.public_id}`}]]
+      :[]),
     [{text:nextStatus==="published"?"نشر المحتوى":"إخفاء المحتوى",callback_data:`cs|${type}|${item.public_id}|${nextStatus}`}],
     [{text:item.is_featured?"إلغاء التمييز":"تمييز في الرئيسية",callback_data:`cf|${type}|${item.public_id}|${item.is_featured?"0":"1"}`}],
     [{text:"حذف",callback_data:`cd1|${type}|${item.public_id}`}],
@@ -1226,7 +1229,7 @@ async function sendContentItem(chatId:number,type:string,publicId:string){
     ?`\nالسنة: ${item.release_year||"—"}\nالمدة: ${item.duration_minutes||"—"} دقيقة`
     :`\nالسنة: ${item.release_year||"—"}`;
   return send(chatId,
-    `${item.public_id}\n${item.title}\n\nالحالة: ${item.status}\nمميز: ${item.is_featured?"نعم":"لا"}\nالجودة: ${item.quality||"—"}\nالمشاهدات: ${item.view_count||0}${extra}`,
+    `${item.public_id}\n${item.title}\n\nالحالة: ${item.status}\nمميز: ${item.is_featured?"نعم":"لا"}\nالجودة: ${item.quality||"—"}\nالمشاهدات: ${item.view_count||0}${item.rating?"\nالتقييم: "+Number(item.rating).toFixed(1)+"/10":""}${item.external_source==="tmdb"&&item.external_id?"\nTMDb ID: "+item.external_id:""}${extra}`,
     {inline_keyboard:rows}
   );
 }
@@ -1639,6 +1642,30 @@ async function callback(q:any){
       return send(chatId,`فشل نشر الفيلم.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"إعادة المحاولة",callback_data:"confirm_movie"},{text:"إلغاء",callback_data:"cancel"}]]});
     }
   }
+  if(a==="confirm_series_tmdb_all"){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
+    const session=await getSession(userId);
+    const draft:any=session?.draft||{};
+    if(!session||session.flow!=="series"||session.step!=="confirm"||draft.external_source!=="tmdb"||!draft.external_id){
+      return showMenu(chatId,"انتهت جلسة استيراد TMDb.");
+    }
+    await setSession(userId,"series","publishing",draft);
+    await send(chatId,"جاري نشر المسلسل ثم استيراد المواسم والحلقات من TMDb...");
+    let id="";
+    try{
+      id=await publishSeries(userId,chatId,draft);
+      const result=await tmdbImportSeriesStructure(userId,id,Number(draft.external_id));
+      await clearSession(userId);
+      const failed=(result.failed_seasons||[]).length?`\nمواسم تعذر جلبها: ${result.failed_seasons.join("، ")}`:"";
+      await send(chatId,`تم استيراد المسلسل بنجاح.\nSeries ID: ${id}\n\nالمواسم الجديدة: ${result.seasons_added}\nالمواسم المحدثة: ${result.seasons_updated}\nالحلقات الجديدة: ${result.episodes_added}\nالحلقات المحدثة: ${result.episodes_updated}${failed}\n\nالحلقات المستوردة تبقى Draft إلى أن تربط الفيديو.`);
+      return sendSeriesEpisodes(chatId,id);
+    }catch(err){
+      await clearSession(userId);
+      if(id)return send(chatId,`تم نشر المسلسل، لكن تعذر إكمال استيراد المواسم.\nSeries ID: ${id}\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"فتح إدارة المسلسل",callback_data:`cm|series|${id}`},{text:"القائمة",callback_data:"menu"}]]});
+      return send(chatId,`فشل نشر المسلسل.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"القائمة",callback_data:"menu"}]]});
+    }
+  }
+
   if(a==="confirm_series_batch"){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
     const session=await getSession(userId);
@@ -1690,6 +1717,20 @@ async function callback(q:any){
       await setSession(userId,"episode","confirm",session.draft);
       return send(chatId,`فشل نشر الحلقة.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"إعادة المحاولة",callback_data:"confirm_episode"},{text:"إلغاء",callback_data:"cancel"}]]});
     }
+  }
+
+  if(a.startsWith("tmdb_sync|")){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية تحديث المحتوى.");
+    const [,publicId]=a.split("|");
+    const item:any=await contentByPublicId("series",publicId);
+    if(!item||item.external_source!=="tmdb"||!item.external_id)return send(chatId,"هذا المسلسل غير مرتبط بـTMDb.");
+    try{
+      await send(chatId,"جاري تحديث المواسم والحلقات من TMDb...");
+      const result=await tmdbImportSeriesStructure(userId,item.public_id,Number(item.external_id));
+      const failed=(result.failed_seasons||[]).length?`\nتعذر تحديث المواسم: ${result.failed_seasons.join("، ")}`:"";
+      await send(chatId,`اكتمل تحديث TMDb.\n\nمواسم جديدة: ${result.seasons_added}\nمواسم محدثة: ${result.seasons_updated}\nحلقات جديدة: ${result.episodes_added}\nحلقات محدثة: ${result.episodes_updated}${failed}`);
+      return sendSeriesEpisodes(chatId,item.public_id);
+    }catch(err){return send(chatId,`فشل تحديث TMDb.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"رجوع",callback_data:`cm|series|${publicId}`}]]});}
   }
 
   if(a==="content"){
