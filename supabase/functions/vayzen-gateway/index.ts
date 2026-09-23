@@ -494,6 +494,12 @@ async function streamSigningSecret(){
   return dbSecret||STREAM_SIGNING_SECRET;
 }
 
+async function streamGateway(){
+  const {data}=await db.from("app_settings").select("value").eq("key","stream_gateway").maybeSingle();
+  const dbUrl=String((data as any)?.value?.url||"").replace(/\/$/,"");
+  return dbUrl||STREAM_GATEWAY.replace(/\/$/,"");
+}
+
 async function hmacHex(payload:string,secret:string){
   const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(secret),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
   const sig=await crypto.subtle.sign("HMAC",key,new TextEncoder().encode(payload));
@@ -505,12 +511,12 @@ async function media(type:string,id:string,req?:Request){
   if(!a) return json({error:"not found"},404);
   if(type==="movie_video"||type==="episode_video"){
     const signingSecret=await streamSigningSecret();
-    if(!STREAM_GATEWAY||!signingSecret) return json({error:"streaming gateway not configured"},503);
+    const gatewayBase=await streamGateway();
+    if(!gatewayBase||!signingSecret) return json({error:"streaming gateway not configured"},503);
     if(a.file_size&&Number(a.file_size)>MAX_VIDEO_BYTES) return json({error:"file exceeds current 500MB limit"},413);
     const exp=Math.floor(Date.now()/1000)+600;
     const payload=`${a.channel_id}:${a.channel_message_id}:${exp}`;
     const sig=await hmacHex(payload,signingSecret);
-    const gatewayBase=STREAM_GATEWAY.replace(/\/$/,"");
     return Response.redirect(`${gatewayBase}/stream/${a.channel_id}/${a.channel_message_id}?exp=${exp}&sig=${sig}`,307);
   }
   if(!a.telegram_file_id) return json({error:"poster file id missing"},409);
@@ -700,7 +706,7 @@ Deno.serve(async(req:Request)=>{
         ok:true,name:"VAYZEN",maxVideoMB:500,
         botConfigured:Boolean(BOT_TOKEN),
         webhookSecretConfigured:Boolean(BOT_SECRET),
-        streamGatewayConfigured:Boolean(STREAM_GATEWAY),
+        streamGatewayConfigured:Boolean(await streamGateway()),
         streamSigningConfigured:Boolean(await streamSigningSecret()),
       });
     }
