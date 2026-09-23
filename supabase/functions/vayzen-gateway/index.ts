@@ -1080,6 +1080,70 @@ async function callback(q:any){
     await setSession(userId,"series","title",{});
     return send(chatId,"أرسل اسم المسلسل.");
   }
+  if(a==="batch_episode"){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
+    await clearSession(userId);
+    return sendBatchSeriesPicker(chatId);
+  }
+  if(a.startsWith("batch_for|")){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
+    const [,id]=a.split("|");return sendBatchSeasonPicker(chatId,id);
+  }
+  if(a.startsWith("batch_season|")){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
+    const [,id,n]=a.split("|");
+    const series:any=await contentByPublicId("series",id);if(!series)return sendBatchSeriesPicker(chatId);
+    await setSession(userId,"batch_episode","start",{series_public_id:id,series_title:series.title,season_number:Number(n),items:[]});
+    return send(chatId,`الموسم ${n}\nأرسل رقم أول حلقة، مثال: 1`);
+  }
+  if(a.startsWith("batch_newseason|")){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
+    const [,id]=a.split("|");
+    const series:any=await contentByPublicId("series",id);if(!series)return sendBatchSeriesPicker(chatId);
+    await setSession(userId,"batch_episode","season",{series_public_id:id,series_title:series.title,items:[]});
+    return send(chatId,"أرسل رقم الموسم الجديد.");
+  }
+  if(a==="batch_finish"){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
+    const session=await getSession(userId);
+    if(!session||session.flow!=="batch_episode"||session.step!=="receiving")return showMenu(chatId,"لا توجد عملية رفع جماعي نشطة.");
+    const draft:any=session.draft||{};
+    if(!Array.isArray(draft.items)||!draft.items.length)return send(chatId,"لم ترسل أي فيديو بعد.");
+    await setSession(userId,"batch_episode","confirm",draft);
+    return send(chatId,batchEpisodeSummary(draft),{inline_keyboard:[
+      [{text:"نشر الكل",callback_data:"confirm_batch_episode"},{text:"متابعة الإضافة",callback_data:"batch_resume"}],
+      [{text:"إلغاء العملية",callback_data:"cancel"}]
+    ]});
+  }
+  if(a==="batch_resume"){
+    const session=await getSession(userId);
+    if(!session||session.flow!=="batch_episode"||session.step!=="confirm")return showMenu(chatId);
+    await setSession(userId,"batch_episode","receiving",session.draft);
+    return send(chatId,"استمر بإرسال الفيديوهات. عند الانتهاء اضغط إنهاء ومراجعة.",{inline_keyboard:[[{text:"إنهاء ومراجعة",callback_data:"batch_finish"},{text:"إلغاء",callback_data:"cancel"}]]});
+  }
+  if(a==="confirm_batch_episode"){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
+    const session=await getSession(userId);
+    if(!session||session.flow!=="batch_episode")return showMenu(chatId,"انتهت جلسة الرفع الجماعي.");
+    if(session.step==="publishing")return send(chatId,"النشر الجماعي قيد التنفيذ الآن.");
+    if(session.step!=="confirm")return showMenu(chatId,"انتهت جلسة الرفع الجماعي.");
+    await setSession(userId,"batch_episode","publishing",session.draft);
+    await send(chatId,"جاري نشر الحلقات والجودات...");
+    const draft:any=session.draft||{};
+    try{
+      const results=await publishBatchEpisodes(userId,chatId,draft);
+      await clearSession(userId);
+      const ok=results.filter((x:any)=>x.ok).length,failed=results.length-ok;
+      const partial=results.filter((x:any)=>x.ok&&x.failedVariants?.length);
+      const failures=results.filter((x:any)=>!x.ok).map((x:any)=>`E${x.episode}: ${x.error}`).slice(0,12).join("\n");
+      const partialText=partial.map((x:any)=>`E${x.episode}: فشل ${x.failedVariants.join(" / ")}`).slice(0,8).join("\n");
+      return send(chatId,`اكتمل النشر الجماعي.\n\nنجح: ${ok}\nفشل: ${failed}${partial.length?`\nجودات جزئية: ${partial.length}`:""}${failures?`\n\nالفشل:\n${failures}`:""}${partialText?`\n\nجودات تحتاج إعادة محاولة:\n${partialText}`:""}`,{inline_keyboard:[[{text:"فتح المسلسل",callback_data:`se|${draft.series_public_id}`},{text:"القائمة",callback_data:"menu"}]]});
+    }catch(err){
+      await setSession(userId,"batch_episode","confirm",session.draft);
+      return send(chatId,`فشل النشر الجماعي.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"إعادة المحاولة",callback_data:"confirm_batch_episode"},{text:"إلغاء",callback_data:"cancel"}]]});
+    }
+  }
+
   if(a==="add_episode"){
     if(!can(admin,"content")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
     await clearSession(userId);
@@ -1103,11 +1167,19 @@ async function callback(q:any){
     await setSession(userId,"episode","season",{series_public_id:id});
     return send(chatId,"أرسل رقم الموسم الجديد.");
   }
+  if(a==="movie_add_quality"){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
+    const session=await getSession(userId);
+    if(!session||session.flow!=="movie"||session.step!=="video_review")return showMenu(chatId,"انتهت جلسة الفيلم.");
+    await setSession(userId,"movie","quality_extra",session.draft);
+    return send(chatId,"أرسل اسم الجودة الإضافية، مثال: 480p أو 720p أو 1080p أو 4K.");
+  }
   if(a==="confirm_movie"){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
     const session=await getSession(userId);
     if(!session||session.flow!=="movie") return showMenu(chatId,"انتهت جلسة الفيلم.");
     if(session.step==="publishing")return send(chatId,"الفيلم قيد النشر الآن، انتظر اكتمال العملية.");
-    if(session.step!=="confirm")return showMenu(chatId,"انتهت جلسة الفيلم.");
+    if(!["confirm","video_review"].includes(session.step))return showMenu(chatId,"انتهت جلسة الفيلم.");
     await setSession(userId,"movie","publishing",session.draft);
     await send(chatId,"جاري نشر الفيلم ونقل الملفات...");
     try{
@@ -1120,6 +1192,7 @@ async function callback(q:any){
     }
   }
   if(a==="confirm_series"){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
     const session=await getSession(userId);
     if(!session||session.flow!=="series") return showMenu(chatId,"انتهت جلسة المسلسل.");
     if(session.step==="publishing")return send(chatId,"المسلسل قيد النشر الآن، انتظر اكتمال العملية.");
@@ -1136,6 +1209,7 @@ async function callback(q:any){
     }
   }
   if(a==="confirm_episode"){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
     const session=await getSession(userId);
     if(!session||session.flow!=="episode") return showMenu(chatId,"انتهت جلسة الحلقة.");
     if(session.step==="publishing")return send(chatId,"الحلقة قيد النشر الآن، انتظر اكتمال العملية.");
@@ -1360,6 +1434,21 @@ async function callback(q:any){
     const [,type,id]=a.split("|");
     await deleteContent(userId,type,id);
     return sendContentManager(chatId);
+  }
+
+  if(a.startsWith("adm_new_role|")){
+    if(!can(admin,"admins"))return send(chatId,"لا تملك صلاحية إدارة المشرفين.");
+    const [,role]=a.split("|");
+    const session=await getSession(userId);
+    if(!session||session.flow!=="add_admin"||session.step!=="role")return sendAdminsManager(chatId,admin);
+    const d:any=session.draft||{};
+    try{
+      await createAdmin(admin,Number(d.telegram_id),String(d.display_name||d.telegram_id),role);
+      await clearSession(userId);
+      return sendAdminsManager(chatId,admin);
+    }catch(err){
+      return send(chatId,adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:"admins"}]]});
+    }
   }
 
   if(a==="admins"){
