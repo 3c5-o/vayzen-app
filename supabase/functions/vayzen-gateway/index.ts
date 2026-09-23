@@ -633,7 +633,7 @@ async function systemStatusText(){
     db.from("reports").select("id",{head:true,count:"exact"}).eq("status","new"),
     db.from("system_logs").select("message,created_at").eq("level","error").order("created_at",{ascending:false}).limit(1),
   ]);
-  let gateway="غير متصل",telegram="غير معروف";
+  let gateway="غير متصل",telegram="غير معروف",activeStreams=0,rangeWindow=0;
   try{
     const base=await streamGateway();
     if(base){
@@ -644,6 +644,8 @@ async function systemStatusText(){
         const j=await res.json().catch(()=>null);
         gateway=res.ok&&j?.ok?"يعمل":`HTTP ${res.status}`;
         telegram=j?.ok?"متصل":"غير متصل";
+        activeStreams=Number(j?.active_streams||0);
+        rangeWindow=Number(j?.range_window_mb||0);
       }finally{clearTimeout(timer)}
     }
   }catch{gateway="غير متصل"}
@@ -654,6 +656,9 @@ async function systemStatusText(){
     `البوت: ${BOT_TOKEN?"مهيأ":"غير مهيأ"}`,
     `بوابة البث: ${gateway}`,
     `Telegram Streaming: ${telegram}`,
+    `عمليات البث الحالية: ${activeStreams}`,
+    `نافذة Range: ${rangeWindow||"—"} MB`,
+    "حد الفيديو: 800 MB",
     `أفلام منشورة: ${mp.count||0}`,
     `مسودات أفلام: ${md.count||0}`,
     `مسلسلات منشورة: ${sp.count||0}`,
@@ -1345,8 +1350,13 @@ async function progressApi(req:Request){
   }
   const body=await req.json().catch(()=>null);
   const type=String(body?.entity_type||""),id=String(body?.entity_id||"");
-  const position=Math.max(0,Number(body?.position_seconds||0)),duration=Math.max(0,Number(body?.duration_seconds||0));
   if(!["movie","episode"].includes(type)||!/^[0-9a-f-]{36}$/i.test(id))return json({error:"invalid progress"},400);
+  if(body?.remove===true){
+    const {error}=await db.from("watch_progress").delete().eq("user_id",auth.user.id).eq("entity_type",type).eq("entity_id",id);
+    if(error)throw error;
+    return json({ok:true,removed:true});
+  }
+  const position=Math.max(0,Number(body?.position_seconds||0)),duration=Math.max(0,Number(body?.duration_seconds||0));
   const {error}=await db.from("watch_progress").upsert({user_id:auth.user.id,entity_type:type,entity_id:id,position_seconds:position,duration_seconds:duration,updated_at:new Date().toISOString()});
   if(error)throw error;return json({ok:true});
 }
