@@ -394,7 +394,13 @@ async function openRequests(){
   try{
     const j=await rawApi("request_status",{params:{requester_key:requestKey()}});
     const labels={new:"جديد",reviewing:"قيد المراجعة",added:"تمت الإضافة",rejected:"مرفوض",duplicate:"مكرر"};
-    $("#requestsList").innerHTML=(j.requests||[]).length?(j.requests||[]).map(x=>`<div class="request-item"><div class="request-top"><b>${esc(x.title)}</b><span class="status-pill status-${esc(x.status)}">${labels[x.status]||esc(x.status)}</span></div><small>${esc(x.request_code)} • ${x.request_type==="movie"?"فيلم":"مسلسل"}</small></div>`).join(""):'<div class="empty-state">ما عندك طلبات بعد.</div>';
+    $("#requestsList").innerHTML=(j.requests||[]).length?(j.requests||[]).map((x,i)=>`<div class="request-item"><div class="request-top"><b>${esc(x.title)}</b><span class="status-pill status-${esc(x.status)}">${labels[x.status]||esc(x.status)}</span></div><small>${esc(x.request_code)} • ${x.request_type==="movie"?"فيلم":"مسلسل"}</small>${x.linked?`<button class="btn primary request-watch" data-request-watch="${i}"><svg><use href="#i-play"/></svg><span>مشاهدة الآن</span></button>`:""}</div>`).join(""):'<div class="empty-state">ما عندك طلبات بعد.</div>';
+    $("#requestsList").querySelectorAll("[data-request-watch]").forEach(btn=>btn.onclick=()=>{
+      const x=(j.requests||[])[Number(btn.dataset.requestWatch)];
+      if(!x?.linked)return;
+      closeModal("requestsModal");
+      openDetails(x.linked.type,x.linked.id);
+    });
   }catch{$("#requestsList").innerHTML='<div class="empty-state">تعذر تحميل الطلبات.</div>'}
 }
 function openReport(type="other",publicId=""){if(!state.user){openAuth("login");return}$("#reportEntityType").value=type;$("#reportPublicId").value=publicId;$("#reportDetails").value="";openModal("reportModal")}
@@ -478,7 +484,7 @@ async function recordPlaybackView(o){
   const key=o.type+":"+o.id;
   if(viewedThisSession.has(key))return;
   viewedThisSession.add(key);
-  try{await rawApi("view",{method:"POST",body:{entity_type:o.type,entity_id:o.id}})}catch{}
+  try{await rawApi("view",{method:"POST",body:{entity_type:o.type,entity_id:o.id,viewer_key:requestKey()}})}catch{}
 }
 function openPlayer(o){
   state.player=o;state.nextEpisode=o.next||null;
