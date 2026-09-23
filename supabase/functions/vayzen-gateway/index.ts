@@ -153,6 +153,7 @@ function menuFor(admin:Admin){
     if(row.length)rows.push(row);
   }
   if(can(admin,"admins"))rows.push([{text:"إدارة المشرفين",callback_data:"admins"},{text:"سجل الإدارة",callback_data:"admin_logs"}]);
+  else if(can(admin,"logs"))rows.push([{text:"سجل الإدارة",callback_data:"admin_logs"}]);
   rows.push([{text:"إلغاء العملية",callback_data:"cancel"}]);
   return {inline_keyboard:rows};
 }
@@ -395,10 +396,14 @@ async function publishEpisode(userId:number,chatId:number,d:any){
     .eq("public_id",String(d.series_public_id).toUpperCase()).maybeSingle();
   if(!series||series.status!=="published") throw new Error("Series not found");
 
-  const {data:season,error:se}=await db.from("seasons").upsert({
-    series_id:series.id,season_number:d.season_number,title:`الموسم ${d.season_number}`,status:"published",
-  },{onConflict:"series_id,season_number"}).select("id").single();
-  if(se||!season) throw se??new Error("Season failed");
+  let {data:season}=await db.from("seasons").select("id").eq("series_id",series.id).eq("season_number",d.season_number).maybeSingle();
+  if(!season){
+    const {data:createdSeason,error:se}=await db.from("seasons").insert({
+      series_id:series.id,season_number:d.season_number,title:`الموسم ${d.season_number}`,status:"published",
+    }).select("id").single();
+    if(se||!createdSeason)throw se??new Error("Season failed");
+    season=createdSeason;
+  }
 
   const {data:existing}=await db.from("episodes").select("id,public_id,status")
     .eq("season_id",season.id).eq("episode_number",d.episode_number).maybeSingle();
@@ -672,7 +677,8 @@ async function sendAdminPermissions(chatId:number,actor:Admin,targetId:number){
   const {data:t}=await db.from("admin_users").select("telegram_user_id,display_name,role,permissions,is_active").eq("telegram_user_id",targetId).maybeSingle();
   if(!t||!canManageAdmin(actor,t as Admin))return sendAdminsManager(chatId,actor);
   if(["owner","secondary_admin"].includes(t.role))return send(chatId,"صلاحيات هذا الدور ثابتة ولا تعدّل يدويًا.",{inline_keyboard:[[{text:"رجوع",callback_data:`adm|${targetId}`}]]});
-  const rows:any[]=(Object.keys(permissionLabels) as AdminPermission[]).map(p=>[{
+  const editable=(Object.keys(permissionLabels) as AdminPermission[]).filter(p=>p!=="admins");
+  const rows:any[]=editable.map(p=>[{
     text:`${can(t as Admin,p)?"✅":"⬜"} ${permissionLabels[p]}`,
     callback_data:`admp|${targetId}|${p}|${can(t as Admin,p)?"0":"1"}`
   }]);
@@ -1519,7 +1525,7 @@ async function callback(q:any){
   if(a.startsWith("admp|")){
     if(!can(admin,"admins"))return send(chatId,"لا تملك صلاحية إدارة المشرفين.");
     const [,id,perm,value]=a.split("|");const targetId=Number(id);
-    if(!(perm in permissionLabels))return send(chatId,"صلاحية غير معروفة.");
+    if(!(perm in permissionLabels)||perm==="admins")return send(chatId,"هذه الصلاحية محجوزة للأدمن الأساسي والثانوي.");
     const {data:t}=await db.from("admin_users").select("telegram_user_id,display_name,role,permissions,is_active").eq("telegram_user_id",targetId).maybeSingle();
     if(!t||!canManageAdmin(admin,t as Admin)||["owner","secondary_admin"].includes(t.role))return send(chatId,"غير مسموح.");
     const permissions={...(t.permissions||{}),[perm]:value==="1"};
