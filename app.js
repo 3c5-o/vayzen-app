@@ -378,19 +378,24 @@ function renderAccount(){
 
 async function loadDetailQualities(item){
   const wrap=$("#detailQualityList");if(!wrap)return;
+  const expectedId=item.id;
   wrap.innerHTML='<span class="quality-loading">جاري قراءة الجودات...</span>';
   try{
     const j=await rawApi("media_variants",{params:{type:"movie",id:item.id}});
+    if(state.detail?.id!==expectedId||state.detail?.type!=="movie")return;
+    const activeWrap=$("#detailQualityList");if(!activeWrap)return;
     const variants=Array.isArray(j.variants)?j.variants:[];
-    if(!variants.length){wrap.innerHTML='<span class="quality-loading">الجودة التلقائية</span>';return}
+    if(!variants.length){activeWrap.innerHTML='<span class="quality-loading">الجودة التلقائية</span>';return}
     const first=variants[0]?.variant||"default";
     state.detailVariant=first;
-    wrap.innerHTML=variants.map((v,i)=>`<button class="quality-pill ${i===0?"active":""}" data-q="${esc(v.variant)}">${esc(v.label||v.variant)}</button>`).join("");
-    wrap.querySelectorAll("[data-q]").forEach(b=>b.onclick=()=>{
+    activeWrap.innerHTML=variants.map((v,i)=>`<button class="quality-pill ${i===0?"active":""}" data-q="${esc(v.variant)}">${esc(v.label||v.variant)}</button>`).join("");
+    activeWrap.querySelectorAll("[data-q]").forEach(b=>b.onclick=()=>{
       state.detailVariant=b.dataset.q||"default";
-      wrap.querySelectorAll("[data-q]").forEach(x=>x.classList.toggle("active",x===b));
+      activeWrap.querySelectorAll("[data-q]").forEach(x=>x.classList.toggle("active",x===b));
     });
-  }catch{wrap.innerHTML='<span class="quality-loading">الجودة التلقائية</span>'}
+  }catch{
+    if(state.detail?.id===expectedId)$("#detailQualityList")?.replaceChildren(document.createTextNode("الجودة التلقائية"));
+  }
 }
 function renderRelated(type,item){
   const grid=$("#relatedGrid");if(!grid)return;
@@ -446,6 +451,7 @@ async function openDetails(type,id){
     </div>
   `;
   openModal("detailModal");
+  const detailSheet=document.querySelector("#detailModal .detail-sheet");if(detailSheet)detailSheet.scrollTop=0;
   if(history.state?.overlay!=="detail")history.pushState({vayzen:true,page:state.currentPage,overlay:"detail",type,id},"","#detail");
 
   $("#favoriteBtn").onclick=()=>toggleFavorite(type,id);
@@ -465,13 +471,17 @@ async function openDetails(type,id){
 }
 
 async function loadSeriesContent(series){
-  const tabs=$("#seasonTabs"),list=$("#episodeList");
-  if(!tabs||!list)return;
-  tabs.innerHTML='<button class="season-tab active skeleton-tab">جاري التحميل</button>';
-  list.innerHTML='<div class="episode-skeleton"></div><div class="episode-skeleton"></div>';
+  const expectedId=series.id;
+  const loadingTabs=$("#seasonTabs"),loadingList=$("#episodeList");
+  if(!loadingTabs||!loadingList)return;
+  loadingTabs.innerHTML='<button class="season-tab active skeleton-tab">جاري التحميل</button>';
+  loadingList.innerHTML='<div class="episode-skeleton"></div><div class="episode-skeleton"></div>';
   try{
     const j=await rawApi("series_content",{params:{id:series.id}});
+    if(state.detail?.id!==expectedId||state.detail?.type!=="series")return;
+    const liveTabs=$("#seasonTabs"),liveList=$("#episodeList");if(!liveTabs||!liveList)return;
     const seasons=j.seasons||[];
+    const tabs=liveTabs,list=liveList;
     if(!seasons.length){tabs.innerHTML="";list.innerHTML='<div class="empty-state">لا توجد حلقات منشورة بعد.</div>';return}
     tabs.innerHTML=seasons.map((s,i)=>`<button class="season-tab ${i===0?"active":""}" data-i="${i}">${esc(s.title||("الموسم "+s.season_number))}<small>${(s.episodes||[]).length} حلقة</small></button>`).join("");
     const show=i=>{
@@ -501,7 +511,12 @@ async function loadSeriesContent(series){
     };
     tabs.querySelectorAll(".season-tab").forEach((b,i)=>b.onclick=()=>show(i));
     show(0);
-  }catch{tabs.innerHTML="";list.innerHTML='<div class="empty-state">تعذر تحميل الحلقات. حاول مرة أخرى.</div>'}
+  }catch{
+    if(state.detail?.id!==expectedId)return;
+    const tabs=$("#seasonTabs"),list=$("#episodeList");
+    if(tabs)tabs.innerHTML="";
+    if(list)list.innerHTML='<div class="empty-state">تعذر تحميل الحلقات. حاول مرة أخرى.</div>';
+  }
 }
 
 async function toggleFavorite(type,id){
