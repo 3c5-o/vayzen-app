@@ -611,8 +611,8 @@ async function saveCurrentProgress(){
 }
 
 video.addEventListener("loadstart",()=>$("#playerLoader").classList.remove("hidden"));
-video.addEventListener("waiting",()=>$("#playerLoader").classList.remove("hidden"));
-video.addEventListener("stalled",()=>$("#playerLoader").classList.remove("hidden"));
+video.addEventListener("waiting",()=>{if(!holdActive)$("#playerLoader").classList.remove("hidden")});
+video.addEventListener("stalled",()=>{if(!holdActive)$("#playerLoader").classList.remove("hidden")});
 video.addEventListener("playing",()=>{playerRetryCount=0;$("#playerLoader").classList.add("hidden");$("#playerError").classList.add("hidden");updatePlayIcon();scheduleControlsHide()});
 video.addEventListener("canplay",()=>$("#playerLoader").classList.add("hidden"));
 video.addEventListener("loadedmetadata",syncPlayerUI);
@@ -643,7 +643,7 @@ function startNextEpisodeCountdown(){
     if(left<=0){
       clearInterval(nextCountdownTick);
       $("#nextCountdown").classList.add("hidden");
-      openPlayer(next);
+      openPlayer(next,{pushHistory:false});
     }
   },1000);
 }
@@ -689,23 +689,25 @@ function endHoldSpeed(){
   if(!holdActive)return;
   holdActive=false;
   video.playbackRate=holdPreviousRate||1;
-  $("#holdSpeedBadge").classList.add("hidden");
   $("#speedSelect").value=String(video.playbackRate);
-  showPlayerControls();
+  scheduleControlsHide();
 }
+playerStage.addEventListener("contextmenu",e=>e.preventDefault());
+playerStage.addEventListener("selectstart",e=>e.preventDefault());
 playerStage.addEventListener("pointerdown",e=>{
-  if(e.target.closest(".player-chrome,.player-error,.player-loader"))return;
+  if(e.target.closest(".player-chrome,.player-error,.player-loader,.next-countdown"))return;
   holdActive=false;
   holdPreviousRate=video.playbackRate||1;
   holdTimer=setTimeout(()=>{
     if(video.paused)return;
-    holdActive=true;video.playbackRate=2;
-    $("#holdSpeedBadge").classList.remove("hidden");
-    if(navigator.vibrate)navigator.vibrate(20);
-  },430);
+    holdActive=true;
+    $("#playerLoader").classList.add("hidden");
+    playerLayer.classList.add("controls-hidden","idle");
+    video.playbackRate=2;
+  },360);
 });
 playerStage.addEventListener("pointerup",e=>{
-  if(e.target.closest(".player-chrome,.player-error,.player-loader"))return;
+  if(e.target.closest(".player-chrome,.player-error,.player-loader,.next-countdown"))return;
   clearTimeout(holdTimer);
   if(holdActive){endHoldSpeed();return}
   const now=Date.now(),x=e.clientX,w=window.innerWidth||1;
@@ -725,13 +727,25 @@ playerStage.addEventListener("pointerup",e=>{
   },330);
 });
 playerStage.addEventListener("pointercancel",endHoldSpeed);
-playerStage.addEventListener("pointerleave",e=>{if(holdActive)endHoldSpeed()});
+playerStage.addEventListener("pointerleave",()=>{if(holdActive)endHoldSpeed()});
 playerLayer.addEventListener("pointermove",()=>{if(!holdActive)showPlayerControls()});
 
-$("#playerBack").onclick=closePlayer;
+$("#playerBack").onclick=()=>closePlayer();
 $("#playPauseBtn").onclick=togglePlayback;
 $("#rewindBtn").onclick=()=>seekBy(-10);
 $("#forwardBtn").onclick=()=>seekBy(10);
+$("#qualitySelect").onchange=()=>{
+  const o=state.player;if(!o)return;
+  const t=video.currentTime||0,paused=video.paused;
+  o.qualityVariant=$("#qualitySelect").value||"default";
+  o.src=sourceForPlayer(o,o.qualityVariant);
+  $("#playerLoader").classList.remove("hidden");
+  video.src=o.src;video.load();
+  video.addEventListener("loadedmetadata",()=>{
+    if(t>0&&t<video.duration)video.currentTime=t;
+    if(!paused)video.play().catch(()=>{});
+  },{once:true});
+};
 $("#speedSelect").onchange=e=>{
   video.playbackRate=Number(e.target.value)||1;
   flashSeek((Number(e.target.value)||1)+"×");showPlayerControls();
@@ -755,11 +769,11 @@ $("#fullscreenBtn").onclick=async()=>{
     }
   }catch{showToast("تعذر فتح ملء الشاشة")}
 };
-$("#nextEpisodeBtn").onclick=()=>{if(state.nextEpisode)openPlayer(state.nextEpisode)};
+$("#nextEpisodeBtn").onclick=()=>{if(state.nextEpisode)openPlayer(state.nextEpisode,{pushHistory:false})};
 $("#retryPlayer").onclick=()=>retryCurrentPlayer(false);
 $("#playNextNow").onclick=()=>{
   clearInterval(nextCountdownTick);$("#nextCountdown").classList.add("hidden");
-  if(state.nextEpisode)openPlayer(state.nextEpisode);
+  if(state.nextEpisode)openPlayer(state.nextEpisode,{pushHistory:false});
 };
 $("#cancelNext").onclick=()=>{
   clearInterval(nextCountdownTick);$("#nextCountdown").classList.add("hidden");showPlayerControls(true);
