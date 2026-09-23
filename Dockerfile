@@ -9,6 +9,9 @@ COPY gateway/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY gateway/app.py /app/app.py
+COPY index.html /app/web/index.html
+COPY styles.css /app/web/styles.css
+COPY app.js /app/web/app.js
 
 EXPOSE 10000
 
