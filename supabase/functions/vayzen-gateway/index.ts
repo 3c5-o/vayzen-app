@@ -506,7 +506,7 @@ async function sendEpisodeItem(chatId:number,publicId:string){
   const rows:any[]=[
     [{text:nextStatus==="published"?"نشر الحلقة":"إخفاء الحلقة",callback_data:`eps|${ep.public_id}|${nextStatus}`}],
     [{text:"تعديل الاسم",callback_data:`epe|${ep.public_id}|title`},{text:"تعديل الوصف",callback_data:`epe|${ep.public_id}|description`}],
-    [{text:"تعديل الجودة",callback_data:`epe|${ep.public_id}|quality`},{text:"استبدال الفيديو",callback_data:`epv|${ep.public_id}`}],
+    [{text:"تعديل الجودة",callback_data:`epe|${ep.public_id}|quality`},{text:"إدارة الجودات",callback_data:`q|episode|${ep.public_id}`}],
     [{text:"حذف الحلقة",callback_data:`epd1|${ep.public_id}`}],
     [{text:"رجوع للحلقات",callback_data:`se|${ep.series?.public_id||""}`}],
   ];
@@ -514,6 +514,56 @@ async function sendEpisodeItem(chatId:number,publicId:string){
     `${ep.public_id}\n${ep.series?.title||"مسلسل"} • موسم ${ep.season?.season_number||"—"} • حلقة ${ep.episode_number}\n\nالعنوان: ${ep.title||"—"}\nالحالة: ${ep.status}\nالجودة: ${ep.quality||"—"}\nالمشاهدات: ${ep.view_count||0}`,
     {inline_keyboard:rows}
   );
+}
+
+async function qualityTarget(type:string,publicId:string){
+  if(type==="movie"){
+    const item:any=await contentByPublicId("movie",publicId);
+    return item?{entityType:"movie",item,channelKey:"movies_storage"}:null;
+  }
+  if(type==="episode"){
+    const item:any=await episodeByPublicId(publicId);
+    return item?{entityType:"episode",item,channelKey:"series_storage"}:null;
+  }
+  return null;
+}
+
+async function sendQualityManager(chatId:number,type:string,publicId:string){
+  const target:any=await qualityTarget(type,publicId);
+  if(!target)return send(chatId,"المحتوى غير موجود.");
+  const {data,error}=await db.from("media_assets").select("variant,file_size").eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("kind","video");
+  if(error)throw error;
+  const list=(data??[]).sort((a:any,b:any)=>qualityRank(String(b.variant))-qualityRank(String(a.variant)));
+  const rows:any[]=list.map((x:any)=>[{text:`${variantLabel(String(x.variant))} • ${sizeLabel(x.file_size)}`,callback_data:`qv|${type}|${publicId}|${x.variant}`}]);
+  rows.push([{text:"إضافة جودة",callback_data:`qa|${type}|${publicId}`}]);
+  rows.push([{text:"رجوع",callback_data:type==="movie"?`cm|movie|${publicId}`:`epi|${publicId}`}]);
+  return send(chatId,`${type==="movie"?"جودات الفيلم":"جودات الحلقة"}\n\n${list.length?`الموجود: ${list.length}`:"لا توجد ملفات فيديو."}`,{inline_keyboard:rows});
+}
+
+async function sendQualityItem(chatId:number,type:string,publicId:string,variant:string){
+  const target:any=await qualityTarget(type,publicId);
+  if(!target)return send(chatId,"المحتوى غير موجود.");
+  const v=normalizeVariant(variant);
+  const asset:any=await currentAsset(target.entityType,target.item.id,"video",v);
+  if(!asset)return sendQualityManager(chatId,type,publicId);
+  return send(chatId,`${variantLabel(v)}\nالحجم: ${sizeLabel(asset.file_size)}`,{inline_keyboard:[
+    [{text:"استبدال الفيديو",callback_data:`qr|${type}|${publicId}|${v}`}],
+    [{text:"حذف الجودة",callback_data:`qd1|${type}|${publicId}|${v}`}],
+    [{text:"رجوع للجودات",callback_data:`q|${type}|${publicId}`}],
+  ]});
+}
+
+async function deleteQuality(adminId:number,type:string,publicId:string,variant:string){
+  const target:any=await qualityTarget(type,publicId);
+  if(!target)throw new Error("المحتوى غير موجود");
+  const {data:list}=await db.from("media_assets").select("variant").eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("kind","video");
+  if((list??[]).length<=1)throw new Error("لا يمكن حذف آخر جودة؛ استبدل الفيديو بدلًا من ذلك.");
+  const v=normalizeVariant(variant);
+  const old:any=await currentAsset(target.entityType,target.item.id,"video",v);
+  if(old)await deleteCopiedMessage({channel_id:old.channel_id,message_id:old.channel_message_id});
+  const {error}=await db.from("media_assets").delete().eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("kind","video").eq("variant",v);
+  if(error)throw error;
+  await adminLog(adminId,"quality_delete",target.entityType,target.item.id,publicId,{variant:v});
 }
 
 async function sendUsersManager(chatId:number){
@@ -642,7 +692,7 @@ async function sendContentItem(chatId:number,type:string,publicId:string){
   const rows:any[]=[
     [{text:"تعديل البيانات",callback_data:`ce|${type}|${item.public_id}`},{text:"استبدال البوستر",callback_data:`cp|${type}|${item.public_id}`}],
     [type==="movie"
-      ?{text:"استبدال الفيديو",callback_data:`cv|movie|${item.public_id}`}
+      ?{text:"إدارة الجودات",callback_data:`q|movie|${item.public_id}`}
       :{text:"المواسم والحلقات",callback_data:`se|${item.public_id}`}],
     [{text:nextStatus==="published"?"نشر المحتوى":"إخفاء المحتوى",callback_data:`cs|${type}|${item.public_id}|${nextStatus}`}],
     [{text:item.is_featured?"إلغاء التمييز":"تمييز في الرئيسية",callback_data:`cf|${type}|${item.public_id}|${item.is_featured?"0":"1"}`}],
