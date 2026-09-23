@@ -1,0 +1,81 @@
+name: VAYZEN Release Check
+
+on:
+  push:
+    branches:
+      - vayzen-release-1-production-hardening-20260924
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python syntax
+        run: |
+          python -m py_compile gateway/app.py scripts/load_test.py
+
+      - name: JavaScript syntax
+        run: |
+          node --check app.js
+
+      - name: HTML and CSS static integrity
+        run: |
+          python - <<'PY'
+          import re
+          from pathlib import Path
+
+          html = Path("index.html").read_text(encoding="utf-8")
+          js = Path("app.js").read_text(encoding="utf-8")
+          css = Path("styles.css").read_text(encoding="utf-8")
+
+          ids = re.findall(r'\sid="([^"]+)"', html)
+          duplicates = sorted({x for x in ids if ids.count(x) > 1})
+          if duplicates:
+              raise SystemExit(f"duplicate HTML ids: {duplicates}")
+
+          refs = set(re.findall(r'\$\("#([A-Za-z0-9_-]+)"\)', js))
+          dynamic = {
+              "favoriteBtn","detailShare","detailReport","detailPlay",
+              "detailQualityList","relatedGrid","seasonTabs","episodeList"
+          }
+          missing = sorted(refs - set(ids) - dynamic)
+          if missing:
+              raise SystemExit(f"missing static DOM ids: {missing}")
+
+          if css.count("{") != css.count("}"):
+              raise SystemExit("CSS brace mismatch")
+
+          required = [
+              "subtitleSelect","watchHistoryList","playerLayer","qualitySelect",
+              "moviesGrid","seriesGrid","hero","bottom-nav"
+          ]
+          for value in required:
+              if value not in html and value not in css:
+                  raise SystemExit(f"required UI marker missing: {value}")
+
+          print(f"HTML ids: {len(ids)}")
+          print(f"JS static refs: {len(refs)}")
+          print("Static UI integrity: OK")
+          PY
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Edge Function typecheck
+        run: |
+          deno check supabase/functions/vayzen-gateway/index.ts
+
+      - name: Docker build
+        run: |
+          docker build -t vayzen-release-check .
