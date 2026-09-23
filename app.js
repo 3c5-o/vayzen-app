@@ -531,7 +531,24 @@ async function recordPlaybackView(o){
   viewedThisSession.add(key);
   try{await rawApi("view",{method:"POST",body:{entity_type:o.type,entity_id:o.id,viewer_key:requestKey()}})}catch{}
 }
-function openPlayer(o){
+async function loadPlayerQualities(o){
+  const select=$("#qualitySelect");if(!select)return;
+  select.innerHTML='<option value="default">تلقائي</option>';
+  try{
+    const j=await rawApi("media_variants",{params:{type:o.type,id:o.id}});
+    const variants=Array.isArray(j.variants)?j.variants:[];
+    const names=[...new Set(variants.map(v=>String(v.variant||"")).filter(Boolean))];
+    select.innerHTML=names.length?names.map(v=>"<option value=\""+esc(v)+"\">"+esc(v==="default"?(o.quality||"افتراضي"):v)+"</option>").join(""):'<option value="default">تلقائي</option>';
+    const wanted=o.qualityVariant&&names.includes(o.qualityVariant)?o.qualityVariant:(names.includes("default")?"default":names[0]);
+    if(wanted)select.value=wanted;
+  }catch{
+    select.innerHTML='<option value="default">تلقائي</option>';
+  }
+}
+function sourceForPlayer(o,variant=""){
+  return mediaUrl(o.type==="movie"?"movie_video":"episode_video",o.id,variant);
+}
+async function openPlayer(o,{pushHistory=true}={}){
   clearTimeout(playerRetryTimer);clearInterval(nextCountdownTimer);clearInterval(nextCountdownTick);
   playerRetryCount=0;
   $("#nextCountdown")?.classList.add("hidden");
@@ -545,20 +562,23 @@ function openPlayer(o){
   seekInput.value="0";seekInput.style.setProperty("--progress","0%");
   $("#playerCurrentTime").textContent="0:00";$("#playerDuration").textContent="0:00";$("#playerRemaining").textContent="−0:00";
   video.playbackRate=1;$("#speedSelect").value="1";
+  await loadPlayerQualities(o);
+  const qv=$("#qualitySelect")?.value||"default";
+  o.qualityVariant=qv;o.src=sourceForPlayer(o,qv);
   video.src=o.src;video.load();
+  if(pushHistory&&history.state?.overlay!=="player")history.pushState({vayzen:true,page:state.currentPage,overlay:"player"},"","#watch");
 
   const p=playerProgress();
   video.addEventListener("loadedmetadata",()=>{
-    if(p&&Number(p.position_seconds)>7&&Number(p.position_seconds)<video.duration-10){
-      video.currentTime=Number(p.position_seconds);
-    }
+    if(p&&Number(p.position_seconds)>7&&Number(p.position_seconds)<video.duration-10)video.currentTime=Number(p.position_seconds);
     syncPlayerUI();
     video.addEventListener("playing",()=>recordPlaybackView(o),{once:true});
     video.play().catch(()=>{showPlayerControls(true)});
   },{once:true});
   showPlayerControls();
 }
-async function closePlayer(){
+async function closePlayer({fromHistory=false}={}){
+  if(!fromHistory&&history.state?.overlay==="player"){history.back();return}
   clearTimeout(playerRetryTimer);clearInterval(nextCountdownTimer);clearInterval(nextCountdownTick);
   $("#nextCountdown")?.classList.add("hidden");
   await saveCurrentProgress();
