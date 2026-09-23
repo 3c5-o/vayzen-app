@@ -7,7 +7,7 @@
   <meta name="color-scheme" content="dark">
   <meta name="application-name" content="VAYZEN">
   <title>VAYZEN</title>
-  <link rel="stylesheet" href="./styles.css?v=20260923-6">
+  <link rel="stylesheet" href="./styles.css?v=20260923-7">
 </head>
 <body>
 <svg class="svg-sprite" aria-hidden="true">
@@ -293,6 +293,18 @@
       </div>
     </div>
 
+    <div class="next-countdown hidden" id="nextCountdown">
+      <div class="next-countdown-card">
+        <small>الحلقة التالية</small>
+        <b id="nextCountdownTitle"></b>
+        <p>تبدأ خلال <span id="nextCountdownSeconds">5</span> ثوانٍ</p>
+        <div>
+          <button class="btn primary" id="playNextNow">تشغيل الآن</button>
+          <button class="btn secondary" id="cancelNext">إلغاء</button>
+        </div>
+      </div>
+    </div>
+
     <div class="player-controls player-chrome">
       <input id="playerSeek" class="player-seek" type="range" min="0" max="1000" value="0" step="1" aria-label="موضع الفيديو">
       <div class="player-time-row">
@@ -319,6 +331,6 @@
   </div>
 </div>
 
-<script src="./app.js?v=20260923-6" defer></script>
+<script src="./app.js?v=20260923-7" defer></script>
 </body>
 </html>
