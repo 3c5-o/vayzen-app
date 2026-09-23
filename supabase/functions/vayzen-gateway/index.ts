@@ -1,6 +1,6 @@
 import { createClient } from "npm:@supabase/supabase-js@2.95.0";
 
-const MAX_VIDEO_BYTES = 500 * 1024 * 1024;
+const MAX_VIDEO_BYTES = 800 * 1024 * 1024;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 function envMap(name:string){
   try{return JSON.parse(Deno.env.get(name) ?? "{}") as Record<string,string>;}catch{return {};}
@@ -695,10 +695,10 @@ async function message(m:any){
     if(s.step==="country"){d.country=text==="-"?"":text;await setSession(userId,"movie","duration",d);return send(chatId,"أرسل مدة الفيلم بالدقائق، أو - للتخطي.");}
     if(s.step==="duration"){const n=positiveOrNull(text);if(text!=="-"&&!n)return send(chatId,"أرسل رقمًا صحيحًا أو -.");d.duration_minutes=n;await setSession(userId,"movie","quality",d);return send(chatId,"أرسل الجودة، مثال 1080p.");}
     if(s.step==="quality"){d.quality=text;await setSession(userId,"movie","poster",d);return send(chatId,"أرسل بوستر الفيلم.");}
-    if(s.step==="poster"){const f=photoFrom(m);if(!f)return send(chatId,"أرسل صورة البوستر.");d.poster=f;d.poster_source_message_id=m.message_id;await setSession(userId,"movie","video",d);return send(chatId,"أرسل فيديو الفيلم. الحد الحالي 500MB.");}
+    if(s.step==="poster"){const f=photoFrom(m);if(!f)return send(chatId,"أرسل صورة البوستر.");d.poster=f;d.poster_source_message_id=m.message_id;await setSession(userId,"movie","video",d);return send(chatId,"أرسل فيديو الفيلم. الحد الحالي 800MB.");}
     if(s.step==="video"){
       const f=videoFrom(m);if(!f)return send(chatId,"أرسل ملف فيديو.");
-      if(f.file_size&&f.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 500MB.");
+      if(f.file_size&&f.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
       d.video=f;d.video_source_message_id=m.message_id;
       await setSession(userId,"movie","confirm",d);
       return send(chatId,movieSummary(d),{inline_keyboard:[[{text:"نشر الفيلم",callback_data:"confirm_movie"},{text:"إلغاء",callback_data:"cancel"}]]});
@@ -728,10 +728,10 @@ async function message(m:any){
     if(s.step==="episode"){const n=Number(text);if(!Number.isInteger(n)||n<1)return send(chatId,"رقم الحلقة غير صحيح.");d.episode_number=n;await setSession(userId,"episode","title",d);return send(chatId,"أرسل اسم الحلقة، أو - للاسم التلقائي.");}
     if(s.step==="title"){d.title=text==="-"?`الحلقة ${d.episode_number}`:text;await setSession(userId,"episode","description",d);return send(chatId,"أرسل وصف الحلقة، أو - للتخطي.");}
     if(s.step==="description"){d.description=text==="-"?"":text;await setSession(userId,"episode","quality",d);return send(chatId,"أرسل الجودة.");}
-    if(s.step==="quality"){d.quality=text;await setSession(userId,"episode","video",d);return send(chatId,"أرسل فيديو الحلقة. الحد 500MB.");}
+    if(s.step==="quality"){d.quality=text;await setSession(userId,"episode","video",d);return send(chatId,"أرسل فيديو الحلقة. الحد 800MB.");}
     if(s.step==="video"){
       const f=videoFrom(m);if(!f)return send(chatId,"أرسل ملف فيديو.");
-      if(f.file_size&&f.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 500MB.");
+      if(f.file_size&&f.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
       d.video=f;d.video_source_message_id=m.message_id;
       await setSession(userId,"episode","confirm",d);
       return send(chatId,`معاينة الحلقة:\n${d.series_public_id}\nالموسم: ${d.season_number}\nالحلقة: ${d.episode_number}\nالعنوان: ${d.title}\nالجودة: ${d.quality}\nالحجم: ${sizeLabel(f.file_size)}`,{inline_keyboard:[[{text:"نشر الحلقة",callback_data:"confirm_episode"},{text:"إلغاء",callback_data:"cancel"}]]});
@@ -792,7 +792,7 @@ async function media(type:string,id:string,req?:Request){
     const signingSecret=await streamSigningSecret();
     const gatewayBase=await streamGateway();
     if(!gatewayBase||!signingSecret) return json({error:"streaming gateway not configured"},503);
-    if(a.file_size&&Number(a.file_size)>MAX_VIDEO_BYTES) return json({error:"file exceeds current 500MB limit"},413);
+    if(a.file_size&&Number(a.file_size)>MAX_VIDEO_BYTES) return json({error:"file exceeds current 800MB limit"},413);
     const exp=Math.floor(Date.now()/1000)+600;
     const payload=`${a.channel_id}:${a.channel_message_id}:${exp}`;
     const sig=await hmacHex(payload,signingSecret);
