@@ -541,15 +541,30 @@ async function recordPlaybackView(o){
 async function loadPlayerQualities(o){
   const select=$("#qualitySelect");if(!select)return;
   select.innerHTML='<option value="default">تلقائي</option>';
+  select.classList.add("hidden");
   try{
     const j=await rawApi("media_variants",{params:{type:o.type,id:o.id}});
     const variants=Array.isArray(j.variants)?j.variants:[];
-    const names=[...new Set(variants.map(v=>String(v.variant||"")).filter(Boolean))];
-    select.innerHTML=names.length?names.map(v=>"<option value=\""+esc(v)+"\">"+esc(v==="default"?(o.quality||"افتراضي"):v)+"</option>").join(""):'<option value="default">تلقائي</option>';
+    const unique=[];
+    const seen=new Set();
+    for(const v of variants){
+      const name=String(v.variant||"");
+      if(!name||seen.has(name))continue;
+      seen.add(name);
+      unique.push({variant:name,label:String(v.label||name)});
+    }
+    if(!unique.length){
+      select.innerHTML='<option value="default">تلقائي</option>';
+      return;
+    }
+    select.innerHTML=unique.map(v=>"<option value=\""+esc(v.variant)+"\">"+esc(v.variant==="default"?(o.quality||v.label||"افتراضي"):v.label)+"</option>").join("");
+    const names=unique.map(v=>v.variant);
     const wanted=o.qualityVariant&&names.includes(o.qualityVariant)?o.qualityVariant:(names.includes("default")?"default":names[0]);
     if(wanted)select.value=wanted;
+    select.classList.toggle("hidden",unique.length<=1);
   }catch{
     select.innerHTML='<option value="default">تلقائي</option>';
+    select.classList.add("hidden");
   }
 }
 function sourceForPlayer(o,variant=""){
