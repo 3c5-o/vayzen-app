@@ -25,6 +25,8 @@ create table if not exists public.movies (
   external_id bigint,
   external_metadata jsonb not null default '{}'::jsonb,
   release_date date,
+  rating numeric(4,2),
+  rating_count integer,
   created_by bigint,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -48,6 +50,8 @@ create table if not exists public.series (
   external_id bigint,
   external_metadata jsonb not null default '{}'::jsonb,
   first_air_date date,
+  rating numeric(4,2),
+  rating_count integer,
   created_by bigint,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -83,6 +87,8 @@ create table if not exists public.episodes (
   external_id bigint,
   external_metadata jsonb not null default '{}'::jsonb,
   air_date date,
+  rating numeric(4,2),
+  rating_count integer,
   created_by bigint,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
