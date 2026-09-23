@@ -546,23 +546,62 @@ async function sendUserItem(chatId:number,userId:string){
 }
 
 async function sendContentManager(chatId:number){
-  const [{data:m},{data:s}]=await Promise.all([
-    db.from("movies").select("public_id,title,status,is_featured").order("created_at",{ascending:false}).limit(6),
-    db.from("series").select("public_id,title,status,is_featured").order("created_at",{ascending:false}).limit(6),
+  const [m,s]=await Promise.all([
+    db.from("movies").select("id",{head:true,count:"exact"}),
+    db.from("series").select("id",{head:true,count:"exact"}),
   ]);
-  const all=[
-    ...(m??[]).map((x:any)=>({...x,type:"movie"})),
-    ...(s??[]).map((x:any)=>({...x,type:"series"})),
-  ];
-  const text=all.length
-    ?"إدارة المحتوى\n\nاختر عنصرًا للتحكم بالنشر أو التمييز أو الحذف."
-    :"لا يوجد محتوى بعد.";
-  const rows=all.map((x:any)=>[{
-    text:`${x.status==="published"?"●":"○"} ${x.public_id} | ${String(x.title).slice(0,28)}${x.is_featured?" ★":""}`,
-    callback_data:`cm|${x.type}|${x.public_id}`
+  return send(chatId,
+    `إدارة المحتوى\n\nالأفلام: ${m.count||0}\nالمسلسلات: ${s.count||0}\n\nاختر القسم:`,
+    {inline_keyboard:[
+      [{text:`الأفلام (${m.count||0})`,callback_data:"content_movies"},{text:`المسلسلات (${s.count||0})`,callback_data:"content_series"}],
+      [{text:"بحث في المحتوى",callback_data:"content_search"}],
+      [{text:"رجوع للقائمة",callback_data:"menu"}],
+    ]}
+  );
+}
+
+async function sendContentList(chatId:number,type:"movie"|"series"){
+  const table=type==="movie"?"movies":"series";
+  const {data,error}=await db.from(table).select("public_id,title,status,is_featured,created_at").order("created_at",{ascending:false}).limit(20);
+  if(error)throw error;
+  const rows:any[]=(data??[]).map((x:any)=>[{
+    text:`${x.status==="published"?"●":"○"} ${String(x.title).slice(0,30)}${x.is_featured?" ★":""}`,
+    callback_data:`cm|${type}|${x.public_id}`
   }]);
-  rows.push([{text:"رجوع للقائمة",callback_data:"menu"}]);
-  return send(chatId,text,{inline_keyboard:rows});
+  rows.push([{text:"بحث",callback_data:`content_search_type|${type}`},{text:"رجوع",callback_data:"content"}]);
+  return send(chatId,type==="movie"?"الأفلام\n\nاختر فيلمًا لإدارته:":"المسلسلات\n\nاختر مسلسلًا لإدارته:",{inline_keyboard:rows});
+}
+
+async function searchContent(chatId:number,query:string,type?:string){
+  const q=query.trim();
+  if(q.length<2)return send(chatId,"أرسل حرفين على الأقل.");
+  const types=type&&["movie","series"].includes(type)?[type]:["movie","series"];
+  const rows:any[]=[];
+  for(const t of types){
+    const table=t==="movie"?"movies":"series";
+    const {data}=await db.from(table).select("public_id,title,status,is_featured").or(`title.ilike.%${q}%,public_id.ilike.%${q}%`).limit(10);
+    for(const x of data??[])rows.push([{text:`${t==="movie"?"فيلم":"مسلسل"} • ${String(x.title).slice(0,28)}`,callback_data:`cm|${t}|${x.public_id}`}]);
+  }
+  rows.push([{text:"بحث جديد",callback_data:type?`content_search_type|${type}`:"content_search"},{text:"رجوع",callback_data:type==="movie"?"content_movies":type==="series"?"content_series":"content"}]);
+  return send(chatId,rows.length>1?`نتائج البحث عن: ${q}`:"لا توجد نتائج مطابقة.",{inline_keyboard:rows});
+}
+
+async function sendEpisodeSeriesPicker(chatId:number){
+  const {data,error}=await db.from("series").select("public_id,title,status").eq("status","published").order("updated_at",{ascending:false}).limit(20);
+  if(error)throw error;
+  const rows:any[]=(data??[]).map((x:any)=>[{text:String(x.title).slice(0,34),callback_data:`add_episode_for|${x.public_id}`}]);
+  rows.push([{text:"رجوع",callback_data:"menu"}]);
+  return send(chatId,(data??[]).length?"إضافة حلقة\n\nاختر المسلسل أولًا:":"لا توجد مسلسلات منشورة بعد.",{inline_keyboard:rows});
+}
+
+async function sendEpisodeSeasonPicker(chatId:number,seriesPublicId:string){
+  const series:any=await contentByPublicId("series",seriesPublicId);
+  if(!series)return sendEpisodeSeriesPicker(chatId);
+  const {data:seasons}=await db.from("seasons").select("season_number,title,status").eq("series_id",series.id).order("season_number",{ascending:true});
+  const rows:any[]=(seasons??[]).map((x:any)=>[{text:`الموسم ${x.season_number}${x.title&&x.title!==`الموسم ${x.season_number}`?" • "+String(x.title).slice(0,20):""}`,callback_data:`ae_season|${series.public_id}|${x.season_number}`}]);
+  rows.push([{text:"موسم جديد",callback_data:`ae_newseason|${series.public_id}`}]);
+  rows.push([{text:"رجوع للمسلسلات",callback_data:"add_episode"}]);
+  return send(chatId,`${series.title}\n\nاختر الموسم الذي ستضيف له الحلقة:`,{inline_keyboard:rows});
 }
 
 async function sendContentItem(chatId:number,type:string,publicId:string){
