@@ -482,3 +482,162 @@ create index if not exists seasons_external_idx
 create index if not exists episodes_external_idx
   on public.episodes(external_source,external_id)
   where external_id is not null;
+
+
+-- ============================================================================
+-- VAYZEN RELEASE 1.0 PRODUCTION CORE
+-- Durable media jobs, trash/restore, subtitles, watch history, health, backups.
+-- ============================================================================
+
+alter table public.movies
+  add column if not exists deleted_at timestamptz,
+  add column if not exists deleted_by bigint,
+  add column if not exists deleted_previous_status text;
+
+alter table public.series
+  add column if not exists deleted_at timestamptz,
+  add column if not exists deleted_by bigint,
+  add column if not exists deleted_previous_status text;
+
+alter table public.episodes
+  add column if not exists deleted_at timestamptz,
+  add column if not exists deleted_by bigint,
+  add column if not exists deleted_previous_status text;
+
+alter table public.media_assets
+  add column if not exists metadata jsonb not null default '{}'::jsonb;
+
+alter table public.media_transfer_jobs
+  add column if not exists caption text,
+  add column if not exists entity_type text,
+  add column if not exists entity_id uuid,
+  add column if not exists entity_public_id text,
+  add column if not exists kind text,
+  add column if not exists variant text,
+  add column if not exists file_metadata jsonb not null default '{}'::jsonb;
+
+create index if not exists movies_deleted_at_idx on public.movies(deleted_at) where deleted_at is not null;
+create index if not exists series_deleted_at_idx on public.series(deleted_at) where deleted_at is not null;
+create index if not exists episodes_deleted_at_idx on public.episodes(deleted_at) where deleted_at is not null;
+create index if not exists media_transfer_jobs_entity_idx on public.media_transfer_jobs(entity_type,entity_id,status,updated_at);
+create index if not exists media_transfer_jobs_failed_idx on public.media_transfer_jobs(updated_at desc) where status='failed';
+
+create table if not exists public.subtitle_tracks (
+  id uuid primary key default gen_random_uuid(),
+  entity_type text not null check (entity_type in ('movie','episode')),
+  entity_id uuid not null,
+  language_code text not null,
+  label text not null,
+  source_format text not null default 'vtt' check (source_format in ('vtt','srt')),
+  is_default boolean not null default false,
+  media_asset_id uuid references public.media_assets(id) on delete cascade,
+  created_by bigint,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique(entity_type,entity_id,language_code)
+);
+
+create table if not exists public.watch_history (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  entity_type text not null check (entity_type in ('movie','episode')),
+  entity_id uuid not null,
+  first_watched_at timestamptz not null default now(),
+  last_watched_at timestamptz not null default now(),
+  completed_at timestamptz,
+  play_count integer not null default 1 check (play_count >= 1),
+  last_position_seconds numeric not null default 0,
+  duration_seconds numeric not null default 0,
+  primary key(user_id,entity_type,entity_id)
+);
+
+create table if not exists public.media_health_runs (
+  id uuid primary key default gen_random_uuid(),
+  status text not null default 'running' check (status in ('running','completed','partial','failed')),
+  checked_assets integer not null default 0,
+  healthy_assets integer not null default 0,
+  warning_assets integer not null default 0,
+  broken_assets integer not null default 0,
+  started_by bigint,
+  started_at timestamptz not null default now(),
+  completed_at timestamptz,
+  details jsonb not null default '{}'::jsonb
+);
+
+create table if not exists public.media_health_issues (
+  id uuid primary key default gen_random_uuid(),
+  fingerprint text unique not null,
+  run_id uuid references public.media_health_runs(id) on delete set null,
+  severity text not null check (severity in ('warning','error','critical')),
+  status text not null default 'open' check (status in ('open','resolved','ignored')),
+  entity_type text,
+  entity_id uuid,
+  entity_public_id text,
+  kind text,
+  variant text,
+  message text not null,
+  details jsonb not null default '{}'::jsonb,
+  first_seen_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  resolved_at timestamptz
+);
+
+create table if not exists public.operational_alerts (
+  id uuid primary key default gen_random_uuid(),
+  fingerprint text unique not null,
+  severity text not null check (severity in ('info','warning','error','critical')),
+  status text not null default 'open' check (status in ('open','resolved','silenced')),
+  source text not null,
+  title text not null,
+  message text not null,
+  details jsonb not null default '{}'::jsonb,
+  first_seen_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  notified_at timestamptz,
+  resolved_at timestamptz
+);
+
+create table if not exists public.backup_snapshots (
+  id uuid primary key default gen_random_uuid(),
+  backup_code text unique not null,
+  status text not null default 'creating' check (status in ('creating','completed','failed')),
+  scope text not null default 'metadata',
+  row_counts jsonb not null default '{}'::jsonb,
+  checksum text,
+  telegram_channel_id bigint,
+  telegram_message_id bigint,
+  created_by bigint,
+  created_at timestamptz not null default now(),
+  completed_at timestamptz,
+  error text
+);
+
+create index if not exists subtitle_tracks_entity_idx on public.subtitle_tracks(entity_type,entity_id,created_at);
+create index if not exists watch_history_user_recent_idx on public.watch_history(user_id,last_watched_at desc);
+create index if not exists media_health_issues_open_idx on public.media_health_issues(status,severity,last_seen_at desc);
+create index if not exists operational_alerts_open_idx on public.operational_alerts(status,severity,last_seen_at desc);
+create index if not exists backup_snapshots_recent_idx on public.backup_snapshots(created_at desc);
+
+alter table public.subtitle_tracks enable row level security;
+alter table public.watch_history enable row level security;
+alter table public.media_health_runs enable row level security;
+alter table public.media_health_issues enable row level security;
+alter table public.operational_alerts enable row level security;
+alter table public.backup_snapshots enable row level security;
+
+drop trigger if exists trg_subtitle_tracks_updated_at on public.subtitle_tracks;
+create trigger trg_subtitle_tracks_updated_at
+before update on public.subtitle_tracks
+for each row execute function public.touch_updated_at();
+
+insert into public.app_settings(key,value)
+values('release',jsonb_build_object(
+  'version','1.0.0',
+  'trash_retention_days',14,
+  'max_video_mb',2000,
+  'media_health_batch_size',60,
+  'gateway_retry_attempts',3,
+  'watch_completion_ratio',0.92,
+  'monitor_interval_seconds',300
+))
+on conflict (key) do update set value=excluded.value,updated_at=now();
+
