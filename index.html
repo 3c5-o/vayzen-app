@@ -7,7 +7,7 @@
   <meta name="color-scheme" content="dark">
   <meta name="application-name" content="VAYZEN">
   <title>VAYZEN</title>
-  <link rel="stylesheet" href="./styles.css?v=20260924-01">
+  <link rel="stylesheet" href="./styles.css?v=20260924-02">
 </head>
 <body>
 <svg class="svg-sprite" aria-hidden="true">
@@ -38,9 +38,23 @@
 <symbol id="i-grid" viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></symbol>
 </svg>
 
-<div id="splash" class="splash">
-  <div class="splash-mark"><span>V</span></div>
-  <div class="splash-name">VAYZEN</div>
+<div id="splash" class="splash" aria-label="VAYZEN">
+  <div class="splash-ambient splash-ambient-a"></div>
+  <div class="splash-ambient splash-ambient-b"></div>
+  <div class="splash-grid"></div>
+  <div class="splash-content">
+    <div class="splash-emblem" aria-hidden="true">
+      <span class="splash-v splash-v-left"></span>
+      <span class="splash-v splash-v-right"></span>
+      <span class="splash-play"></span>
+      <span class="splash-ring splash-ring-a"></span>
+      <span class="splash-ring splash-ring-b"></span>
+    </div>
+    <div class="splash-wordmark">VAYZEN</div>
+    <div class="splash-tagline">MOVIES <i></i> SERIES <i></i> BEYOND</div>
+    <div class="splash-loader"><span></span></div>
+  </div>
+  <div class="splash-footer">تجربة مشاهدة سينمائية</div>
 </div>
 
 <div id="toast" class="toast"></div>
@@ -69,7 +83,10 @@
         <div class="hero-media" id="heroMedia"></div>
         <div class="hero-shade"></div>
         <div class="hero-body">
-          <div class="eyebrow"><span class="eyebrow-dot"></span> مختارات VAYZEN</div>
+          <div class="hero-topline">
+            <div class="eyebrow"><span class="eyebrow-dot"></span><span id="heroEyebrow">المضاف حديثًا</span></div>
+            <div class="hero-counter"><span id="heroCounterNow">1</span><i>/</i><span id="heroCounterTotal">4</span></div>
+          </div>
           <h1 id="heroTitle">VAYZEN</h1>
           <div class="hero-meta" id="heroMeta"></div>
           <p id="heroText">أفضل الأفلام والمسلسلات في واجهة واحدة.</p>
@@ -79,6 +96,12 @@
             <button class="hero-save" id="heroFavorite" aria-label="إضافة إلى قائمتي"><svg><use href="#i-plus"/></svg></button>
           </div>
         </div>
+        <div class="hero-carousel-controls" aria-label="التنقل بين المضاف حديثًا">
+          <button class="hero-arrow hero-prev" id="heroPrev" aria-label="السابق"><svg><use href="#i-back"/></svg></button>
+          <div class="hero-dots" id="heroDots"></div>
+          <button class="hero-arrow hero-next" id="heroNext" aria-label="التالي"><svg><use href="#i-chevron"/></svg></button>
+        </div>
+        <div class="hero-autoplay-progress" id="heroAutoplayProgress"><span></span></div>
         <div class="hero-edge"></div>
       </div>
 
@@ -390,6 +413,6 @@
   </div>
 </div>
 
-<script src="./app.js?v=20260924-01" defer></script>
+<script src="./app.js?v=20260924-02" defer></script>
 </body>
 </html>
