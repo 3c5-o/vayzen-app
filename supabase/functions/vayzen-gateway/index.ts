@@ -1232,6 +1232,42 @@ async function systemStatusText(){
   ].join("\n");
 }
 
+
+async function sendTmdbSettings(chatId:number){
+  const status=await tmdbStatus();
+  const state=status.configured?"متصل":"غير مربوط";
+  const hint=status.configured&&status.hint?`••••••${status.hint}`:"—";
+  const rows:any[]=[
+    [{text:status.configured?"تغيير Access Token":"إضافة Access Token",callback_data:"tmdb_token_set"}],
+  ];
+  if(status.configured){
+    rows.push([{text:"اختبار الاتصال",callback_data:"tmdb_token_test"},{text:"حذف الربط",callback_data:"tmdb_token_del1"}]);
+  }
+  rows.push([{text:"رجوع",callback_data:"menu"}]);
+  return send(chatId,`إعدادات TMDb\n\nالحالة: ${state}\nالتوكن: ${hint}\nالـAPI: ${TMDB_API_BASE}\n\nالإضافة اليدوية تبقى مستقلة حتى إذا TMDb غير متصل.`,{inline_keyboard:rows});
+}
+
+async function sendTmdbSearchResults(chatId:number,type:"movie"|"series",query:string){
+  const rowsData:any[]=await tmdbSearch(type,query);
+  if(!rowsData.length)return send(chatId,"ما لقيت نتائج مطابقة. جرّب الاسم الأصلي أو سنة الإصدار.",{inline_keyboard:[[{text:"بحث جديد",callback_data:`tmdb_again|${type==="movie"?"m":"s"}`},{text:"إلغاء",callback_data:"cancel"}]]});
+  const rows:any[]=rowsData.map((x:any)=>{
+    const title=String(type==="movie"?(x.title||x.original_title):(x.name||x.original_name)||"بدون اسم");
+    const date=String(type==="movie"?x.release_date:x.first_air_date||"");
+    const year=/^\d{4}/.test(date)?date.slice(0,4):"—";
+    return [{text:`${title.slice(0,36)} • ${year}`,callback_data:`tmdb_pick|${type==="movie"?"m":"s"}|${x.id}`}];
+  });
+  rows.push([{text:"بحث جديد",callback_data:`tmdb_again|${type==="movie"?"m":"s"}`},{text:"إلغاء",callback_data:"cancel"}]);
+  return send(chatId,`نتائج TMDb لـ: ${query}\n\nاختر النتيجة الصحيحة:`,{inline_keyboard:rows});
+}
+
+async function tmdbMappedDetails(type:"movie"|"series",tmdbId:number){
+  const bundle=await tmdbDetails(type,tmdbId);
+  const mapped=tmdbMap(type,bundle);
+  mapped.poster_url=await tmdbImageUrl(mapped.poster_path,"poster");
+  mapped.backdrop_url=await tmdbImageUrl(mapped.backdrop_path,"backdrop");
+  return {bundle,mapped};
+}
+
 async function callback(q:any){
   const userId=Number(q.from?.id||0);
   const chatId=Number(q.message?.chat?.id||userId);
@@ -1249,15 +1285,75 @@ async function callback(q:any){
     await clearSession(userId);
     return showMenu(chatId,"تم إلغاء العملية.");
   }
+  if(a==="tmdb_settings"){
+    if(admin.role!=="owner")return send(chatId,"إعدادات TMDb متاحة للمالك فقط.");
+    await clearSession(userId);
+    return sendTmdbSettings(chatId);
+  }
+  if(a==="tmdb_token_set"){
+    if(admin.role!=="owner")return send(chatId,"إعدادات TMDb متاحة للمالك فقط.");
+    await setSession(userId,"tmdb_settings","token",{});
+    return send(chatId,"أرسل API Read Access Token الخاص بـTMDb.\n\nسأختبره أولًا، ثم يُحفظ مشفّرًا ولن يظهر كاملًا بعد الحفظ.");
+  }
+  if(a==="tmdb_token_test"){
+    if(admin.role!=="owner")return send(chatId,"إعدادات TMDb متاحة للمالك فقط.");
+    try{
+      await tmdbApi("/configuration");
+      const row:any=await tmdbSetting();
+      const value={...(row?.value||{}),verified_at:new Date().toISOString()};
+      await db.from("app_settings").upsert({key:"tmdb",value,updated_at:new Date().toISOString()});
+      return send(chatId,"اتصال TMDb يعمل بشكل صحيح.",{inline_keyboard:[[{text:"رجوع",callback_data:"tmdb_settings"}]]});
+    }catch(err){return send(chatId,`فشل اتصال TMDb.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"رجوع",callback_data:"tmdb_settings"}]]});}
+  }
+  if(a==="tmdb_token_del1"){
+    if(admin.role!=="owner")return send(chatId,"إعدادات TMDb متاحة للمالك فقط.");
+    return send(chatId,"تأكيد حذف ربط TMDb؟\nلن يتأثر أي فيلم أو مسلسل تم استيراده سابقًا.",{inline_keyboard:[[{text:"تأكيد الحذف",callback_data:"tmdb_token_del2"}],[{text:"تراجع",callback_data:"tmdb_settings"}]]});
+  }
+  if(a==="tmdb_token_del2"){
+    if(admin.role!=="owner")return send(chatId,"إعدادات TMDb متاحة للمالك فقط.");
+    await db.from("app_settings").delete().eq("key","tmdb");
+    await adminLog(userId,"tmdb_disconnect","settings",undefined,"tmdb",{});
+    return sendTmdbSettings(chatId);
+  }
   if(a==="add_movie"){
+    if(!can(admin,"content")||!can(admin,"publish")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
+    await clearSession(userId);
+    return send(chatId,"طريقة إضافة الفيلم:",{inline_keyboard:[
+      [{text:"إدخال يدوي",callback_data:"add_movie_manual"},{text:"جلب من TMDb",callback_data:"add_movie_tmdb"}],
+      [{text:"إلغاء",callback_data:"cancel"}]
+    ]});
+  }
+  if(a==="add_movie_manual"){
     if(!can(admin,"content")||!can(admin,"publish")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
     await setSession(userId,"movie","title",{});
     return send(chatId,"أرسل اسم الفيلم.");
   }
+  if(a==="add_movie_tmdb"){
+    if(!can(admin,"content")||!can(admin,"publish")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
+    const status=await tmdbStatus();
+    if(!status.configured)return send(chatId,"TMDb غير مربوط حاليًا. استخدم الإدخال اليدوي أو اطلب من الـOwner إضافة Access Token.",{inline_keyboard:[[{text:"إدخال يدوي",callback_data:"add_movie_manual"},{text:"رجوع",callback_data:"menu"}]]});
+    await setSession(userId,"tmdb_search","query",{type:"movie"});
+    return send(chatId,"أرسل اسم الفيلم للبحث في TMDb.");
+  }
   if(a==="add_series"){
+    if(!can(admin,"content")||!can(admin,"publish")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
+    await clearSession(userId);
+    return send(chatId,"طريقة إضافة المسلسل:",{inline_keyboard:[
+      [{text:"إدخال يدوي",callback_data:"add_series_manual"},{text:"جلب من TMDb",callback_data:"add_series_tmdb"}],
+      [{text:"إلغاء",callback_data:"cancel"}]
+    ]});
+  }
+  if(a==="add_series_manual"){
     if(!can(admin,"content")||!can(admin,"publish")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
     await setSession(userId,"series","title",{});
     return send(chatId,"أرسل اسم المسلسل.");
+  }
+  if(a==="add_series_tmdb"){
+    if(!can(admin,"content")||!can(admin,"publish")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
+    const status=await tmdbStatus();
+    if(!status.configured)return send(chatId,"TMDb غير مربوط حاليًا. استخدم الإدخال اليدوي أو اطلب من الـOwner إضافة Access Token.",{inline_keyboard:[[{text:"إدخال يدوي",callback_data:"add_series_manual"},{text:"رجوع",callback_data:"menu"}]]});
+    await setSession(userId,"tmdb_search","query",{type:"series"});
+    return send(chatId,"أرسل اسم المسلسل للبحث في TMDb.");
   }
   if(a==="batch_episode"){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
