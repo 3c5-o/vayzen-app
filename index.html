@@ -7,7 +7,7 @@
   <meta name="color-scheme" content="dark">
   <meta name="application-name" content="VAYZEN">
   <title>VAYZEN</title>
-  <link rel="stylesheet" href="./styles.css?v=20260923-7">
+  <link rel="stylesheet" href="./styles.css?v=20260923-8">
 </head>
 <body>
 <svg class="svg-sprite" aria-hidden="true">
@@ -101,13 +101,19 @@
 
     <section class="page" data-page="movies">
       <div class="page-title"><div><h1>الأفلام</h1><p>اكتشف كل الأفلام المنشورة</p></div></div>
-      <div class="chips" id="movieChips"></div>
+      <div class="catalog-filter-row">
+        <div class="chips" id="movieChips"></div>
+        <select class="filter-select" id="movieYearFilter" aria-label="فلترة الأفلام حسب السنة"><option value="">كل السنوات</option></select>
+      </div>
       <div class="grid" id="moviesGrid"></div>
     </section>
 
     <section class="page" data-page="series">
       <div class="page-title"><div><h1>المسلسلات</h1><p>المواسم والحلقات في مكان واحد</p></div></div>
-      <div class="chips" id="seriesChips"></div>
+      <div class="catalog-filter-row">
+        <div class="chips" id="seriesChips"></div>
+        <select class="filter-select" id="seriesYearFilter" aria-label="فلترة المسلسلات حسب السنة"><option value="">كل السنوات</option></select>
+      </div>
       <div class="grid" id="seriesGrid"></div>
     </section>
 
@@ -331,6 +337,6 @@
   </div>
 </div>
 
-<script src="./app.js?v=20260923-7" defer></script>
+<script src="./app.js?v=20260923-8" defer></script>
 </body>
 </html>
