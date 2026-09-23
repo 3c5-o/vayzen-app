@@ -289,3 +289,28 @@ grant select on public.movies,public.series,public.seasons,public.episodes to an
 revoke all on public.media_assets,public.telegram_channels,public.admin_users,public.bot_sessions,
 public.content_requests,public.reports,public.admin_logs,public.system_logs,public.app_settings
 from anon,authenticated;
+
+
+create or replace function public.bump_view_count(p_entity_type text, p_entity_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path=public
+as $$
+begin
+  if p_entity_type='movie' then
+    update public.movies set view_count=view_count+1, updated_at=now()
+    where id=p_entity_id and status='published';
+  elsif p_entity_type='episode' then
+    update public.episodes set view_count=view_count+1, updated_at=now()
+    where id=p_entity_id and status='published';
+  else
+    raise exception 'invalid entity type';
+  end if;
+end;
+$$;
+
+revoke all on function public.bump_view_count(text,uuid) from public;
+revoke all on function public.bump_view_count(text,uuid) from anon;
+revoke all on function public.bump_view_count(text,uuid) from authenticated;
+grant execute on function public.bump_view_count(text,uuid) to service_role;
