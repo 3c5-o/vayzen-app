@@ -490,7 +490,7 @@ async function hmacHex(payload:string){
   return [...new Uint8Array(sig)].map(b=>b.toString(16).padStart(2,"0")).join("");
 }
 
-async function media(type:string,id:string){
+async function media(type:string,id:string,req?:Request){
   const a:any=await asset(type,id);
   if(!a) return json({error:"not found"},404);
   if(type==="movie_video"||type==="episode_video"){
@@ -499,7 +499,9 @@ async function media(type:string,id:string){
     const exp=Math.floor(Date.now()/1000)+600;
     const payload=`${a.channel_id}:${a.channel_message_id}:${exp}`;
     const sig=await hmacHex(payload);
-    return Response.redirect(`${STREAM_GATEWAY}/stream/${a.channel_id}/${a.channel_message_id}?exp=${exp}&sig=${sig}`,307);
+    const origin=req?.headers.get("origin")||"";
+    const gatewayBase=origin&&/^https?:\/\//i.test(origin)?origin.replace(/\/$/,""):STREAM_GATEWAY;
+    return Response.redirect(`${gatewayBase}/stream/${a.channel_id}/${a.channel_message_id}?exp=${exp}&sig=${sig}`,307);
   }
   if(!a.telegram_file_id) return json({error:"poster file id missing"},409);
   const file=await tg("getFile",{file_id:a.telegram_file_id});
@@ -713,7 +715,7 @@ Deno.serve(async(req:Request)=>{
     if(req.method==="POST"&&action==="report") return publicReport(req);
 
     const mt=url.searchParams.get("media"),id=url.searchParams.get("id");
-    if(req.method==="GET"&&mt&&id) return media(mt,id);
+    if(req.method==="GET"&&mt&&id) return media(mt,id,req);
 
     if(req.method!=="POST") return json({error:"method not allowed"},405);
     if(!BOT_SECRET||req.headers.get("x-telegram-bot-api-secret-token")!==BOT_SECRET) return json({error:"bad webhook signature"},403);
