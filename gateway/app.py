@@ -16,7 +16,10 @@ API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 STREAM_SIGNING_SECRET = os.environ.get("STREAM_SIGNING_SECRET", "").encode()
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 VAYZEN_API_TARGET = os.environ.get("VAYZEN_API_TARGET", "").rstrip("/")
+if not VAYZEN_API_TARGET and SUPABASE_URL:
+    VAYZEN_API_TARGET = f"{SUPABASE_URL}/functions/v1/vayzen-gateway"
 MAX_CONCURRENT_STREAMS = max(1, int(os.environ.get("MAX_CONCURRENT_STREAMS", "6")))
 CHUNK_SIZE = 512 * 1024
 
