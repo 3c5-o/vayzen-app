@@ -166,6 +166,15 @@ function guestProgress(){
   try{return JSON.parse(localStorage.getItem(GUEST_PROGRESS_KEY)||"[]")}catch{return[]}
 }
 function setGuestProgress(list){localStorage.setItem(GUEST_PROGRESS_KEY,JSON.stringify(list.slice(0,100)))}
+async function removeContinueEntry(type,id){
+  if(state.user){
+    state.progress=state.progress.filter(x=>!(x.entity_type===type&&x.entity_id===id));
+    try{await rawApi("progress",{method:"POST",auth:true,body:{entity_type:type,entity_id:id,remove:true}})}catch{}
+  }else{
+    setGuestProgress(guestProgress().filter(x=>!(x.entity_type===type&&x.entity_id===id)));
+  }
+  renderContinue();
+}
 function renderContinue(){
   const entries=(state.user?state.progress:guestProgress())
     .filter(x=>Number(x.position_seconds)>5&&Number(x.duration_seconds)>20&&Number(x.position_seconds)<Number(x.duration_seconds)-5)
@@ -178,6 +187,7 @@ function renderContinue(){
       const item=state.movies.find(m=>m.id===p.entity_id);if(!item)continue;
       const idx=playable.push({type:"movie",id:item.id,title:item.title,publicId:item.public_id,src:mediaUrl("movie_video",item.id)})-1;
       html.push(`<article class="continue-watch-card" data-cont="${idx}">
+        <button class="continue-remove" data-cont-remove="${idx}" aria-label="إزالة">×</button>
         <div class="continue-poster"><img src="${mediaUrl("movie_poster",item.id)}" alt="" loading="lazy"><span class="continue-play"><svg><use href="#i-play"/></svg></span></div>
         <div class="continue-copy"><b>${esc(item.title)}</b><small>فيلم • ${formatClock(p.position_seconds)} من ${formatClock(p.duration_seconds)}</small><div class="continue-progress"><i style="width:${pct}%"></i></div></div>
       </article>`);
@@ -190,6 +200,7 @@ function renderContinue(){
         seasonNumber:p.season_number||null,episodeNumber:p.episode_number||null,episodeTitle:epTitle
       })-1;
       html.push(`<article class="continue-watch-card" data-cont="${idx}">
+        <button class="continue-remove" data-cont-remove="${idx}" aria-label="إزالة">×</button>
         <div class="continue-poster"><img src="${mediaUrl("series_poster",p.series_id)}" alt="" loading="lazy"><span class="continue-play"><svg><use href="#i-play"/></svg></span></div>
         <div class="continue-copy"><b>${esc(title)}</b><small>${esc(epTitle)} • ${formatClock(p.position_seconds)} من ${formatClock(p.duration_seconds)}</small><div class="continue-progress"><i style="width:${pct}%"></i></div></div>
       </article>`);
@@ -197,6 +208,11 @@ function renderContinue(){
   }
   $("#continueRail").innerHTML=html.length?html.join(""):'<div class="empty-card">ما عندك مشاهدة غير مكتملة بعد.</div>';
   $("#continueRail").querySelectorAll("[data-cont]").forEach(el=>el.onclick=()=>openPlayer(playable[Number(el.dataset.cont)]));
+  $("#continueRail").querySelectorAll("[data-cont-remove]").forEach(btn=>btn.onclick=e=>{
+    e.stopPropagation();
+    const o=playable[Number(btn.dataset.contRemove)];
+    if(o)removeContinueEntry(o.type,o.id);
+  });
 }
 function renderMyList(){
   const guest=$("#myListGuest"),grid=$("#myListGrid");
@@ -424,6 +440,10 @@ let holdPreviousRate=1;
 let lastTapAt=0;
 let lastTapX=0;
 let singleTapTimer=0;
+let playerRetryCount=0;
+let playerRetryTimer=0;
+let nextCountdownTimer=0;
+let nextCountdownTick=0;
 
 function formatClock(value){
   const n=Math.max(0,Math.floor(Number(value)||0));
@@ -487,6 +507,9 @@ async function recordPlaybackView(o){
   try{await rawApi("view",{method:"POST",body:{entity_type:o.type,entity_id:o.id,viewer_key:requestKey()}})}catch{}
 }
 function openPlayer(o){
+  clearTimeout(playerRetryTimer);clearInterval(nextCountdownTimer);clearInterval(nextCountdownTick);
+  playerRetryCount=0;
+  $("#nextCountdown")?.classList.add("hidden");
   state.player=o;state.nextEpisode=o.next||null;
   $("#playerTitle").textContent=o.title;$("#playerMeta").textContent=o.publicId||"";
   $("#nextEpisodeBtn").classList.toggle("hidden",!o.next);
@@ -511,6 +534,8 @@ function openPlayer(o){
   showPlayerControls();
 }
 async function closePlayer(){
+  clearTimeout(playerRetryTimer);clearInterval(nextCountdownTimer);clearInterval(nextCountdownTick);
+  $("#nextCountdown")?.classList.add("hidden");
   await saveCurrentProgress();
   video.pause();
   video.removeAttribute("src");video.load();
@@ -543,15 +568,51 @@ async function saveCurrentProgress(){
 video.addEventListener("loadstart",()=>$("#playerLoader").classList.remove("hidden"));
 video.addEventListener("waiting",()=>$("#playerLoader").classList.remove("hidden"));
 video.addEventListener("stalled",()=>$("#playerLoader").classList.remove("hidden"));
-video.addEventListener("playing",()=>{$("#playerLoader").classList.add("hidden");$("#playerError").classList.add("hidden");updatePlayIcon();scheduleControlsHide()});
+video.addEventListener("playing",()=>{playerRetryCount=0;$("#playerLoader").classList.add("hidden");$("#playerError").classList.add("hidden");updatePlayIcon();scheduleControlsHide()});
 video.addEventListener("canplay",()=>$("#playerLoader").classList.add("hidden"));
 video.addEventListener("loadedmetadata",syncPlayerUI);
 video.addEventListener("durationchange",syncPlayerUI);
 video.addEventListener("play",()=>{updatePlayIcon();scheduleControlsHide()});
 video.addEventListener("pause",()=>{updatePlayIcon();showPlayerControls(true);saveCurrentProgress()});
+function retryCurrentPlayer(auto=false){
+  const o=state.player;if(!o)return;
+  const t=video.currentTime||0;
+  $("#playerError").classList.add("hidden");$("#playerLoader").classList.remove("hidden");
+  video.src=o.src;video.load();
+  video.addEventListener("loadedmetadata",()=>{
+    if(t>0&&t<video.duration)video.currentTime=t;
+    video.play().catch(()=>{});
+  },{once:true});
+  if(!auto)playerRetryCount=0;
+}
+function startNextEpisodeCountdown(){
+  const next=state.nextEpisode;if(!next)return;
+  let left=5;
+  $("#nextCountdownTitle").textContent=next.title||"الحلقة التالية";
+  $("#nextCountdownSeconds").textContent=String(left);
+  $("#nextCountdown").classList.remove("hidden");
+  clearInterval(nextCountdownTick);
+  nextCountdownTick=setInterval(()=>{
+    left-=1;
+    $("#nextCountdownSeconds").textContent=String(Math.max(0,left));
+    if(left<=0){
+      clearInterval(nextCountdownTick);
+      $("#nextCountdown").classList.add("hidden");
+      openPlayer(next);
+    }
+  },1000);
+}
 video.addEventListener("error",()=>{
-  $("#playerLoader").classList.add("hidden");
   const code=video.error?.code||0;
+  if(code===2&&navigator.onLine&&playerRetryCount<2&&state.player){
+    playerRetryCount+=1;
+    $("#playerError").classList.add("hidden");$("#playerLoader").classList.remove("hidden");
+    $("#playerErrorText").textContent="إعادة الاتصال بمصدر الفيديو...";
+    clearTimeout(playerRetryTimer);
+    playerRetryTimer=setTimeout(()=>retryCurrentPlayer(true),1200*playerRetryCount);
+    return;
+  }
+  $("#playerLoader").classList.add("hidden");
   $("#playerErrorText").textContent=code===2?"انقطع الاتصال بمصدر الفيديو. أعد المحاولة.":code===3?"تعذر قراءة الفيديو على هذا الجهاز.":"تعذر الوصول إلى مصدر الفيديو. أعد المحاولة.";
   $("#playerError").classList.remove("hidden");showPlayerControls(true);
 });
@@ -561,7 +622,7 @@ video.addEventListener("timeupdate",()=>{
 });
 video.addEventListener("ended",async()=>{
   await saveCurrentProgress();showPlayerControls(true);
-  if(state.prefs.autoplayNext&&state.nextEpisode)setTimeout(()=>openPlayer(state.nextEpisode),650);
+  if(state.prefs.autoplayNext&&state.nextEpisode)startNextEpisodeCountdown();
 });
 
 seekInput.addEventListener("input",e=>{
@@ -650,12 +711,13 @@ $("#fullscreenBtn").onclick=async()=>{
   }catch{showToast("تعذر فتح ملء الشاشة")}
 };
 $("#nextEpisodeBtn").onclick=()=>{if(state.nextEpisode)openPlayer(state.nextEpisode)};
-$("#retryPlayer").onclick=()=>{
-  const o=state.player;if(!o)return;
-  const t=video.currentTime||0;
-  $("#playerError").classList.add("hidden");$("#playerLoader").classList.remove("hidden");
-  video.src=o.src;video.load();
-  video.addEventListener("loadedmetadata",()=>{if(t>0&&t<video.duration)video.currentTime=t;video.play().catch(()=>{})},{once:true});
+$("#retryPlayer").onclick=()=>retryCurrentPlayer(false);
+$("#playNextNow").onclick=()=>{
+  clearInterval(nextCountdownTick);$("#nextCountdown").classList.add("hidden");
+  if(state.nextEpisode)openPlayer(state.nextEpisode);
+};
+$("#cancelNext").onclick=()=>{
+  clearInterval(nextCountdownTick);$("#nextCountdown").classList.add("hidden");showPlayerControls(true);
 };
 document.addEventListener("keydown",e=>{
   if(!playerLayer.classList.contains("open")||e.target.matches("input,select,textarea"))return;
