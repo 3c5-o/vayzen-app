@@ -80,7 +80,8 @@ const mainMenu={
     [{text:"إضافة فيلم",callback_data:"add_movie"},{text:"إضافة مسلسل",callback_data:"add_series"}],
     [{text:"إضافة حلقة",callback_data:"add_episode"}],
     [{text:"طلبات المستخدمين",callback_data:"requests"},{text:"البلاغات",callback_data:"reports"}],
-    [{text:"آخر المحتوى",callback_data:"content"},{text:"الإحصائيات",callback_data:"stats"}],
+    [{text:"إدارة المحتوى",callback_data:"content"},{text:"الإحصائيات",callback_data:"stats"}],
+    [{text:"حالة النظام",callback_data:"system_status"}],
     [{text:"إلغاء العملية",callback_data:"cancel"}],
   ]
 };
@@ -168,6 +169,19 @@ async function saveAsset(entity_type:string,entity_id:string,kind:string,file:an
   if(error) throw error;
 }
 
+async function deleteCopiedMessage(place:any){
+  if(!place?.channel_id||!place?.message_id)return;
+  try{await tg("deleteMessage",{chat_id:place.channel_id,message_id:place.message_id});}catch{}
+}
+
+async function cleanupEntity(entityType:"movie"|"series"|"episode",entityId:string,places:any[]=[]){
+  for(const place of places) await deleteCopiedMessage(place);
+  try{await db.from("media_assets").delete().eq("entity_type",entityType).eq("entity_id",entityId);}catch{}
+  if(entityType==="movie")try{await db.from("movies").delete().eq("id",entityId);}catch{}
+  if(entityType==="series")try{await db.from("series").delete().eq("id",entityId);}catch{}
+  if(entityType==="episode")try{await db.from("episodes").delete().eq("id",entityId);}catch{}
+}
+
 async function adminLog(adminId:number,action:string,entity_type?:string,entity_id?:string,public_id?:string,details:any={}){
   await db.from("admin_logs").insert({
     admin_telegram_id:adminId,action,
@@ -224,33 +238,32 @@ async function publishMovie(userId:number,chatId:number,d:any){
   }).select("id,public_id").single();
   if(error||!movie) throw error??new Error("Movie insert failed");
 
-  const infoCaption=[
-    `${movie.public_id}`,
-    "",
-    `🎬 ${d.title}`,
-    d.original_title&&d.original_title!==d.title?d.original_title:"",
-    "",
-    `السنة: ${d.release_year||"—"}`,
-    `التصنيف: ${(d.genres||[]).join(" • ")||"—"}`,
-    `اللغة: ${d.language||"—"}`,
-    `الدولة: ${d.country||"—"}`,
-    `المدة: ${d.duration_minutes?d.duration_minutes+" دقيقة":"—"}`,
-    `الجودة: ${d.quality||"—"}`,
-    "",
-    d.description||"",
-    "",
-    `Movie ID: ${movie.public_id}`,
-  ].filter(Boolean).join("\n");
+  let posterPlace:any=null,videoPlace:any=null;
+  try{
+    const infoCaption=[
+      `${movie.public_id}`,"",`🎬 ${d.title}`,
+      d.original_title&&d.original_title!==d.title?d.original_title:"",
+      "",`السنة: ${d.release_year||"—"}`,
+      `التصنيف: ${(d.genres||[]).join(" • ")||"—"}`,
+      `اللغة: ${d.language||"—"}`,`الدولة: ${d.country||"—"}`,
+      `المدة: ${d.duration_minutes?d.duration_minutes+" دقيقة":"—"}`,
+      `الجودة: ${d.quality||"—"}`,"",d.description||"","",`Movie ID: ${movie.public_id}`,
+    ].filter(Boolean).join("\n");
 
-  const posterPlace=await copyTo("movies_info",chatId,d.poster_source_message_id,infoCaption);
-  const videoPlace=await copyTo("movies_storage",chatId,d.video_source_message_id,
-    `${movie.public_id} | ${d.title} | ${d.quality||"Video"} | ${sizeLabel(d.video?.file_size)}`);
-
-  await saveAsset("movie",movie.id,"poster",d.poster,posterPlace);
-  await saveAsset("movie",movie.id,"video",d.video,videoPlace);
-  await db.from("movies").update({status:"published"}).eq("id",movie.id);
-  await adminLog(userId,"movie_publish","movie",movie.id,movie.public_id,{title:d.title});
-  return movie.public_id;
+    posterPlace=await copyTo("movies_info",chatId,d.poster_source_message_id,infoCaption);
+    videoPlace=await copyTo("movies_storage",chatId,d.video_source_message_id,
+      `${movie.public_id} | ${d.title} | ${d.quality||"Video"} | ${sizeLabel(d.video?.file_size)}`);
+    await saveAsset("movie",movie.id,"poster",d.poster,posterPlace);
+    await saveAsset("movie",movie.id,"video",d.video,videoPlace);
+    const {error:publishError}=await db.from("movies").update({status:"published",updated_at:new Date().toISOString()}).eq("id",movie.id);
+    if(publishError)throw publishError;
+    await adminLog(userId,"movie_publish","movie",movie.id,movie.public_id,{title:d.title});
+    return movie.public_id;
+  }catch(err){
+    await cleanupEntity("movie",movie.id,[videoPlace,posterPlace]);
+    await systemLog("error","movie publish rolled back",{public_id:movie.public_id});
+    throw err;
+  }
 }
 
 async function publishSeries(userId:number,chatId:number,d:any){
@@ -261,22 +274,27 @@ async function publishSeries(userId:number,chatId:number,d:any){
   }).select("id,public_id").single();
   if(error||!series) throw error??new Error("Series insert failed");
 
-  const infoCaption=[
-    `${series.public_id}`,"",`📺 ${d.title}`,
-    d.original_title&&d.original_title!==d.title?d.original_title:"",
-    "",`السنة: ${d.release_year||"—"}`,
-    `التصنيف: ${(d.genres||[]).join(" • ")||"—"}`,
-    `اللغة: ${d.language||"—"}`,
-    `الدولة: ${d.country||"—"}`,
-    `الجودة: ${d.quality||"—"}`,"",d.description||"","",
-    `Series ID: ${series.public_id}`,
-  ].filter(Boolean).join("\n");
-
-  const posterPlace=await copyTo("series_info",chatId,d.poster_source_message_id,infoCaption);
-  await saveAsset("series",series.id,"poster",d.poster,posterPlace);
-  await db.from("series").update({status:"published"}).eq("id",series.id);
-  await adminLog(userId,"series_publish","series",series.id,series.public_id,{title:d.title});
-  return series.public_id;
+  let posterPlace:any=null;
+  try{
+    const infoCaption=[
+      `${series.public_id}`,"",`📺 ${d.title}`,
+      d.original_title&&d.original_title!==d.title?d.original_title:"",
+      "",`السنة: ${d.release_year||"—"}`,
+      `التصنيف: ${(d.genres||[]).join(" • ")||"—"}`,
+      `اللغة: ${d.language||"—"}`,`الدولة: ${d.country||"—"}`,
+      `الجودة: ${d.quality||"—"}`,"",d.description||"","",`Series ID: ${series.public_id}`,
+    ].filter(Boolean).join("\n");
+    posterPlace=await copyTo("series_info",chatId,d.poster_source_message_id,infoCaption);
+    await saveAsset("series",series.id,"poster",d.poster,posterPlace);
+    const {error:publishError}=await db.from("series").update({status:"published",updated_at:new Date().toISOString()}).eq("id",series.id);
+    if(publishError)throw publishError;
+    await adminLog(userId,"series_publish","series",series.id,series.public_id,{title:d.title});
+    return series.public_id;
+  }catch(err){
+    await cleanupEntity("series",series.id,[posterPlace]);
+    await systemLog("error","series publish rolled back",{public_id:series.public_id});
+    throw err;
+  }
 }
 
 async function publishEpisode(userId:number,chatId:number,d:any){
@@ -289,18 +307,42 @@ async function publishEpisode(userId:number,chatId:number,d:any){
   },{onConflict:"series_id,season_number"}).select("id").single();
   if(se||!season) throw se??new Error("Season failed");
 
-  const {data:ep,error}=await db.from("episodes").upsert({
-    season_id:season.id,episode_number:d.episode_number,title:d.title||`الحلقة ${d.episode_number}`,
-    description:d.description||"",quality:d.quality||"",status:"draft",created_by:userId,
-  },{onConflict:"season_id,episode_number"}).select("id,public_id").single();
-  if(error||!ep) throw error??new Error("Episode failed");
+  const {data:existing}=await db.from("episodes").select("id,public_id,status")
+    .eq("season_id",season.id).eq("episode_number",d.episode_number).maybeSingle();
 
-  const place=await copyTo("series_storage",chatId,d.video_source_message_id,
-    `${ep.public_id} | ${series.title} | موسم ${d.season_number} | حلقة ${d.episode_number} | ${d.quality||"Video"}`);
-  await saveAsset("episode",ep.id,"video",d.video,place);
-  await db.from("episodes").update({status:"published"}).eq("id",ep.id);
-  await adminLog(userId,"episode_publish","episode",ep.id,ep.public_id,{series:series.title});
-  return ep.public_id;
+  let ep:any=existing,created=false;
+  if(existing){
+    const {data:updated,error}=await db.from("episodes").update({
+      title:d.title||`الحلقة ${d.episode_number}`,description:d.description||"",quality:d.quality||"",
+      updated_at:new Date().toISOString(),
+    }).eq("id",existing.id).select("id,public_id,status").single();
+    if(error||!updated)throw error??new Error("Episode update failed");
+    ep=updated;
+  }else{
+    const {data:inserted,error}=await db.from("episodes").insert({
+      season_id:season.id,episode_number:d.episode_number,title:d.title||`الحلقة ${d.episode_number}`,
+      description:d.description||"",quality:d.quality||"",status:"draft",created_by:userId,
+    }).select("id,public_id,status").single();
+    if(error||!inserted) throw error??new Error("Episode failed");
+    ep=inserted;created=true;
+  }
+
+  let place:any=null;
+  try{
+    place=await copyTo("series_storage",chatId,d.video_source_message_id,
+      `${ep.public_id} | ${series.title} | موسم ${d.season_number} | حلقة ${d.episode_number} | ${d.quality||"Video"}`);
+    await saveAsset("episode",ep.id,"video",d.video,place);
+    const {error:publishError}=await db.from("episodes").update({status:"published",updated_at:new Date().toISOString()}).eq("id",ep.id);
+    if(publishError)throw publishError;
+    await adminLog(userId,existing?"episode_replace":"episode_publish","episode",ep.id,ep.public_id,{series:series.title});
+    return ep.public_id;
+  }catch(err){
+    await deleteCopiedMessage(place);
+    if(created)await cleanupEntity("episode",ep.id);
+    else await db.from("episodes").update({status:existing.status,updated_at:new Date().toISOString()}).eq("id",ep.id);
+    await systemLog("error","episode publish failed",{public_id:ep.public_id});
+    throw err;
+  }
 }
 
 async function callback(q:any){
