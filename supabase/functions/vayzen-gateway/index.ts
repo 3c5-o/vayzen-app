@@ -101,6 +101,8 @@ function defaultPermission(role:string,perm:AdminPermission){
   if(role==="secondary_admin")return true;
   if(role==="content_manager")return ["content","publish","stats"].includes(perm);
   if(role==="requests_manager")return ["requests","reports","stats"].includes(perm);
+  if(role==="user_manager")return ["users","stats"].includes(perm);
+  if(role==="viewer")return ["stats","logs","system"].includes(perm);
   if(role==="moderator")return ["requests","reports","stats"].includes(perm);
   if(role==="support")return ["requests","reports"].includes(perm);
   return false;
@@ -124,7 +126,7 @@ function canManageAdmin(actor:Admin,target:Admin|null,newRole?:string){
 }
 
 function roleLabel(role:string){
-  const map:Record<string,string>={owner:"المالك",secondary_admin:"أدمن ثانوي",content_manager:"مشرف محتوى",requests_manager:"مشرف طلبات",moderator:"مشرف",support:"دعم"};
+  const map:Record<string,string>={owner:"المالك",secondary_admin:"أدمن ثانوي",content_manager:"مشرف محتوى",requests_manager:"مشرف طلبات",user_manager:"مشرف مستخدمين",viewer:"مراقب",moderator:"مشرف",support:"دعم"};
   return map[role]||role;
 }
 
@@ -666,8 +668,8 @@ async function sendAdminRoles(chatId:number,actor:Admin,targetId:number){
   const {data:t}=await db.from("admin_users").select("telegram_user_id,display_name,role,permissions,is_active").eq("telegram_user_id",targetId).maybeSingle();
   if(!t||!canManageAdmin(actor,t as Admin))return sendAdminsManager(chatId,actor);
   const roles=actor.role==="owner"
-    ?["secondary_admin","content_manager","requests_manager","moderator","support"]
-    :["content_manager","requests_manager","moderator","support"];
+    ?["secondary_admin","content_manager","requests_manager","user_manager","viewer","moderator","support"]
+    :["content_manager","requests_manager","user_manager","viewer","moderator","support"];
   const rows:any[]=roles.map(r=>[{text:`${t.role===r?"✓ ":""}${roleLabel(r)}`,callback_data:`adm_role|${targetId}|${r}`}]);
   rows.push([{text:"رجوع",callback_data:`adm|${targetId}`}]);
   return send(chatId,"اختر الدور الجديد:",{inline_keyboard:rows});
@@ -698,7 +700,7 @@ async function createAdmin(actor:Admin,telegramId:number,name:string,role:string
   if(!Number.isInteger(telegramId)||telegramId<=0)throw new Error("Telegram ID غير صحيح");
   if(role==="owner")throw new Error("لا يمكن إنشاء Owner جديد");
   if(role==="secondary_admin"&&actor.role!=="owner")throw new Error("فقط المالك يستطيع إضافة أدمن ثانوي");
-  const allowed=["secondary_admin","content_manager","requests_manager","moderator","support"];
+  const allowed=["secondary_admin","content_manager","requests_manager","user_manager","viewer","moderator","support"];
   if(!allowed.includes(role))throw new Error("الدور غير صالح");
   const {data:existing}=await db.from("admin_users").select("telegram_user_id,role").eq("telegram_user_id",telegramId).maybeSingle();
   if(existing)throw new Error("هذا الحساب موجود ضمن الإدارة بالفعل");
@@ -1501,7 +1503,7 @@ async function callback(q:any){
     const {data:t}=await db.from("admin_users").select("telegram_user_id,display_name,role,permissions,is_active").eq("telegram_user_id",targetId).maybeSingle();
     if(!t||!canManageAdmin(admin,t as Admin,role))return send(chatId,"غير مسموح بتغيير هذا الدور.");
     if(role==="owner")return send(chatId,"لا يمكن تعيين Owner جديد.");
-    const allowed=["secondary_admin","content_manager","requests_manager","moderator","support"];
+    const allowed=["secondary_admin","content_manager","requests_manager","user_manager","viewer","moderator","support"];
     if(!allowed.includes(role))return send(chatId,"الدور غير صالح.");
     if(role==="secondary_admin"&&admin.role!=="owner")return send(chatId,"فقط المالك يستطيع تعيين أدمن ثانوي.");
     const {error}=await db.from("admin_users").update({role,permissions:{},updated_at:new Date().toISOString()}).eq("telegram_user_id",targetId);
@@ -1683,6 +1685,7 @@ async function message(m:any){
       const roles:any[]=[];
       if(admin.role==="owner")roles.push([{text:"أدمن ثانوي",callback_data:"adm_new_role|secondary_admin"}]);
       roles.push([{text:"مشرف محتوى",callback_data:"adm_new_role|content_manager"},{text:"مشرف طلبات",callback_data:"adm_new_role|requests_manager"}]);
+      roles.push([{text:"مشرف مستخدمين",callback_data:"adm_new_role|user_manager"},{text:"مراقب",callback_data:"adm_new_role|viewer"}]);
       roles.push([{text:"مشرف",callback_data:"adm_new_role|moderator"},{text:"دعم",callback_data:"adm_new_role|support"}]);
       roles.push([{text:"إلغاء",callback_data:"cancel"}]);
       return send(chatId,`اختر دور ${name}:`,{inline_keyboard:roles});
