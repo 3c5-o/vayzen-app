@@ -8,13 +8,15 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
+import httpx
 from telethon import TelegramClient
 
 API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 STREAM_SIGNING_SECRET = os.environ.get("STREAM_SIGNING_SECRET", "").encode()
+VAYZEN_API_TARGET = os.environ.get("VAYZEN_API_TARGET", "").rstrip("/")
 MAX_CONCURRENT_STREAMS = max(1, int(os.environ.get("MAX_CONCURRENT_STREAMS", "6")))
 CHUNK_SIZE = 512 * 1024
 
@@ -102,7 +104,60 @@ async def get_media(channel_id: int, message_id: int):
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "vayzen-gateway", "storage": "telegram"}
+    return FileResponse("/app/web/index.html", media_type="text/html; charset=utf-8")
+
+
+@app.get("/styles.css")
+async def styles():
+    return FileResponse("/app/web/styles.css", media_type="text/css; charset=utf-8")
+
+
+@app.get("/app.js")
+async def app_js():
+    return FileResponse("/app/web/app.js", media_type="application/javascript; charset=utf-8")
+
+
+@app.api_route("/api", methods=["GET", "POST", "OPTIONS"])
+async def api_proxy(request: Request):
+    if not VAYZEN_API_TARGET:
+        raise HTTPException(status_code=503, detail="API target is not configured")
+
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "https"
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    origin = f"{proto}://{host}" if host else ""
+
+    headers = {"Origin": origin} if origin else {}
+    content_type = request.headers.get("content-type")
+    authorization = request.headers.get("authorization")
+    if content_type:
+        headers["Content-Type"] = content_type
+    if authorization:
+        headers["Authorization"] = authorization
+
+    body = await request.body()
+    target = VAYZEN_API_TARGET
+    if request.url.query:
+        target += "?" + request.url.query
+
+    async with httpx.AsyncClient(follow_redirects=False, timeout=60.0) as http:
+        upstream = await http.request(
+            request.method,
+            target,
+            content=body if body else None,
+            headers=headers,
+        )
+
+    out_headers = {}
+    for key in ("content-type", "location", "cache-control", "content-length"):
+        value = upstream.headers.get(key)
+        if value:
+            out_headers[key] = value
+
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=out_headers,
+    )
 
 
 @app.get("/health")
