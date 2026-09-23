@@ -211,6 +211,48 @@ async function send(chatId:string|number,text:string,reply_markup?:unknown){
   return tg("sendMessage",{chat_id:chatId,text,...(reply_markup?{reply_markup}:{})});
 }
 
+
+async function sendRemotePhotoTo(key:string,url:string,caption:string){
+  const ch=await channel(key);
+  const m=await tg("sendPhoto",{chat_id:ch.telegram_channel_id,photo:url,caption:caption.slice(0,1000)});
+  const file=photoFrom(m);
+  if(!file)throw new Error("تعذر حفظ صورة TMDb في Telegram.");
+  return {file,place:{channel_id:Number(ch.telegram_channel_id),message_id:Number(m.message_id)}};
+}
+async function sendTmdbPreview(chatId:number,type:"movie"|"series",mapped:any,bundle:any){
+  const ar=bundle?.ar||{};
+  const posterUrl=await tmdbImageUrl(mapped.poster_path,"poster");
+  const year=mapped.release_year||"—";
+  const rating=mapped.rating?Number(mapped.rating).toFixed(1):"—";
+  const extra=type==="series"
+    ? `المواسم: ${Number(ar.number_of_seasons||0)||"—"}\nالحلقات: ${Number(ar.number_of_episodes||0)||"—"}`
+    : `المدة: ${mapped.duration_minutes?mapped.duration_minutes+" دقيقة":"—"}`;
+  const caption=[
+    type==="movie"?"نتيجة TMDb • فيلم":"نتيجة TMDb • مسلسل",
+    "",
+    mapped.title,
+    mapped.original_title&&mapped.original_title!==mapped.title?mapped.original_title:"",
+    `السنة: ${year}`,
+    `التقييم: ${rating}/10`,
+    `التصنيف: ${(mapped.genres||[]).join(" • ")||"—"}`,
+    extra,
+    "",
+    String(mapped.description||"").slice(0,420),
+    "",
+    `TMDb ID: ${mapped.external_id}`
+  ].filter(Boolean).join("\n").slice(0,980);
+  const reply_markup={inline_keyboard:[
+    [{text:"استخدام هذه النتيجة",callback_data:`tmdb_use|${type==="movie"?"m":"s"}|${mapped.external_id}`}],
+    [{text:"بحث جديد",callback_data:`tmdb_again|${type==="movie"?"m":"s"}`},{text:"إلغاء",callback_data:"cancel"}]
+  ]};
+  if(posterUrl){
+    const m=await tg("sendPhoto",{chat_id:chatId,photo:posterUrl,caption,reply_markup});
+    return {message:m,poster:photoFrom(m),poster_source_message_id:Number(m.message_id)};
+  }
+  const m=await tg("sendMessage",{chat_id:chatId,text:caption,reply_markup});
+  return {message:m,poster:null,poster_source_message_id:null};
+}
+
 type AdminPermission="content"|"publish"|"delete_content"|"requests"|"reports"|"users"|"stats"|"logs"|"system"|"admins";
 type Admin={telegram_user_id:number;display_name?:string;role:string;permissions:Record<string,boolean>;is_active:boolean};
 
@@ -286,6 +328,7 @@ function menuFor(admin:Admin){
   }
   if(can(admin,"admins"))rows.push([{text:"إدارة المشرفين",callback_data:"admins"},{text:"سجل الإدارة",callback_data:"admin_logs"}]);
   else if(can(admin,"logs"))rows.push([{text:"سجل الإدارة",callback_data:"admin_logs"}]);
+  if(admin.role==="owner")rows.push([{text:"إعدادات TMDb",callback_data:"tmdb_settings"}]);
   rows.push([{text:"إلغاء العملية",callback_data:"cancel"}]);
   return {inline_keyboard:rows};
 }
