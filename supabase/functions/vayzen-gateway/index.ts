@@ -479,13 +479,42 @@ async function sendUsersManager(chatId:number){
   const ids=users.map((u:any)=>u.id);
   const {data:profiles}=ids.length?await db.from("profiles").select("id,display_name,is_disabled,created_at").in("id",ids):{data:[] as any[]};
   const map=new Map((profiles??[]).map((p:any)=>[p.id,p]));
-  const rows=users.map((u:any)=>{
+  const rows:any[]=users.map((u:any)=>{
     const p:any=map.get(u.id);
     const label=(p?.display_name||u.email||"مستخدم").slice(0,28);
     return [{text:`${p?.is_disabled?"⛔":"●"} ${label}`,callback_data:`usr|${u.id}`}];
   });
+  rows.push([{text:"بحث عن مستخدم",callback_data:"user_search"}]);
   rows.push([{text:"رجوع للقائمة",callback_data:"menu"}]);
   return send(chatId,`المستخدمون\n\nآخر ${users.length} حسابات:`,{inline_keyboard:rows});
+}
+
+async function searchUsers(chatId:number,query:string){
+  const q=query.trim().toLowerCase();
+  if(q.length<2)return send(chatId,"أرسل حرفين على الأقل للبحث.");
+  const found:any[]=[];
+  for(let page=1;page<=5&&found.length<8;page++){
+    const {data,error}=await db.auth.admin.listUsers({page,perPage:50});
+    if(error)throw error;
+    const users=data?.users??[];
+    if(!users.length)break;
+    const ids=users.map((u:any)=>u.id);
+    const {data:profiles}=ids.length?await db.from("profiles").select("id,display_name,is_disabled").in("id",ids):{data:[] as any[]};
+    const map=new Map((profiles??[]).map((p:any)=>[p.id,p]));
+    for(const u of users){
+      const p:any=map.get(u.id);
+      const hay=(String(u.email||"")+" "+String(p?.display_name||"")).toLowerCase();
+      if(hay.includes(q))found.push({u,p});
+      if(found.length>=8)break;
+    }
+    if(users.length<50)break;
+  }
+  const rows:any[]=found.map(({u,p}:any)=>[{
+    text:`${p?.is_disabled?"⛔":"●"} ${String(p?.display_name||u.email||"مستخدم").slice(0,28)}`,
+    callback_data:`usr|${u.id}`
+  }]);
+  rows.push([{text:"بحث جديد",callback_data:"user_search"},{text:"رجوع",callback_data:"users"}]);
+  return send(chatId,found.length?`نتائج البحث عن: ${query}`:"لا توجد نتائج مطابقة.",{inline_keyboard:rows});
 }
 
 async function sendUserItem(chatId:number,userId:string){
@@ -704,34 +733,49 @@ async function callback(q:any){
   }
   if(a==="confirm_movie"){
     const session=await getSession(userId);
-    if(!session||session.flow!=="movie"||session.step!=="confirm") return showMenu(chatId,"انتهت جلسة الفيلم.");
+    if(!session||session.flow!=="movie") return showMenu(chatId,"انتهت جلسة الفيلم.");
+    if(session.step==="publishing")return send(chatId,"الفيلم قيد النشر الآن، انتظر اكتمال العملية.");
+    if(session.step!=="confirm")return showMenu(chatId,"انتهت جلسة الفيلم.");
+    await setSession(userId,"movie","publishing",session.draft);
+    await send(chatId,"جاري نشر الفيلم ونقل الملفات...");
     try{
       const id=await publishMovie(userId,chatId,session.draft);
       await clearSession(userId);
       return showMenu(chatId,`تم نشر الفيلم بنجاح.\nMovie ID: ${id}`);
     }catch(err){
+      await setSession(userId,"movie","confirm",session.draft);
       return send(chatId,`فشل نشر الفيلم.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"إعادة المحاولة",callback_data:"confirm_movie"},{text:"إلغاء",callback_data:"cancel"}]]});
     }
   }
   if(a==="confirm_series"){
     const session=await getSession(userId);
-    if(!session||session.flow!=="series"||session.step!=="confirm") return showMenu(chatId,"انتهت جلسة المسلسل.");
+    if(!session||session.flow!=="series") return showMenu(chatId,"انتهت جلسة المسلسل.");
+    if(session.step==="publishing")return send(chatId,"المسلسل قيد النشر الآن، انتظر اكتمال العملية.");
+    if(session.step!=="confirm")return showMenu(chatId,"انتهت جلسة المسلسل.");
+    await setSession(userId,"series","publishing",session.draft);
+    await send(chatId,"جاري نشر المسلسل ونقل البوستر...");
     try{
       const id=await publishSeries(userId,chatId,session.draft);
       await clearSession(userId);
       return showMenu(chatId,`تم نشر المسلسل بنجاح.\nSeries ID: ${id}`);
     }catch(err){
+      await setSession(userId,"series","confirm",session.draft);
       return send(chatId,`فشل نشر المسلسل.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"إعادة المحاولة",callback_data:"confirm_series"},{text:"إلغاء",callback_data:"cancel"}]]});
     }
   }
   if(a==="confirm_episode"){
     const session=await getSession(userId);
-    if(!session||session.flow!=="episode"||session.step!=="confirm") return showMenu(chatId,"انتهت جلسة الحلقة.");
+    if(!session||session.flow!=="episode") return showMenu(chatId,"انتهت جلسة الحلقة.");
+    if(session.step==="publishing")return send(chatId,"الحلقة قيد النشر الآن، انتظر اكتمال العملية.");
+    if(session.step!=="confirm")return showMenu(chatId,"انتهت جلسة الحلقة.");
+    await setSession(userId,"episode","publishing",session.draft);
+    await send(chatId,"جاري نشر الحلقة ونقل الفيديو...");
     try{
       const id=await publishEpisode(userId,chatId,session.draft);
       await clearSession(userId);
       return showMenu(chatId,`تم نشر الحلقة بنجاح.\nEpisode ID: ${id}`);
     }catch(err){
+      await setSession(userId,"episode","confirm",session.draft);
       return send(chatId,`فشل نشر الحلقة.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"إعادة المحاولة",callback_data:"confirm_episode"},{text:"إلغاء",callback_data:"cancel"}]]});
     }
   }
@@ -882,6 +926,11 @@ async function callback(q:any){
     if(!["owner","secondary_admin"].includes(admin.role))return send(chatId,"لا تملك صلاحية إدارة المستخدمين.");
     return sendUsersManager(chatId);
   }
+  if(a==="user_search"){
+    if(!["owner","secondary_admin"].includes(admin.role))return send(chatId,"لا تملك صلاحية إدارة المستخدمين.");
+    await setSession(userId,"search_user","query",{});
+    return send(chatId,"أرسل الاسم أو البريد الإلكتروني للبحث.");
+  }
   if(a.startsWith("usr|")){
     if(!["owner","secondary_admin"].includes(admin.role))return send(chatId,"لا تملك صلاحية إدارة المستخدمين.");
     const [,id]=a.split("|");return sendUserItem(chatId,id);
@@ -952,6 +1001,11 @@ async function message(m:any){
   const s=await getSession(userId);
   if(!s) return showMenu(chatId);
   const d:any={...(s.draft??{})};
+
+  if(s.flow==="search_user"&&s.step==="query"){
+    await clearSession(userId);
+    return searchUsers(chatId,text);
+  }
 
   if(s.flow==="edit_content"&&s.step==="value"){
     const type=String(d.type||""),publicId=String(d.public_id||""),field=String(d.field||"");
