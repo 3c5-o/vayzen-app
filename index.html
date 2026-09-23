@@ -3,11 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <meta name="theme-color" content="#08090d">
+  <meta name="theme-color" content="#050506">
   <meta name="color-scheme" content="dark">
   <meta name="application-name" content="VAYZEN">
   <title>VAYZEN</title>
-  <link rel="stylesheet" href="./styles.css?v=20260923-11">
+  <link rel="stylesheet" href="./styles.css?v=20260924-01">
 </head>
 <body>
 <svg class="svg-sprite" aria-hidden="true">
@@ -31,6 +31,11 @@
   <symbol id="i-full" viewBox="0 0 24 24"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/></symbol>
 <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5h3v14H8zM13 5h3v14h-3z"/></symbol>
 <symbol id="i-pip" viewBox="0 0 24 24"><path d="M3 5h18v14H3zM12 11h7v6h-7z"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-2.9-5.6 2.9 1.1-6.2L3 9.6l6.2-.9z"/></symbol>
+<symbol id="i-share" viewBox="0 0 24 24"><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="m8.2 10.8 7.6-4.5M8.2 13.2l7.6 4.5"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 6h16M7 12h10M10 18h4"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 10v6M12 7h.01"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></symbol>
 </svg>
 
 <div id="splash" class="splash">
@@ -42,14 +47,12 @@
 
 <div class="app-shell">
   <header class="topbar">
-    <div class="brand-wrap">
-      <div class="brand-mark">V</div>
-      <div>
-        <div class="brand-name">VAYZEN</div>
-        <div class="brand-sub">Movies & Series</div>
-      </div>
+    <button class="icon-btn top-search" id="globalSearchBtn" aria-label="بحث"><svg><use href="#i-search"/></svg></button>
+    <div class="brand-wrap premium-brand" aria-label="VAYZEN">
+      <span class="brand-slash"></span>
+      <div class="brand-name">VAYZEN</div>
     </div>
-    <button class="icon-btn" id="globalSearchBtn" aria-label="بحث"><svg><use href="#i-search"/></svg></button>
+    <button class="icon-btn top-account" data-go="account" aria-label="الحساب"><svg><use href="#i-user"/></svg></button>
   </header>
 
   <div class="search-panel hidden" id="searchPanel">
@@ -61,61 +64,110 @@
   </div>
 
   <main id="main">
-    <section class="page active" data-page="home">
+    <section class="page active home-page" data-page="home">
       <div class="hero" id="hero">
         <div class="hero-media" id="heroMedia"></div>
         <div class="hero-shade"></div>
         <div class="hero-body">
-          <div class="eyebrow">VAYZEN ORIGINAL</div>
+          <div class="eyebrow"><span class="eyebrow-dot"></span> مختارات VAYZEN</div>
           <h1 id="heroTitle">VAYZEN</h1>
           <div class="hero-meta" id="heroMeta"></div>
           <p id="heroText">أفضل الأفلام والمسلسلات في واجهة واحدة.</p>
           <div class="hero-actions">
-            <button class="btn primary" id="heroPlay"><svg><use href="#i-play"/></svg><span>مشاهدة الآن</span></button>
-            <button class="btn glass" id="heroDetails">التفاصيل</button>
+            <button class="btn primary hero-watch" id="heroPlay"><svg><use href="#i-play"/></svg><span>مشاهدة الآن</span></button>
+            <button class="btn glass hero-more" id="heroDetails"><svg><use href="#i-info"/></svg><span>التفاصيل</span></button>
+            <button class="hero-save" id="heroFavorite" aria-label="إضافة إلى قائمتي"><svg><use href="#i-plus"/></svg></button>
           </div>
         </div>
+        <div class="hero-edge"></div>
       </div>
 
-      <div class="section-head">
-        <div><h2>تابع المشاهدة</h2><p>ارجع من المكان الذي توقفت عنده</p></div>
+      <div class="discovery-strip">
+        <div class="discovery-title"><span>اكتشف حسب التصنيف</span><small>اختيار أسرع للمحتوى</small></div>
+        <div class="home-genres" id="homeGenreChips"></div>
       </div>
-      <div class="rail" id="continueRail"><div class="empty-card">ما عندك مشاهدة غير مكتملة بعد.</div></div>
 
-      <div class="section-head">
-        <div><h2>أحدث الأفلام</h2><p>إضافات جديدة باستمرار</p></div>
-        <button class="text-btn" data-go="movies">عرض الكل</button>
-      </div>
-      <div class="rail" id="latestMovies"></div>
+      <section class="content-section continue-section" id="continueSection">
+        <div class="section-head">
+          <div><span class="section-kicker">استكمل</span><h2>تابع المشاهدة</h2><p>ارجع مباشرة للمكان الذي توقفت عنده</p></div>
+        </div>
+        <div class="rail continue-rail" id="continueRail"><div class="skeleton-wide"></div><div class="skeleton-wide"></div></div>
+      </section>
 
-      <div class="section-head">
-        <div><h2>الأكثر مشاهدة</h2><p>المحتوى الأكثر تشغيلًا على VAYZEN</p></div>
-      </div>
-      <div class="rail" id="trendingRail"></div>
+      <section class="content-section">
+        <div class="section-head">
+          <div><span class="section-kicker">جديد VAYZEN</span><h2>المضاف حديثًا</h2><p>آخر الأفلام والمسلسلات التي وصلت للمنصة</p></div>
+        </div>
+        <div class="rail poster-rail" id="recommendedRail"></div>
+      </section>
 
-      <div class="section-head">
-        <div><h2>أحدث المسلسلات</h2><p>مواسم وحلقات مرتبة</p></div>
-        <button class="text-btn" data-go="series">عرض الكل</button>
-      </div>
-      <div class="rail" id="latestSeries"></div>
+      <section class="content-section">
+        <div class="section-head">
+          <div><span class="section-kicker">الأكثر رواجًا</span><h2>الأكثر مشاهدة</h2><p>الأعمال التي يشاهدها المستخدمون الآن</p></div>
+        </div>
+        <div class="rail poster-rail" id="trendingRail"></div>
+      </section>
+
+      <section class="content-section">
+        <div class="section-head">
+          <div><span class="section-kicker">الأعلى تقييمًا</span><h2>اختيارات مميزة</h2><p>أعمال بتقييمات مرتفعة ومعلومات مكتملة</p></div>
+        </div>
+        <div class="rail poster-rail" id="topRatedRail"></div>
+      </section>
+
+      <section class="content-section">
+        <div class="section-head">
+          <div><span class="section-kicker">أفلام</span><h2>أحدث الأفلام</h2><p>تصفح آخر الإضافات السينمائية</p></div>
+          <button class="text-btn" data-go="movies">عرض الكل <svg><use href="#i-chevron"/></svg></button>
+        </div>
+        <div class="rail poster-rail" id="latestMovies"></div>
+      </section>
+
+      <section class="content-section">
+        <div class="section-head">
+          <div><span class="section-kicker">مسلسلات</span><h2>أحدث المسلسلات</h2><p>مواسم وحلقات مرتبة في مكان واحد</p></div>
+          <button class="text-btn" data-go="series">عرض الكل <svg><use href="#i-chevron"/></svg></button>
+        </div>
+        <div class="rail poster-rail" id="latestSeries"></div>
+      </section>
     </section>
 
-    <section class="page" data-page="movies">
-      <div class="page-title"><div><h1>الأفلام</h1><p>اكتشف كل الأفلام المنشورة</p></div></div>
-      <div class="catalog-filter-row">
-        <div class="chips" id="movieChips"></div>
-        <select class="filter-select" id="movieYearFilter" aria-label="فلترة الأفلام حسب السنة"><option value="">كل السنوات</option></select>
+    <section class="page catalog-page" data-page="movies">
+      <div class="catalog-hero">
+        <div><span class="section-kicker">مكتبة VAYZEN</span><h1>الأفلام</h1><p>اكتشف الأفلام حسب التصنيف والسنة والتقييم.</p></div>
+        <div class="catalog-count"><b id="movieCount">0</b><span>فيلم</span></div>
       </div>
-      <div class="grid" id="moviesGrid"></div>
+      <div class="catalog-filter-shell">
+        <div class="filter-label"><svg><use href="#i-filter"/></svg><span>التصنيفات</span></div>
+        <div class="catalog-filter-row">
+          <div class="chips" id="movieChips"></div>
+          <select class="filter-select" id="movieYearFilter" aria-label="فلترة الأفلام حسب السنة"><option value="">كل السنوات</option></select>
+        </div>
+      </div>
+      <div class="grid cinematic-grid" id="moviesGrid"></div>
     </section>
 
-    <section class="page" data-page="series">
-      <div class="page-title"><div><h1>المسلسلات</h1><p>المواسم والحلقات في مكان واحد</p></div></div>
-      <div class="catalog-filter-row">
-        <div class="chips" id="seriesChips"></div>
-        <select class="filter-select" id="seriesYearFilter" aria-label="فلترة المسلسلات حسب السنة"><option value="">كل السنوات</option></select>
+    <section class="page catalog-page" data-page="series">
+      <div class="catalog-hero">
+        <div><span class="section-kicker">مكتبة VAYZEN</span><h1>المسلسلات</h1><p>المواسم والحلقات مرتبة بتجربة مشاهدة واضحة.</p></div>
+        <div class="catalog-count"><b id="seriesCount">0</b><span>مسلسل</span></div>
       </div>
-      <div class="grid" id="seriesGrid"></div>
+      <div class="catalog-filter-shell">
+        <div class="filter-label"><svg><use href="#i-filter"/></svg><span>التصنيفات</span></div>
+        <div class="catalog-filter-row">
+          <div class="chips" id="seriesChips"></div>
+          <select class="filter-select" id="seriesYearFilter" aria-label="فلترة المسلسلات حسب السنة"><option value="">كل السنوات</option></select>
+        </div>
+      </div>
+      <div class="grid cinematic-grid" id="seriesGrid"></div>
+    </section>
+
+    <section class="page search-page" data-page="search">
+      <div class="catalog-hero search-hero">
+        <div><span class="section-kicker">بحث VAYZEN</span><h1>نتائج البحث</h1><p id="searchSummary">اكتب اسم فيلم أو مسلسل للبحث.</p></div>
+        <div class="catalog-count"><b id="searchCount">0</b><span>نتيجة</span></div>
+      </div>
+      <div class="grid cinematic-grid search-grid" id="searchResultsGrid"></div>
     </section>
 
     <section class="page" data-page="mylist">
@@ -338,6 +390,6 @@
   </div>
 </div>
 
-<script src="./app.js?v=20260923-13" defer></script>
+<script src="./app.js?v=20260924-01" defer></script>
 </body>
 </html>

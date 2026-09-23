@@ -7,7 +7,7 @@ const GUEST_PROGRESS_KEY="vayzen.guest.progress";
 
 const state={
   movies:[],series:[],favorites:[],progress:[],user:null,session:null,
-  query:"",movieGenre:"",seriesGenre:"",movieYear:"",seriesYear:"",currentPage:"home",detail:null,player:null,nextEpisode:null,
+  query:"",movieGenre:"",seriesGenre:"",movieYear:"",seriesYear:"",currentPage:"home",detail:null,detailVariant:"",player:null,nextEpisode:null,searchReturnPage:"home",
   prefs:{autoplayNext:true,saveProgress:true}
 };
 const viewedThisSession=new Set();
@@ -103,54 +103,134 @@ function percent(type,id){
 }
 function itemBy(type,id){return (type==="movie"?state.movies:state.series).find(x=>x.id===id)}
 
+function ratingValue(x){return Number(x?.rating)||0}
+function createdValue(x){const n=Date.parse(x?.created_at||"");return Number.isFinite(n)?n:0}
+function scoreLabel(x){return ratingValue(x)>0?ratingValue(x).toFixed(1):""}
+function mixedCatalog(){
+  return [
+    ...state.movies.map(item=>({item,type:"movie"})),
+    ...state.series.map(item=>({item,type:"series"}))
+  ];
+}
+function contentMatches(item,q){
+  if(!q)return true;
+  const t=q.toLowerCase();
+  return [item.title,item.original_title,item.description,...genreList(item),item.release_year,item.country,item.language]
+    .filter(Boolean).join(" ").toLowerCase().includes(t);
+}
+function skeletonCards(n=6){
+  return Array.from({length:n},()=>'<div class="media-card skeleton-card"><div class="poster skeleton-block"></div><div class="card-body"><div class="skeleton-line wide"></div><div class="skeleton-line"></div></div></div>').join("");
+}
+async function shareContent(type,item){
+  const title=item?.title||"VAYZEN";
+  const text=`${title} • ${typeLabel(type)} على VAYZEN`;
+  const url=location.href.split("#")[0]+`#${type}-${item?.public_id||item?.id||""}`;
+  try{
+    if(navigator.share){await navigator.share({title,text,url});return}
+    await navigator.clipboard.writeText(url);showToast("تم نسخ رابط المحتوى");
+  }catch(err){
+    if(err?.name!=="AbortError")showToast("تعذرت المشاركة");
+  }
+}
+function relatedFor(type,item,limit=8){
+  const source=type==="movie"?state.movies:state.series;
+  const genres=new Set(genreList(item));
+  return source.filter(x=>x.id!==item.id).map(x=>{
+    const common=genreList(x).filter(g=>genres.has(g)).length;
+    const yearGap=Math.abs(Number(x.release_year||0)-Number(item.release_year||0));
+    return {x,score:common*10+ratingValue(x)+(yearGap<=2?2:0)};
+  }).filter(o=>o.score>0).sort((a,b)=>b.score-a.score||createdValue(b.x)-createdValue(a.x)).slice(0,limit).map(o=>o.x);
+}
+
 function card(item,type,{compact=false}={}){
   const pct=type==="movie"?percent("movie",item.id):0;
-  return `<article class="media-card" data-type="${type}" data-id="${item.id}">
+  const rating=scoreLabel(item);
+  const subtitle=item.original_title&&item.original_title!==item.title?item.original_title:"";
+  return `<article class="media-card ${compact?"compact-card":""}" data-type="${type}" data-id="${item.id}" tabindex="0" role="button" aria-label="${esc(item.title)}">
     <div class="poster">
       <div class="poster-fallback">V</div>
-      <img src="${mediaUrl(type==="movie"?"movie_poster":"series_poster",item.id)}" alt="" loading="lazy" onerror="this.style.display='none'">
-      <span class="badge">${isFav(type,item.id)?"محفوظ":typeLabel(type)}</span>
+      <img src="${mediaUrl(type==="movie"?"movie_poster":"series_poster",item.id)}" alt="${esc(item.title)}" loading="lazy" onerror="this.style.display='none'">
+      <span class="badge type-badge">${typeLabel(type)}</span>
+      ${rating?`<span class="rating-badge"><svg><use href="#i-star"/></svg>${rating}</span>`:""}
+      ${isFav(type,item.id)?'<span class="saved-badge"><svg><use href="#i-heart"/></svg></span>':""}
+      <span class="poster-play"><svg><use href="#i-play"/></svg></span>
     </div>
     <div class="card-body">
       <div class="card-title">${esc(item.title)}</div>
-      <div class="card-meta">${esc(item.release_year||"")} ${genreList(item).length?"• "+esc(genreList(item).slice(0,2).join(" • ")):""}</div>
+      ${subtitle?`<div class="card-original">${esc(subtitle)}</div>`:""}
+      <div class="card-meta"><span>${esc(item.release_year||"—")}</span>${genreList(item)[0]?`<span>• ${esc(genreList(item)[0])}</span>`:""}</div>
       ${pct>1?`<div class="card-progress"><span style="width:${pct}%"></span></div>`:""}
     </div>
   </article>`;
 }
 
 function bindCards(root=document){
-  root.querySelectorAll?.(".media-card").forEach(c=>c.onclick=()=>openDetails(c.dataset.type,c.dataset.id));
+  root.querySelectorAll?.(".media-card[data-type]").forEach(cardEl=>{
+    const open=()=>openDetails(cardEl.dataset.type,cardEl.dataset.id);
+    cardEl.onclick=open;
+    cardEl.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();open()}};
+  });
 }
 
 function renderCatalog(){
   const q=state.query.trim().toLowerCase();
-  const filter=(arr,genre,year)=>arr.filter(x=>{
-    const text=[x.title,x.original_title,x.description,...genreList(x)].join(" ").toLowerCase();
-    return (!q||text.includes(q))&&(!genre||genreList(x).includes(genre))&&(!year||String(x.release_year||"")===String(year));
-  });
+  const filter=(arr,genre,year)=>arr.filter(x=>
+    contentMatches(x,q)&&(!genre||genreList(x).includes(genre))&&(!year||String(x.release_year||"")===String(year))
+  );
   const movies=filter(state.movies,state.movieGenre,state.movieYear);
   const series=filter(state.series,state.seriesGenre,state.seriesYear);
+  const mixed=mixedCatalog();
+  const recent=[...mixed].sort((a,b)=>createdValue(b.item)-createdValue(a.item));
+  const trending=[...mixed].sort((a,b)=>(Number(b.item.view_count)||0)-(Number(a.item.view_count)||0)||createdValue(b.item)-createdValue(a.item));
+  const rated=[...mixed].filter(x=>ratingValue(x.item)>0).sort((a,b)=>ratingValue(b.item)-ratingValue(a.item)||Number(b.item.rating_count||0)-Number(a.item.rating_count||0));
+  const recommended=[...mixed].sort((a,b)=>(Number(Boolean(b.item.is_featured))-Number(Boolean(a.item.is_featured)))||ratingValue(b.item)-ratingValue(a.item)||createdValue(b.item)-createdValue(a.item));
 
-  $("#latestMovies").innerHTML=state.movies.slice(0,10).map(x=>card(x,"movie",{compact:true})).join("")||'<div class="empty-card">لا توجد أفلام بعد.</div>';
-  $("#latestSeries").innerHTML=state.series.slice(0,10).map(x=>card(x,"series",{compact:true})).join("")||'<div class="empty-card">لا توجد مسلسلات بعد.</div>';
-  const trending=[
-    ...state.movies.map(item=>({item,type:"movie"})),
-    ...state.series.map(item=>({item,type:"series"}))
-  ].sort((a,b)=>(Number(b.item.view_count)||0)-(Number(a.item.view_count)||0)||new Date(b.item.created_at)-new Date(a.item.created_at)).slice(0,10);
-  $("#trendingRail").innerHTML=trending.length?trending.map(x=>card(x.item,x.type,{compact:true})).join(""):'<div class="empty-card">يظهر الأكثر مشاهدة بعد بدء المشاهدات.</div>';
-  $("#moviesGrid").innerHTML=movies.map(x=>card(x,"movie")).join("")||'<div class="empty-state">لا توجد نتائج مطابقة.</div>';
-  $("#seriesGrid").innerHTML=series.map(x=>card(x,"series")).join("")||'<div class="empty-state">لا توجد نتائج مطابقة.</div>';
+  $("#latestMovies").innerHTML=state.movies.slice().sort((a,b)=>createdValue(b)-createdValue(a)).slice(0,12).map(x=>card(x,"movie",{compact:true})).join("")||'<div class="empty-card">لا توجد أفلام منشورة بعد.</div>';
+  $("#latestSeries").innerHTML=state.series.slice().sort((a,b)=>createdValue(b)-createdValue(a)).slice(0,12).map(x=>card(x,"series",{compact:true})).join("")||'<div class="empty-card">لا توجد مسلسلات منشورة بعد.</div>';
+  $("#recommendedRail").innerHTML=recent.slice(0,14).map(x=>card(x.item,x.type,{compact:true})).join("")||'<div class="empty-card">سيظهر المحتوى الجديد هنا.</div>';
+  $("#trendingRail").innerHTML=trending.slice(0,14).map(x=>card(x.item,x.type,{compact:true})).join("")||'<div class="empty-card">يظهر الأكثر مشاهدة بعد بدء المشاهدات.</div>';
+  $("#topRatedRail").innerHTML=(rated.length?rated:recommended).slice(0,14).map(x=>card(x.item,x.type,{compact:true})).join("")||'<div class="empty-card">لا توجد تقييمات بعد.</div>';
+  $("#moviesGrid").innerHTML=movies.map(x=>card(x,"movie")).join("")||'<div class="empty-state">لا توجد أفلام مطابقة للفلاتر الحالية.</div>';
+  $("#seriesGrid").innerHTML=series.map(x=>card(x,"series")).join("")||'<div class="empty-state">لا توجد مسلسلات مطابقة للفلاتر الحالية.</div>';
+  $("#movieCount").textContent=String(movies.length);
+  $("#seriesCount").textContent=String(series.length);
+
+  const searchMatches=mixed.filter(x=>contentMatches(x.item,q));
+  $("#searchResultsGrid").innerHTML=q?(searchMatches.map(x=>card(x.item,x.type)).join("")||'<div class="empty-state">ما لقينا نتائج مطابقة. جرّب اسمًا آخر.</div>'):'<div class="empty-state">اكتب اسم فيلم أو مسلسل في مربع البحث.</div>';
+  $("#searchCount").textContent=String(q?searchMatches.length:0);
+  $("#searchSummary").textContent=q?`نتائج البحث عن “${state.query.trim()}”`:"اكتب اسم فيلم أو مسلسل للبحث.";
 
   renderGenreChips("movieChips",state.movies,"movieGenre");
   renderGenreChips("seriesChips",state.series,"seriesGenre");
   renderYearFilter("movieYearFilter",state.movies,"movieYear");
   renderYearFilter("seriesYearFilter",state.series,"seriesYear");
+  renderHomeGenres();
   bindCards();
   renderHero();
   renderMyList();
   renderContinue();
 }
+
+function renderHomeGenres(){
+  const el=$("#homeGenreChips");if(!el)return;
+  const map=new Map();
+  for(const x of mixedCatalog()){
+    for(const g of genreList(x.item)){
+      if(!g)continue;
+      const row=map.get(g)||{count:0,movies:0,series:0};
+      row.count++;row[x.type==="movie"?"movies":"series"]++;map.set(g,row);
+    }
+  }
+  const genres=[...map.entries()].sort((a,b)=>b[1].count-a[1].count).slice(0,10);
+  el.innerHTML=genres.length?genres.map(([g,v])=>`<button class="home-genre" data-home-genre="${esc(g)}" data-target="${v.movies>=v.series?"movies":"series"}">${esc(g)}<small>${v.count}</small></button>`).join(""):'<span class="muted-note">تظهر التصنيفات بعد إضافة المحتوى.</span>';
+  el.querySelectorAll("[data-home-genre]").forEach(b=>b.onclick=()=>{
+    const genre=b.dataset.homeGenre||"",target=b.dataset.target||"movies";
+    state.query="";$("#searchInput").value="";
+    if(target==="movies")state.movieGenre=genre;else state.seriesGenre=genre;
+    renderCatalog();go(target);
+  });
+}
+
 function renderGenreChips(id,items,key){
   const genres=[...new Set(items.flatMap(genreList))].filter(Boolean).slice(0,18);
   $("#"+id).innerHTML=`<button class="chip ${!state[key]?"active":""}" data-genre="">الكل</button>`+
@@ -167,24 +247,30 @@ function renderYearFilter(id,items,key){
   el.onchange=()=>{state[key]=el.value||"";renderCatalog()};
 }
 function renderHero(){
-  const x=state.movies.find(x=>x.is_featured)||state.series.find(x=>x.is_featured)||state.movies[0]||state.series[0];
-  if(!x)return;
-  const type=state.movies.includes(x)?"movie":"series";
+  const candidates=mixedCatalog().sort((a,b)=>(Number(Boolean(b.item.is_featured))-Number(Boolean(a.item.is_featured)))||ratingValue(b.item)-ratingValue(a.item)||createdValue(b.item)-createdValue(a.item));
+  const pick=candidates[0];if(!pick)return;
+  const {item:x,type}=pick;
   $("#heroTitle").textContent=x.title;
   const heroMeta=$("#heroMeta");
-  if(heroMeta){
-    const bits=[];
-    if(x.release_year)bits.push("<span>"+esc(x.release_year)+"</span>");
-    if(x.quality)bits.push("<span>"+esc(x.quality)+"</span>");
-    if(Number(x.rating)>0)bits.push("<span>★ "+Number(x.rating).toFixed(1)+"</span>");
-    if(genreList(x)[0])bits.push("<span>"+esc(genreList(x)[0])+"</span>");
-    if(Number(x.view_count)>0)bits.push("<span>"+Number(x.view_count).toLocaleString("ar-IQ")+" مشاهدة</span>");
-    heroMeta.innerHTML=bits.join("");
-  }
-  $("#heroText").textContent=x.description||"شاهد التفاصيل واكتشف المزيد على VAYZEN.";
+  const bits=[];
+  if(ratingValue(x)>0)bits.push('<span class="hero-rating"><svg><use href="#i-star"/></svg>'+ratingValue(x).toFixed(1)+'</span>');
+  if(x.release_year)bits.push("<span>"+esc(x.release_year)+"</span>");
+  if(genreList(x)[0])bits.push("<span>"+esc(genreList(x)[0])+"</span>");
+  if(x.quality)bits.push("<span>"+esc(x.quality)+"</span>");
+  if(Number(x.view_count)>0)bits.push("<span>"+Number(x.view_count).toLocaleString("ar-IQ")+" مشاهدة</span>");
+  heroMeta.innerHTML=bits.join("");
+  $("#heroText").textContent=x.description||"اكتشف التفاصيل وابدأ المشاهدة على VAYZEN.";
   $("#heroMedia").style.backgroundImage=`url("${mediaUrl(type==="movie"?"movie_backdrop":"series_backdrop",x.id)}")`;
   $("#heroDetails").onclick=()=>openDetails(type,x.id);
-  $("#heroPlay").onclick=()=>type==="movie"?openPlayer({type:"movie",id:x.id,title:x.title,publicId:x.public_id,quality:x.quality||"",src:mediaUrl("movie_video",x.id)}):openDetails(type,x.id);
+  $("#heroPlay").onclick=()=>type==="movie"
+    ?openPlayer({type:"movie",id:x.id,title:x.title,publicId:x.public_id,quality:x.quality||"",src:mediaUrl("movie_video",x.id)})
+    :openDetails(type,x.id);
+  const fav=$("#heroFavorite");
+  if(fav){
+    fav.classList.toggle("active",isFav(type,x.id));
+    fav.innerHTML=`<svg><use href="#${isFav(type,x.id)?"i-check":"i-plus"}"/></svg>`;
+    fav.onclick=()=>toggleFavorite(type,x.id);
+  }
 }
 
 function guestProgress(){
@@ -231,6 +317,8 @@ function renderContinue(){
       </article>`);
     }
   }
+  const section=$("#continueSection");
+  if(section)section.classList.toggle("hidden",!html.length);
   $("#continueRail").innerHTML=html.length?html.join(""):'<div class="empty-card">ما عندك مشاهدة غير مكتملة بعد.</div>';
   $("#continueRail").querySelectorAll("[data-cont]").forEach(el=>el.onclick=()=>openPlayer(playable[Number(el.dataset.cont)]));
   $("#continueRail").querySelectorAll("[data-cont-remove]").forEach(btn=>btn.onclick=e=>{
@@ -251,6 +339,8 @@ function renderMyList(){
 }
 
 async function loadCatalog(){
+  const skeleton=skeletonCards(8);
+  ["latestMovies","latestSeries","recommendedRail","trendingRail","topRatedRail","moviesGrid","seriesGrid"].forEach(id=>{const el=$("#"+id);if(el)el.innerHTML=skeleton});
   try{
     const j=await rawApi("catalog");
     state.movies=j.movies||[];state.series=j.series||[];
@@ -258,6 +348,8 @@ async function loadCatalog(){
   }catch(e){
     showToast("تعذر تحميل المحتوى");
     $("#moviesGrid").innerHTML='<div class="empty-state">تعذر تحميل المحتوى حاليًا.</div>';
+    $("#seriesGrid").innerHTML='<div class="empty-state">تعذر تحميل المحتوى حاليًا.</div>';
+    ["recommendedRail","trendingRail","topRatedRail","latestMovies","latestSeries"].forEach(id=>{const el=$("#"+id);if(el)el.innerHTML='<div class="empty-card">تعذر تحميل المحتوى.</div>'});
   }
 }
 async function loadUserState(){
@@ -284,46 +376,94 @@ function renderAccount(){
   $("#profileNameInput").value=state.user.display_name||"";
 }
 
+async function loadDetailQualities(item){
+  const wrap=$("#detailQualityList");if(!wrap)return;
+  const expectedId=item.id;
+  wrap.innerHTML='<span class="quality-loading">جاري قراءة الجودات...</span>';
+  try{
+    const j=await rawApi("media_variants",{params:{type:"movie",id:item.id}});
+    if(state.detail?.id!==expectedId||state.detail?.type!=="movie")return;
+    const activeWrap=$("#detailQualityList");if(!activeWrap)return;
+    const variants=Array.isArray(j.variants)?j.variants:[];
+    if(!variants.length){activeWrap.innerHTML='<span class="quality-loading">الجودة التلقائية</span>';return}
+    const first=variants[0]?.variant||"default";
+    state.detailVariant=first;
+    activeWrap.innerHTML=variants.map((v,i)=>`<button class="quality-pill ${i===0?"active":""}" data-q="${esc(v.variant)}">${esc(v.label||v.variant)}</button>`).join("");
+    activeWrap.querySelectorAll("[data-q]").forEach(b=>b.onclick=()=>{
+      state.detailVariant=b.dataset.q||"default";
+      activeWrap.querySelectorAll("[data-q]").forEach(x=>x.classList.toggle("active",x===b));
+    });
+  }catch{
+    if(state.detail?.id===expectedId)$("#detailQualityList")?.replaceChildren(document.createTextNode("الجودة التلقائية"));
+  }
+}
+function renderRelated(type,item){
+  const grid=$("#relatedGrid");if(!grid)return;
+  const list=relatedFor(type,item,8);
+  grid.innerHTML=list.length?list.map(x=>card(x,type,{compact:true})).join(""):'<div class="empty-card">لا توجد اقتراحات مشابهة حاليًا.</div>';
+  bindCards(grid);
+}
 async function openDetails(type,id){
   const item=itemBy(type,id);if(!item)return;
-  state.detail={type,id};
+  state.detail={type,id};state.detailVariant="";
   const poster=mediaUrl(type==="movie"?"movie_poster":"series_poster",id);
   const backdrop=mediaUrl(type==="movie"?"movie_backdrop":"series_backdrop",id);
-  const genreTags=genreList(item).slice(0,4).map(g=>`<span class="tag">${esc(g)}</span>`).join("");
+  const genres=genreList(item);
+  const genreTags=genres.slice(0,5).map(g=>`<span class="tag">${esc(g)}</span>`).join("");
+  const rating=ratingValue(item);
   $("#detailContent").innerHTML=`
-    <div class="detail-hero">
+    <div class="detail-hero premium-detail">
       <div class="detail-bg" style="background-image:url('${backdrop}')"></div>
+      <div class="detail-cinematic-shade"></div>
       <div class="detail-summary">
-        <div class="detail-poster"><img src="${poster}" alt=""></div>
+        <div class="detail-poster"><img src="${poster}" alt="${esc(item.title)}"></div>
         <div class="detail-copy">
+          <span class="detail-type">${typeLabel(type)}</span>
           <h2>${esc(item.title)}</h2>
           ${item.original_title&&item.original_title!==item.title?`<div class="detail-original">${esc(item.original_title)}</div>`:""}
-          <div class="tags"><span class="tag">${esc(item.release_year||"—")}</span><span class="tag">${esc(item.quality||"—")}</span>${genreTags}</div>
-          <div class="detail-facts">
-            ${item.language?`<span>${esc(item.language)}</span>`:""}
-            ${item.country?`<span>${esc(item.country)}</span>`:""}
+          <div class="detail-primary-meta">
+            ${rating?`<span class="detail-rating"><svg><use href="#i-star"/></svg>${rating.toFixed(1)}</span>`:""}
+            ${item.release_year?`<span>${esc(item.release_year)}</span>`:""}
             ${type==="movie"&&item.duration_minutes?`<span>${esc(item.duration_minutes)} دقيقة</span>`:""}
-            ${Number(item.rating)>0?`<span>★ ${Number(item.rating).toFixed(1)}/10${Number(item.rating_count)>0?" • "+Number(item.rating_count).toLocaleString("ar-IQ")+" تقييم":""}</span>`:""}
-            ${Number(item.view_count)>0?`<span>${Number(item.view_count).toLocaleString("ar-IQ")} مشاهدة</span>`:""}
+            ${item.country?`<span>${esc(item.country)}</span>`:""}
           </div>
-          <p>${esc(item.description||"لا يوجد وصف متاح.")}</p>
+          <div class="tags">${genreTags}</div>
         </div>
       </div>
     </div>
-    <div class="detail-actions">
-      <button class="btn primary" id="detailPlay"><svg><use href="#i-play"/></svg><span>${type==="movie"?"مشاهدة الآن":"عرض الحلقات"}</span></button>
-      <button class="circle-action ${isFav(type,id)?"active":""}" id="favoriteBtn" title="قائمتي"><svg><use href="#${isFav(type,id)?"i-check":"i-plus"}"/></svg></button>
-      <button class="circle-action" id="detailReport" title="إبلاغ"><svg><use href="#i-report"/></svg></button>
+    <div class="detail-main">
+      <div class="detail-actions premium-actions">
+        <button class="btn primary detail-watch" id="detailPlay"><svg><use href="#i-play"/></svg><span>${type==="movie"?"مشاهدة الآن":"عرض الحلقات"}</span></button>
+        <button class="circle-action ${isFav(type,id)?"active":""}" id="favoriteBtn" title="قائمتي"><svg><use href="#${isFav(type,id)?"i-check":"i-plus"}"/></svg></button>
+        <button class="circle-action" id="detailShare" title="مشاركة"><svg><use href="#i-share"/></svg></button>
+        <button class="circle-action" id="detailReport" title="إبلاغ"><svg><use href="#i-report"/></svg></button>
+      </div>
+      ${type==="movie"?'<div class="detail-quality-block"><div class="detail-section-title"><span>الجودة</span><small>اختر الجودة قبل التشغيل</small></div><div class="detail-quality-list" id="detailQualityList"></div></div>':""}
+      <div class="detail-story">
+        <div class="detail-section-title"><span>القصة</span><small>${Number(item.view_count)>0?Number(item.view_count).toLocaleString("ar-IQ")+" مشاهدة":""}</small></div>
+        <p>${esc(item.description||"لا يوجد وصف متاح لهذا المحتوى.")}</p>
+      </div>
+      ${type==="series"?'<div class="seasons-wrap"><div class="detail-section-title"><span>المواسم والحلقات</span><small>اختر الموسم ثم الحلقة</small></div><div class="season-tabs" id="seasonTabs"></div><div class="episode-list" id="episodeList"></div></div>':""}
+      <div class="related-wrap">
+        <div class="detail-section-title"><span>قد يعجبك أيضًا</span><small>محتوى مشابه</small></div>
+        <div class="rail related-rail" id="relatedGrid"></div>
+      </div>
     </div>
-    ${type==="series"?'<div class="seasons-wrap"><div class="season-tabs" id="seasonTabs"></div><div class="episode-list" id="episodeList"></div></div>':""}
   `;
   openModal("detailModal");
+  const detailSheet=document.querySelector("#detailModal .detail-sheet");if(detailSheet)detailSheet.scrollTop=0;
   if(history.state?.overlay!=="detail")history.pushState({vayzen:true,page:state.currentPage,overlay:"detail",type,id},"","#detail");
 
   $("#favoriteBtn").onclick=()=>toggleFavorite(type,id);
+  $("#detailShare").onclick=()=>shareContent(type,item);
   $("#detailReport").onclick=()=>openReport(type,item.public_id);
+  renderRelated(type,item);
   if(type==="movie"){
-    $("#detailPlay").onclick=()=>openPlayer({type:"movie",id:item.id,title:item.title,publicId:item.public_id,quality:item.quality||"",src:mediaUrl("movie_video",item.id)});
+    await loadDetailQualities(item);
+    $("#detailPlay").onclick=()=>openPlayer({
+      type:"movie",id:item.id,title:item.title,publicId:item.public_id,quality:item.quality||"",
+      qualityVariant:state.detailVariant||"default",src:mediaUrl("movie_video",item.id,state.detailVariant||"")
+    });
   }else{
     $("#detailPlay").onclick=()=>$("#seasonTabs")?.scrollIntoView({behavior:"smooth",block:"center"});
     await loadSeriesContent(item);
@@ -331,40 +471,52 @@ async function openDetails(type,id){
 }
 
 async function loadSeriesContent(series){
-  const tabs=$("#seasonTabs"),list=$("#episodeList");
-  tabs.innerHTML='<button class="season-tab active">جاري التحميل...</button>';list.innerHTML="";
+  const expectedId=series.id;
+  const loadingTabs=$("#seasonTabs"),loadingList=$("#episodeList");
+  if(!loadingTabs||!loadingList)return;
+  loadingTabs.innerHTML='<button class="season-tab active skeleton-tab">جاري التحميل</button>';
+  loadingList.innerHTML='<div class="episode-skeleton"></div><div class="episode-skeleton"></div>';
   try{
     const j=await rawApi("series_content",{params:{id:series.id}});
+    if(state.detail?.id!==expectedId||state.detail?.type!=="series")return;
+    const liveTabs=$("#seasonTabs"),liveList=$("#episodeList");if(!liveTabs||!liveList)return;
     const seasons=j.seasons||[];
+    const tabs=liveTabs,list=liveList;
     if(!seasons.length){tabs.innerHTML="";list.innerHTML='<div class="empty-state">لا توجد حلقات منشورة بعد.</div>';return}
-    tabs.innerHTML=seasons.map((s,i)=>`<button class="season-tab ${i===0?"active":""}" data-i="${i}">${esc(s.title||("الموسم "+s.season_number))}</button>`).join("");
+    tabs.innerHTML=seasons.map((s,i)=>`<button class="season-tab ${i===0?"active":""}" data-i="${i}">${esc(s.title||("الموسم "+s.season_number))}<small>${(s.episodes||[]).length} حلقة</small></button>`).join("");
     const show=i=>{
       tabs.querySelectorAll(".season-tab").forEach((b,n)=>b.classList.toggle("active",n===i));
-      const eps=seasons[i].episodes||[];
-      list.innerHTML=eps.length?eps.map((e,n)=>`<div class="episode-row">
-        <div class="episode-no">${e.episode_number}</div>
-        <div class="episode-copy"><b>${esc(e.title||("الحلقة "+e.episode_number))}</b><small>${esc(e.quality||"")} ${e.duration_minutes?"• "+e.duration_minutes+" دقيقة":""}</small></div>
-        <button class="episode-play" data-e="${n}"><svg><use href="#i-play"/></svg></button>
-      </div>`).join(""):'<div class="empty-state">لا توجد حلقات بهذا الموسم.</div>';
+      const season=seasons[i],eps=season.episodes||[];
+      list.innerHTML=eps.length?eps.map((e,n)=>`<article class="episode-row">
+        <div class="episode-thumb" style="background-image:url('${mediaUrl("series_backdrop",series.id)}')"><span class="episode-index">${String(e.episode_number).padStart(2,"0")}</span><span class="episode-thumb-play"><svg><use href="#i-play"/></svg></span></div>
+        <div class="episode-copy"><b>${esc(e.title||("الحلقة "+e.episode_number))}</b><small>${e.duration_minutes?e.duration_minutes+" دقيقة":""}${e.quality?" • "+esc(e.quality):""}${Number(e.rating)>0?" • ★ "+Number(e.rating).toFixed(1):""}</small><p>${esc(e.description||"")}</p></div>
+        <button class="episode-play" data-e="${n}" aria-label="تشغيل الحلقة"><svg><use href="#i-play"/></svg></button>
+      </article>`).join(""):'<div class="empty-state">لا توجد حلقات منشورة في هذا الموسم.</div>';
       list.querySelectorAll("[data-e]").forEach(btn=>{
         const n=Number(btn.dataset.e),ep=eps[n],next=eps[n+1];
         btn.onclick=()=>openPlayer({
           type:"episode",id:ep.id,title:series.title+" • "+(ep.title||("الحلقة "+ep.episode_number)),
           publicId:ep.public_id,src:mediaUrl("episode_video",ep.id),
-          seriesId:series.id,seriesTitle:series.title,seasonNumber:seasons[i].season_number,
+          seriesId:series.id,seriesTitle:series.title,seasonNumber:season.season_number,
           episodeNumber:ep.episode_number,episodeTitle:ep.title||("الحلقة "+ep.episode_number),
           next:next?{
             type:"episode",id:next.id,title:series.title+" • "+(next.title||("الحلقة "+next.episode_number)),
             publicId:next.public_id,src:mediaUrl("episode_video",next.id),
-            seriesId:series.id,seriesTitle:series.title,seasonNumber:seasons[i].season_number,
+            seriesId:series.id,seriesTitle:series.title,seasonNumber:season.season_number,
             episodeNumber:next.episode_number,episodeTitle:next.title||("الحلقة "+next.episode_number)
           }:null
         });
       });
+      list.querySelectorAll(".episode-row").forEach((row,n)=>row.onclick=e=>{if(!e.target.closest("button"))list.querySelector(`[data-e="${n}"]`)?.click()});
     };
     tabs.querySelectorAll(".season-tab").forEach((b,i)=>b.onclick=()=>show(i));
     show(0);
-  }catch{tabs.innerHTML="";list.innerHTML='<div class="empty-state">تعذر تحميل الحلقات.</div>'}
+  }catch{
+    if(state.detail?.id!==expectedId)return;
+    const tabs=$("#seasonTabs"),list=$("#episodeList");
+    if(tabs)tabs.innerHTML="";
+    if(list)list.innerHTML='<div class="empty-state">تعذر تحميل الحلقات. حاول مرة أخرى.</div>';
+  }
 }
 
 async function toggleFavorite(type,id){
@@ -376,6 +528,7 @@ async function toggleFavorite(type,id){
     else state.favorites=state.favorites.filter(x=>!(x.entity_type===type&&x.entity_id===id));
     renderCatalog();
     const btn=$("#favoriteBtn");if(btn){btn.classList.toggle("active",enabled);btn.innerHTML=`<svg><use href="#${enabled?"i-check":"i-plus"}"/></svg>`}
+    const heroBtn=$("#heroFavorite");if(heroBtn){heroBtn.classList.toggle("active",isFav(type,id));heroBtn.innerHTML=`<svg><use href="#${isFav(type,id)?"i-check":"i-plus"}"/></svg>`}
     showToast(enabled?"تمت الإضافة إلى قائمتك":"تمت الإزالة من قائمتك");
   }catch(e){showToast(e.message)}
 }
@@ -816,12 +969,12 @@ document.addEventListener("fullscreenchange",()=>{
 });
 
 function applyPage(page){
-  const valid=["home","movies","series","mylist","account"];
+  const valid=["home","movies","series","search","mylist","account"];
   if(!valid.includes(page))page="home";
   state.currentPage=page;
   Array.from(document.querySelectorAll(".page")).forEach(p=>p.classList.toggle("active",p.dataset.page===page));
   Array.from(document.querySelectorAll(".nav-item")).forEach(n=>n.classList.toggle("active",n.dataset.nav===page));
-  $("#searchPanel")?.classList.add("hidden");
+  if(page!=="search")$("#searchPanel")?.classList.add("hidden");
   window.scrollTo({top:0,behavior:"instant"});
   if(page==="mylist")renderMyList();
   if(page==="account")renderAccount();
@@ -858,9 +1011,21 @@ Array.from(document.querySelectorAll(".modal")).forEach(m=>m.addEventListener("c
   else closeModal(m.id);
 }));
 
-$("#globalSearchBtn").onclick=()=>{$("#searchPanel").classList.toggle("hidden");if(!$("#searchPanel").classList.contains("hidden"))$("#searchInput").focus()};
-$("#clearSearch").onclick=()=>{$("#searchInput").value="";state.query="";renderCatalog()};
-$("#searchInput").oninput=e=>{state.query=e.target.value;renderCatalog()};
+$("#globalSearchBtn").onclick=()=>{
+  const panel=$("#searchPanel"),opening=panel.classList.contains("hidden");
+  panel.classList.toggle("hidden");
+  if(opening){state.searchReturnPage=state.currentPage==="search"?"home":state.currentPage;setTimeout(()=>$("#searchInput").focus(),20)}
+};
+$("#clearSearch").onclick=()=>{
+  $("#searchInput").value="";state.query="";renderCatalog();
+  if(state.currentPage==="search")go(state.searchReturnPage||"home");
+};
+$("#searchInput").oninput=e=>{
+  state.query=e.target.value;
+  renderCatalog();
+  if(state.query.trim()){if(state.currentPage!=="search")go("search")}
+  else if(state.currentPage==="search")go(state.searchReturnPage||"home");
+};
 $("#editProfileBtn").onclick=()=>openModal("editProfileModal");
 $("#openPasswordBtn").onclick=()=>openModal("changePasswordModal");
 $("#openRequestBtn").onclick=()=>openModal("requestModal");
