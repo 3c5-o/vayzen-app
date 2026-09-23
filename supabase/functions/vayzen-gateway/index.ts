@@ -1904,24 +1904,36 @@ async function callback(q:any){
   }
   if(a==="confirm_batch_episode"){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
-    const session=await getSession(userId);
+    let session=await getSession(userId);
     if(!session||session.flow!=="batch_episode")return showMenu(chatId,"انتهت جلسة الرفع الجماعي.");
-    if(session.step==="publishing")return send(chatId,"النشر الجماعي قيد التنفيذ الآن.");
-    if(session.step!=="confirm")return showMenu(chatId,"انتهت جلسة الرفع الجماعي.");
-    await setSession(userId,"batch_episode","publishing",session.draft);
-    await send(chatId,"جاري نشر الحلقات والجودات...");
-    const draft:any=session.draft||{};
+    if(session.step==="publishing"){
+      if(!publishingSessionIsStale(session))return send(chatId,"النشر الجماعي قيد التنفيذ الآن.");
+      await setSession(userId,"batch_episode","confirm",{...(session.draft||{}),batch_retry:true});
+      session=await getSession(userId);
+    }
+    if(!session||session.step!=="confirm")return showMenu(chatId,"انتهت جلسة الرفع الجماعي.");
+    const draft:any={...(session.draft||{}),batch_retry:Boolean((session.draft as any)?.batch_retry)};
+    await setSession(userId,"batch_episode","publishing",draft);
+    await send(chatId,draft.batch_retry?"استئناف نشر الملفات المتبقية...":"جاري نشر الحلقات والجودات...");
     try{
       const results=await publishBatchEpisodes(userId,chatId,draft);
-      await clearSession(userId);
       const ok=results.filter((x:any)=>x.ok).length,failed=results.length-ok;
       const partial=results.filter((x:any)=>x.ok&&x.failedVariants?.length);
       const failures=results.filter((x:any)=>!x.ok).map((x:any)=>`E${x.episode}: ${x.error}`).slice(0,12).join("\n");
       const partialText=partial.map((x:any)=>`E${x.episode}: فشل ${x.failedVariants.join(" / ")}`).slice(0,8).join("\n");
-      return send(chatId,`اكتمل النشر الجماعي.\n\nنجح: ${ok}\nفشل: ${failed}${partial.length?`\nجودات جزئية: ${partial.length}`:""}${failures?`\n\nالفشل:\n${failures}`:""}${partialText?`\n\nجودات تحتاج إعادة محاولة:\n${partialText}`:""}`,{inline_keyboard:[[{text:"فتح المسلسل",callback_data:`se|${draft.series_public_id}`},{text:"القائمة",callback_data:"menu"}]]});
+      const needsRetry=failed>0||partial.length>0;
+      if(needsRetry){
+        await setSession(userId,"batch_episode","confirm",{...draft,batch_results:results,batch_retry:true});
+      }else{
+        await clearSession(userId);
+      }
+      const buttons=needsRetry
+        ?[[{text:"إعادة محاولة الفاشل",callback_data:"confirm_batch_episode"}],[{text:"فتح المسلسل",callback_data:`se|${draft.series_public_id}`},{text:"القائمة",callback_data:"menu"}]]
+        :[[{text:"فتح المسلسل",callback_data:`se|${draft.series_public_id}`},{text:"القائمة",callback_data:"menu"}]];
+      return send(chatId,`${needsRetry?"اكتمل النشر جزئيًا.":"اكتمل النشر الجماعي."}\n\nنجح: ${ok}\nفشل: ${failed}${partial.length?`\nجودات جزئية: ${partial.length}`:""}${failures?`\n\nالفشل:\n${failures}`:""}${partialText?`\n\nجودات تحتاج إعادة محاولة:\n${partialText}`:""}`,{inline_keyboard:buttons});
     }catch(err){
-      await setSession(userId,"batch_episode","confirm",session.draft);
-      return send(chatId,`فشل النشر الجماعي.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"إعادة المحاولة",callback_data:"confirm_batch_episode"},{text:"إلغاء",callback_data:"cancel"}]]});
+      await setSession(userId,"batch_episode","confirm",{...(session.draft||{}),batch_retry:true});
+      return send(chatId,`فشل النشر الجماعي.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"استئناف المحاولة",callback_data:"confirm_batch_episode"},{text:"إلغاء",callback_data:"cancel"}]]});
     }
   }
 
