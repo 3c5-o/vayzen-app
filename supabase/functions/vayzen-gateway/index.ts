@@ -1246,6 +1246,63 @@ async function message(m:any){
     return searchUsers(chatId,text);
   }
 
+  if(s.flow==="search_content"&&s.step==="query"){
+    const type=String(d.type||"");
+    await clearSession(userId);
+    return searchContent(chatId,text,type||undefined);
+  }
+
+  if(s.flow==="edit_season"&&s.step==="title"){
+    const series:any=await contentByPublicId("series",String(d.series_public_id||""));
+    if(!series){await clearSession(userId);return send(chatId,"المسلسل غير موجود.");}
+    const title=text.trim().slice(0,120);if(!title)return send(chatId,"اسم الموسم لا يمكن أن يكون فارغًا.");
+    const {error}=await db.from("seasons").update({title,updated_at:new Date().toISOString()}).eq("series_id",series.id).eq("season_number",Number(d.season_number));
+    if(error)throw error;
+    await adminLog(userId,"season_edit","series",series.id,series.public_id,{season_number:Number(d.season_number)});
+    await clearSession(userId);
+    return sendSeasonEpisodes(chatId,series.public_id,Number(d.season_number));
+  }
+
+  if(s.flow==="add_quality"&&s.step==="label"){
+    const raw=text.trim().toLowerCase().replace(/\s+/g,"");
+    const variant=normalizeVariant(raw);
+    if(variant==="default"&&raw!=="default")return send(chatId,"اسم الجودة غير صالح. استخدم مثل 480p أو 720p أو 1080p أو 4K.");
+    d.variant=variant;
+    await setSession(userId,"add_quality","file",d);
+    return send(chatId,`أرسل فيديو جودة ${variantLabel(variant)}. الحد الأقصى 800MB.`);
+  }
+  if(s.flow==="add_quality"&&s.step==="file"){
+    const target:any=await qualityTarget(String(d.type||""),String(d.public_id||""));
+    if(!target){await clearSession(userId);return send(chatId,"المحتوى غير موجود.");}
+    const file=videoFrom(m);if(!file)return send(chatId,"أرسل ملف فيديو.");
+    if(file.file_size&&file.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
+    const variant=normalizeVariant(d.variant);
+    const title=target.item.title||target.item.series?.title||target.item.public_id;
+    await replaceStoredAsset({
+      adminId:userId,chatId,entityType:target.entityType,entityId:target.item.id,publicId:String(d.public_id),
+      kind:"video",channelKey:target.channelKey,sourceMessageId:m.message_id,file,variant,
+      caption:`${d.public_id} | ${title} | ${variantLabel(variant)} | ${sizeLabel(file.file_size)}`
+    });
+    await clearSession(userId);
+    return sendQualityManager(chatId,String(d.type),String(d.public_id));
+  }
+
+  if(s.flow==="replace_quality"&&s.step==="file"){
+    const target:any=await qualityTarget(String(d.type||""),String(d.public_id||""));
+    if(!target){await clearSession(userId);return send(chatId,"المحتوى غير موجود.");}
+    const file=videoFrom(m);if(!file)return send(chatId,"أرسل ملف فيديو.");
+    if(file.file_size&&file.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
+    const variant=normalizeVariant(d.variant);
+    const title=target.item.title||target.item.series?.title||target.item.public_id;
+    await replaceStoredAsset({
+      adminId:userId,chatId,entityType:target.entityType,entityId:target.item.id,publicId:String(d.public_id),
+      kind:"video",channelKey:target.channelKey,sourceMessageId:m.message_id,file,variant,
+      caption:`${d.public_id} | ${title} | ${variantLabel(variant)} | ${sizeLabel(file.file_size)}`
+    });
+    await clearSession(userId);
+    return sendQualityManager(chatId,String(d.type),String(d.public_id));
+  }
+
   if(s.flow==="edit_content"&&s.step==="value"){
     const type=String(d.type||""),publicId=String(d.public_id||""),field=String(d.field||"");
     const item:any=await contentByPublicId(type,publicId);
