@@ -291,6 +291,8 @@ async function systemLog(level:string,message:string,details:any={}){
 }
 
 function movieSummary(d:any){
+  const videos=Array.isArray(d.videos)&&d.videos.length?d.videos:(d.video?[{variant:normalizeVariant(d.quality||"default"),file:d.video}]:[]);
+  const qualities=videos.map((x:any)=>`${variantLabel(x.variant||"default")} (${sizeLabel(x.file?.file_size)})`).join(" • ")||"—";
   return [
     "معاينة الفيلم:",
     `الاسم: ${d.title}`,
@@ -300,8 +302,7 @@ function movieSummary(d:any){
     `اللغة: ${d.language||"—"}`,
     `الدولة: ${d.country||"—"}`,
     `المدة: ${d.duration_minutes?d.duration_minutes+" دقيقة":"—"}`,
-    `الجودة: ${d.quality||"—"}`,
-    `الحجم: ${sizeLabel(d.video?.file_size)}`,
+    `الجودات: ${qualities}`,
   ].join("\n");
 }
 function seriesSummary(d:any){
@@ -318,14 +319,20 @@ function seriesSummary(d:any){
 }
 
 async function publishMovie(userId:number,chatId:number,d:any){
+  const videos:any[]=Array.isArray(d.videos)&&d.videos.length?d.videos:(d.video?[{variant:normalizeVariant(d.quality||"default"),file:d.video,source_message_id:d.video_source_message_id}]:[]);
+  if(!videos.length)throw new Error("Movie video missing");
+  const unique=new Set<string>();
+  for(const v of videos){const q=normalizeVariant(v.variant||"default");if(unique.has(q))throw new Error(`جودة مكررة: ${variantLabel(q)}`);unique.add(q);v.variant=q;}
+  const best=[...videos].sort((a,b)=>qualityRank(b.variant)-qualityRank(a.variant))[0];
+  const bestLabel=variantLabel(best.variant);
   const {data:movie,error}=await db.from("movies").insert({
     title:d.title,original_title:d.original_title||"",description:d.description||"",
     release_year:d.release_year,genres:d.genres||[],language:d.language||"",country:d.country||"",
-    duration_minutes:d.duration_minutes,quality:d.quality||"",status:"draft",created_by:userId,
+    duration_minutes:d.duration_minutes,quality:bestLabel,status:"draft",created_by:userId,
   }).select("id,public_id").single();
   if(error||!movie) throw error??new Error("Movie insert failed");
 
-  let posterPlace:any=null,videoPlace:any=null;
+  let posterPlace:any=null;const videoPlaces:any[]=[];
   try{
     const infoCaption=[
       `${movie.public_id}`,"",`🎬 ${d.title}`,
@@ -334,20 +341,21 @@ async function publishMovie(userId:number,chatId:number,d:any){
       `التصنيف: ${(d.genres||[]).join(" • ")||"—"}`,
       `اللغة: ${d.language||"—"}`,`الدولة: ${d.country||"—"}`,
       `المدة: ${d.duration_minutes?d.duration_minutes+" دقيقة":"—"}`,
-      `الجودة: ${d.quality||"—"}`,"",d.description||"","",`Movie ID: ${movie.public_id}`,
+      `الجودات: ${videos.map(v=>variantLabel(v.variant)).join(" • ")}`,"",d.description||"","",`Movie ID: ${movie.public_id}`,
     ].filter(Boolean).join("\n");
-
     posterPlace=await copyTo("movies_info",chatId,d.poster_source_message_id,infoCaption);
-    videoPlace=await copyTo("movies_storage",chatId,d.video_source_message_id,
-      `${movie.public_id} | ${d.title} | ${d.quality||"Video"} | ${sizeLabel(d.video?.file_size)}`);
     await saveAsset("movie",movie.id,"poster",d.poster,posterPlace);
-    await saveAsset("movie",movie.id,"video",d.video,videoPlace);
-    const {error:publishError}=await db.from("movies").update({status:"published",updated_at:new Date().toISOString()}).eq("id",movie.id);
+    for(const v of videos){
+      const place=await copyTo("movies_storage",chatId,v.source_message_id,`${movie.public_id} | ${d.title} | ${variantLabel(v.variant)} | ${sizeLabel(v.file?.file_size)}`);
+      videoPlaces.push(place);
+      await saveAsset("movie",movie.id,"video",v.file,place,v.variant);
+    }
+    const {error:publishError}=await db.from("movies").update({status:"published",quality:bestLabel,updated_at:new Date().toISOString()}).eq("id",movie.id);
     if(publishError)throw publishError;
-    await adminLog(userId,"movie_publish","movie",movie.id,movie.public_id,{title:d.title});
+    await adminLog(userId,"movie_publish","movie",movie.id,movie.public_id,{title:d.title,qualities:videos.map(v=>v.variant)});
     return movie.public_id;
   }catch(err){
-    await cleanupEntity("movie",movie.id,[videoPlace,posterPlace]);
+    await cleanupEntity("movie",movie.id,[...videoPlaces,posterPlace]);
     await systemLog("error","movie publish rolled back",{public_id:movie.public_id});
     throw err;
   }
@@ -1638,9 +1646,26 @@ async function message(m:any){
     if(s.step==="video"){
       const f=videoFrom(m);if(!f)return send(chatId,"أرسل ملف فيديو.");
       if(f.file_size&&f.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
-      d.video=f;d.video_source_message_id=m.message_id;
-      await setSession(userId,"movie","confirm",d);
-      return send(chatId,movieSummary(d),{inline_keyboard:[[{text:"نشر الفيلم",callback_data:"confirm_movie"},{text:"إلغاء",callback_data:"cancel"}]]});
+      const variant=normalizeVariant(d.pending_quality||d.quality||"default");
+      const videos=Array.isArray(d.videos)?d.videos:[];
+      if(videos.some((x:any)=>normalizeVariant(x.variant)===variant))return send(chatId,`جودة ${variantLabel(variant)} موجودة مسبقًا. اختر جودة أخرى.`);
+      videos.push({variant,file:f,source_message_id:m.message_id});
+      d.videos=videos;delete d.pending_quality;delete d.video;delete d.video_source_message_id;
+      await setSession(userId,"movie","video_review",d);
+      return send(chatId,movieSummary(d),{inline_keyboard:[
+        [{text:"إضافة جودة أخرى",callback_data:"movie_add_quality"},{text:"نشر الفيلم",callback_data:"confirm_movie"}],
+        [{text:"إلغاء",callback_data:"cancel"}]
+      ]});
+    }
+    if(s.step==="quality_extra"){
+      const raw=text.trim().toLowerCase().replace(/\s+/g,"");
+      const variant=normalizeVariant(raw);
+      if(variant==="default"&&raw!=="default")return send(chatId,"الجودة غير صالحة. مثال: 480p أو 720p أو 1080p أو 4K.");
+      const videos=Array.isArray(d.videos)?d.videos:[];
+      if(videos.some((x:any)=>normalizeVariant(x.variant)===variant))return send(chatId,"هذه الجودة موجودة مسبقًا.");
+      d.pending_quality=variant;
+      await setSession(userId,"movie","video",d);
+      return send(chatId,`أرسل فيديو جودة ${variantLabel(variant)}. الحد 800MB.`);
     }
   }
 
