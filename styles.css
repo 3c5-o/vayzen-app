@@ -183,3 +183,17 @@ svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.9;stroke
   .player-controls{padding-left:13px;padding-right:13px}
   .player-tools select{max-width:78px}
 }
+
+
+/* Continue watching cards */
+.continue-watch-card{width:158px;flex:0 0 158px;border:1px solid var(--line);background:var(--panel);border-radius:16px;overflow:hidden;cursor:pointer;text-align:right}
+.continue-poster{height:92px;position:relative;background:#11141c;overflow:hidden}
+.continue-poster img{width:100%;height:100%;object-fit:cover;display:block}
+.continue-poster:after{content:"";position:absolute;inset:0;background:linear-gradient(0deg,rgba(0,0,0,.58),transparent 60%)}
+.continue-play{position:absolute;z-index:2;left:10px;bottom:9px;width:31px;height:31px;border-radius:50%;display:grid;place-items:center;background:rgba(0,0,0,.72);border:1px solid rgba(255,255,255,.22)}
+.continue-play svg{width:15px;height:15px;fill:#fff;stroke:#fff}
+.continue-copy{padding:9px 10px 10px;min-width:0}
+.continue-copy b{display:block;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.continue-copy small{display:block;color:var(--muted);font-size:8.5px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.continue-progress{height:3px;border-radius:999px;background:#292e3a;margin-top:8px;overflow:hidden}
+.continue-progress i{display:block;height:100%;background:#fff;border-radius:inherit}
