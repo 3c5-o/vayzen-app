@@ -424,10 +424,13 @@ async function publishEpisode(userId:number,chatId:number,d:any){
 
   let place:any=null;
   try{
+    const variant=normalizeVariant(d.variant||d.quality||"default");
+    const oldAsset:any=await currentAsset("episode",ep.id,"video",variant);
     place=await copyTo("series_storage",chatId,d.video_source_message_id,
-      `${ep.public_id} | ${series.title} | موسم ${d.season_number} | حلقة ${d.episode_number} | ${d.quality||"Video"}`);
-    await saveAsset("episode",ep.id,"video",d.video,place);
-    const {error:publishError}=await db.from("episodes").update({status:"published",updated_at:new Date().toISOString()}).eq("id",ep.id);
+      `${ep.public_id} | ${series.title} | موسم ${d.season_number} | حلقة ${d.episode_number} | ${variantLabel(variant)}`);
+    await saveAsset("episode",ep.id,"video",d.video,place,variant);
+    if(oldAsset?.channel_id&&oldAsset?.channel_message_id)await deleteCopiedMessage({channel_id:oldAsset.channel_id,message_id:oldAsset.channel_message_id});
+    const {error:publishError}=await db.from("episodes").update({status:"published",quality:d.quality||variantLabel(variant),updated_at:new Date().toISOString()}).eq("id",ep.id);
     if(publishError)throw publishError;
     await adminLog(userId,existing?"episode_replace":"episode_publish","episode",ep.id,ep.public_id,{series:series.title});
     return ep.public_id;
@@ -799,6 +802,90 @@ async function searchContent(chatId:number,query:string,type?:string){
   }
   rows.push([{text:"بحث جديد",callback_data:type?`content_search_type|${type}`:"content_search"},{text:"رجوع",callback_data:type==="movie"?"content_movies":type==="series"?"content_series":"content"}]);
   return send(chatId,rows.length>1?`نتائج البحث عن: ${q}`:"لا توجد نتائج مطابقة.",{inline_keyboard:rows});
+}
+
+async function sendBatchSeriesPicker(chatId:number){
+  const {data,error}=await db.from("series").select("public_id,title,status").eq("status","published").order("updated_at",{ascending:false}).limit(20);
+  if(error)throw error;
+  const rows:any[]=(data??[]).map((x:any)=>[{text:String(x.title).slice(0,34),callback_data:`batch_for|${x.public_id}`}]);
+  rows.push([{text:"رجوع",callback_data:"menu"}]);
+  return send(chatId,(data??[]).length?"إضافة حلقات جماعية\n\nاختر المسلسل:":"لا توجد مسلسلات منشورة بعد.",{inline_keyboard:rows});
+}
+
+async function sendBatchSeasonPicker(chatId:number,seriesPublicId:string){
+  const series:any=await contentByPublicId("series",seriesPublicId);if(!series)return sendBatchSeriesPicker(chatId);
+  const {data:seasons}=await db.from("seasons").select("season_number,title,status").eq("series_id",series.id).order("season_number",{ascending:true});
+  const rows:any[]=(seasons??[]).map((x:any)=>[{text:`الموسم ${x.season_number}`,callback_data:`batch_season|${series.public_id}|${x.season_number}`}]);
+  rows.push([{text:"موسم جديد",callback_data:`batch_newseason|${series.public_id}`}]);
+  rows.push([{text:"رجوع",callback_data:"batch_episode"}]);
+  return send(chatId,`${series.title}\n\nاختر الموسم:`,{inline_keyboard:rows});
+}
+
+function parseBatchEpisodeCaption(value:string,nextEpisode:number){
+  const parts=value.split("|").map(x=>x.trim()).filter(Boolean);
+  let episode=nextEpisode,title="",variant="default",explicitEpisode=false;
+  if(parts.length){
+    const m=parts[0].match(/^(?:e|ep|حلقة)?\s*(\d{1,4})$/i);
+    if(m){episode=Number(m[1]);explicitEpisode=true;parts.shift();}
+  }
+  for(const p of parts){
+    const compact=p.toLowerCase().replace(/\s+/g,"");
+    if(/^(?:\d{3,4}p|4k|default)$/.test(compact))variant=normalizeVariant(compact);
+    else if(!title)title=p.slice(0,180);
+    else title=(title+" | "+p).slice(0,180);
+  }
+  return {episode_number:episode,title:title||`الحلقة ${episode}`,variant,explicitEpisode};
+}
+
+function batchEpisodeSummary(d:any){
+  const items:any[]=Array.isArray(d.items)?d.items:[];
+  const grouped=new Map<number,any[]>();
+  for(const x of items){const n=Number(x.episode_number);if(!grouped.has(n))grouped.set(n,[]);grouped.get(n)!.push(x);}
+  const lines=[...grouped.entries()].sort((a,b)=>a[0]-b[0]).map(([n,arr])=>`E${String(n).padStart(2,"0")}: ${arr.map(x=>variantLabel(x.variant)).join(" / ")}`);
+  return `معاينة الرفع الجماعي\n\n${d.series_title||d.series_public_id}\nالموسم: ${d.season_number}\nالحلقات: ${grouped.size}\nملفات الفيديو: ${items.length}\n\n${lines.slice(0,30).join("\n")}${lines.length>30?"\n…":""}`;
+}
+
+async function episodeNumberExists(seriesPublicId:string,seasonNumber:number,episodeNumber:number){
+  const series:any=await contentByPublicId("series",seriesPublicId);if(!series)return false;
+  const {data:season}=await db.from("seasons").select("id").eq("series_id",series.id).eq("season_number",seasonNumber).maybeSingle();
+  if(!season)return false;
+  const {data}=await db.from("episodes").select("id").eq("season_id",season.id).eq("episode_number",episodeNumber).maybeSingle();
+  return Boolean(data);
+}
+
+async function publishBatchEpisodes(userId:number,chatId:number,d:any){
+  const items:any[]=Array.isArray(d.items)?d.items:[];
+  const grouped=new Map<number,any[]>();
+  for(const x of items){const n=Number(x.episode_number);if(!grouped.has(n))grouped.set(n,[]);grouped.get(n)!.push(x);}
+  const results:any[]=[];
+  for(const [episodeNumber,files] of [...grouped.entries()].sort((a,b)=>a[0]-b[0])){
+    if(await episodeNumberExists(d.series_public_id,Number(d.season_number),episodeNumber)){
+      results.push({episode:episodeNumber,ok:false,error:"الحلقة موجودة مسبقًا"});continue;
+    }
+    const sorted=[...files].sort((a,b)=>qualityRank(String(b.variant))-qualityRank(String(a.variant)));
+    const first=sorted[0];
+    try{
+      const epPublicId=await publishEpisode(userId,chatId,{
+        series_public_id:d.series_public_id,season_number:Number(d.season_number),episode_number:episodeNumber,
+        title:first.title||`الحلقة ${episodeNumber}`,description:"",quality:variantLabel(first.variant),variant:first.variant,
+        video:first.file,video_source_message_id:first.source_message_id
+      });
+      const ep:any=await episodeByPublicId(epPublicId);
+      const failedVariants:string[]=[];
+      for(const extra of sorted.slice(1)){
+        try{
+          await replaceStoredAsset({
+            adminId:userId,chatId,entityType:"episode",entityId:ep.id,publicId:ep.public_id,kind:"video",channelKey:"series_storage",
+            sourceMessageId:extra.source_message_id,file:extra.file,variant:extra.variant,
+            caption:`${ep.public_id} | ${d.series_title||d.series_public_id} | موسم ${d.season_number} | حلقة ${episodeNumber} | ${variantLabel(extra.variant)}`
+          });
+        }catch{failedVariants.push(variantLabel(extra.variant));}
+      }
+      results.push({episode:episodeNumber,ok:true,public_id:epPublicId,failedVariants});
+    }catch(err){results.push({episode:episodeNumber,ok:false,error:adminErrorText(err)});}
+  }
+  await adminLog(userId,"batch_episode_publish","series",undefined,d.series_public_id,{season_number:d.season_number,results});
+  return results;
 }
 
 async function sendEpisodeSeriesPicker(chatId:number){
@@ -1458,6 +1545,7 @@ async function message(m:any){
   const admin=await getAdmin(userId);
   if(!admin) return send(chatId,"هذا البوت مخصص لإدارة VAYZEN.");
   const text=String(m.text??"").trim();
+  const caption=String(m.caption??"").trim();
 
   if(text==="/start"||text==="/menu"){
     await clearSession(userId);
