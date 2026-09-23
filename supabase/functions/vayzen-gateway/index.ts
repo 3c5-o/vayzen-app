@@ -1131,6 +1131,7 @@ async function sendEpisodeItem(chatId:number,publicId:string){
     [{text:nextStatus==="published"?"نشر الحلقة":"إخفاء الحلقة",callback_data:`eps|${ep.public_id}|${nextStatus}`}],
     [{text:"تعديل الاسم",callback_data:`epe|${ep.public_id}|title`},{text:"تعديل الوصف",callback_data:`epe|${ep.public_id}|description`}],
     [{text:"تعديل الجودة",callback_data:`epe|${ep.public_id}|quality`},{text:"إدارة الجودات",callback_data:`q|episode|${ep.public_id}`}],
+    [{text:"الترجمات",callback_data:`sub|episode|${ep.public_id}`}],
     [{text:"حذف الحلقة",callback_data:`epd1|${ep.public_id}`}],
     [{text:"رجوع للحلقات",callback_data:`se|${ep.series?.public_id||""}`}],
   ];
@@ -1668,6 +1669,7 @@ async function sendContentItem(chatId:number,type:string,publicId:string){
     [type==="movie"
       ?{text:"إدارة الجودات",callback_data:`q|movie|${item.public_id}`}
       :{text:"المواسم والحلقات",callback_data:`se|${item.public_id}`}],
+    ...(type==="movie"?[[{text:"الترجمات",callback_data:`sub|movie|${item.public_id}`}]]:[]),
     ...(type==="series"&&item.external_source==="tmdb"&&item.external_id
       ?[[{text:"تحديث مواسم وحلقات TMDb",callback_data:`tmdb_sync|${item.public_id}`}]]
       :[]),
@@ -2884,6 +2886,64 @@ async function callback(q:any){
     }
   }
 
+  if(a.startsWith("sub|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة الترجمات.");
+    const [,type,id]=a.split("|");return sendSubtitleManager(chatId,type,id);
+  }
+  if(a.startsWith("sub_add|")){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة الترجمات.");
+    const [,type,id]=a.split("|");
+    return send(chatId,"اختر لغة الترجمة:",{inline_keyboard:[
+      [{text:"العربية",callback_data:`sub_lang|${type}|${id}|ar`},{text:"English",callback_data:`sub_lang|${type}|${id}|en`}],
+      [{text:"Kurdî",callback_data:`sub_lang|${type}|${id}|ku`},{text:"Türkçe",callback_data:`sub_lang|${type}|${id}|tr`}],
+      [{text:"لغة أخرى",callback_data:`sub_custom|${type}|${id}`}],
+      [{text:"رجوع",callback_data:`sub|${type}|${id}`}]
+    ]});
+  }
+  if(a.startsWith("sub_lang|")){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة الترجمات.");
+    const [,type,id,lang]=a.split("|");
+    const code=normalizeLanguageCode(lang);if(!code)return send(chatId,"رمز اللغة غير صالح.");
+    await setSession(userId,"subtitle","file",{type,public_id:id,language_code:code,label:subtitleLabel(code)});
+    return send(chatId,`أرسل ملف الترجمة ${subtitleLabel(code)} بصيغة VTT أو SRT. الحد 8MB.`);
+  }
+  if(a.startsWith("sub_custom|")){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة الترجمات.");
+    const [,type,id]=a.split("|");
+    await setSession(userId,"subtitle","language",{type,public_id:id});
+    return send(chatId,"أرسل رمز اللغة، مثال: fr أو es أو fa أو ar-iq.");
+  }
+  if(a.startsWith("sub_item|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة الترجمات.");
+    const [,type,id,lang]=a.split("|");
+    const target:any=await subtitleTarget(type,id);if(!target)return send(chatId,"المحتوى غير موجود.");
+    const {data:t}=await db.from("subtitle_tracks").select("language_code,label,source_format,is_default").eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("language_code",lang).maybeSingle();
+    if(!t)return sendSubtitleManager(chatId,type,id);
+    return send(chatId,`${t.label}\nالصيغة: ${String(t.source_format).toUpperCase()}\nافتراضية: ${t.is_default?"نعم":"لا"}`,{inline_keyboard:[
+      ...(!t.is_default?[[{text:"تعيين كافتراضية",callback_data:`sub_default|${type}|${id}|${lang}`}]]:[]),
+      [{text:"حذف الترجمة",callback_data:`sub_del1|${type}|${id}|${lang}`}],
+      [{text:"رجوع",callback_data:`sub|${type}|${id}`}]
+    ]});
+  }
+  if(a.startsWith("sub_default|")){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية تعديل الترجمات.");
+    const [,type,id,lang]=a.split("|");
+    await setDefaultSubtitle(userId,type,id,lang);return sendSubtitleManager(chatId,type,id);
+  }
+  if(a.startsWith("sub_del1|")){
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف الترجمات.");
+    const [,type,id,lang]=a.split("|");
+    return send(chatId,"تأكيد حذف مسار الترجمة؟",{inline_keyboard:[
+      [{text:"تأكيد الحذف",callback_data:`sub_del2|${type}|${id}|${lang}`}],
+      [{text:"تراجع",callback_data:`sub_item|${type}|${id}|${lang}`}]
+    ]});
+  }
+  if(a.startsWith("sub_del2|")){
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف الترجمات.");
+    const [,type,id,lang]=a.split("|");
+    await deleteSubtitleTrack(userId,type,id,lang);return sendSubtitleManager(chatId,type,id);
+  }
+
   if(a==="jobs"){
     if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة عمليات الوسائط.");
     return sendJobCenter(chatId);
@@ -3176,6 +3236,25 @@ async function message(m:any){
       return sendTmdbSearchResults(chatId,type,q);
     }catch(err){
       return send(chatId,`فشل البحث في TMDb.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"بحث جديد",callback_data:`tmdb_again|${type==="movie"?"m":"s"}`},{text:"إلغاء",callback_data:"cancel"}]]});
+    }
+  }
+
+  if(s.flow==="subtitle"){
+    if(!can(admin,"content")||!can(admin,"publish")){await clearSession(userId);return send(chatId,"لا تملك صلاحية إدارة الترجمات.");}
+    if(s.step==="language"){
+      const code=normalizeLanguageCode(text);
+      if(!code)return send(chatId,"رمز اللغة غير صالح. مثال: fr أو es أو ar-iq.");
+      d.language_code=code;d.label=subtitleLabel(code);
+      await setSession(userId,"subtitle","file",d);
+      return send(chatId,`أرسل ملف الترجمة ${d.label} بصيغة VTT أو SRT. الحد 8MB.`);
+    }
+    if(s.step==="file"){
+      const file=subtitleFileFrom(m);if(!file)return send(chatId,"أرسل ملف ترجمة بصيغة .vtt أو .srt.");
+      try{
+        await storeSubtitleTrack(userId,chatId,String(d.type||""),String(d.public_id||""),String(d.language_code||""),String(d.label||subtitleLabel(String(d.language_code||""))),file,m.message_id);
+        await clearSession(userId);
+        return sendSubtitleManager(chatId,String(d.type),String(d.public_id));
+      }catch(err){return send(chatId,`تعذر حفظ الترجمة.\n${adminErrorText(err)}`)}
     }
   }
 
