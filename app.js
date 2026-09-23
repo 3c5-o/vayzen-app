@@ -7,7 +7,7 @@ const GUEST_PROGRESS_KEY="vayzen.guest.progress";
 
 const state={
   movies:[],series:[],favorites:[],progress:[],user:null,session:null,
-  query:"",movieGenre:"",seriesGenre:"",detail:null,player:null,nextEpisode:null,
+  query:"",movieGenre:"",seriesGenre:"",movieYear:"",seriesYear:"",detail:null,player:null,nextEpisode:null,
   prefs:{autoplayNext:true,saveProgress:true}
 };
 const viewedThisSession=new Set();
@@ -121,12 +121,12 @@ function bindCards(root=document){
 
 function renderCatalog(){
   const q=state.query.trim().toLowerCase();
-  const filter=(arr,genre)=>arr.filter(x=>{
+  const filter=(arr,genre,year)=>arr.filter(x=>{
     const text=[x.title,x.original_title,x.description,...genreList(x)].join(" ").toLowerCase();
-    return (!q||text.includes(q))&&(!genre||genreList(x).includes(genre));
+    return (!q||text.includes(q))&&(!genre||genreList(x).includes(genre))&&(!year||String(x.release_year||"")===String(year));
   });
-  const movies=filter(state.movies,state.movieGenre);
-  const series=filter(state.series,state.seriesGenre);
+  const movies=filter(state.movies,state.movieGenre,state.movieYear);
+  const series=filter(state.series,state.seriesGenre,state.seriesYear);
 
   $("#latestMovies").innerHTML=state.movies.slice(0,10).map(x=>card(x,"movie",{compact:true})).join("")||'<div class="empty-card">لا توجد أفلام بعد.</div>';
   $("#latestSeries").innerHTML=state.series.slice(0,10).map(x=>card(x,"series",{compact:true})).join("")||'<div class="empty-card">لا توجد مسلسلات بعد.</div>';
@@ -140,6 +140,8 @@ function renderCatalog(){
 
   renderGenreChips("movieChips",state.movies,"movieGenre");
   renderGenreChips("seriesChips",state.series,"seriesGenre");
+  renderYearFilter("movieYearFilter",state.movies,"movieYear");
+  renderYearFilter("seriesYearFilter",state.series,"seriesYear");
   bindCards();
   renderHero();
   renderMyList();
@@ -150,6 +152,15 @@ function renderGenreChips(id,items,key){
   $("#"+id).innerHTML=`<button class="chip ${!state[key]?"active":""}" data-genre="">الكل</button>`+
     genres.map(g=>`<button class="chip ${state[key]===g?"active":""}" data-genre="${esc(g)}">${esc(g)}</button>`).join("");
   $("#"+id).querySelectorAll(".chip").forEach(b=>b.onclick=()=>{state[key]=b.dataset.genre||"";renderCatalog()});
+}
+function renderYearFilter(id,items,key){
+  const el=$("#"+id);if(!el)return;
+  const years=[...new Set(items.map(x=>Number(x.release_year)).filter(y=>Number.isInteger(y)&&y>0))].sort((a,b)=>b-a);
+  const current=String(state[key]||"");
+  const html='<option value="">كل السنوات</option>'+years.map(y=>`<option value="${y}">${y}</option>`).join("");
+  if(el.innerHTML!==html)el.innerHTML=html;
+  el.value=current;
+  el.onchange=()=>{state[key]=el.value||"";renderCatalog()};
 }
 function renderHero(){
   const x=state.movies.find(x=>x.is_featured)||state.series.find(x=>x.is_featured)||state.movies[0]||state.series[0];
