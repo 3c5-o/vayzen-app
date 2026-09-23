@@ -25,12 +25,22 @@ CHUNK_SIZE = max(128, int(os.environ.get("STREAM_CHUNK_KB", "512"))) * 1024
 MAX_RANGE_WINDOW = max(4, int(os.environ.get("MAX_RANGE_WINDOW_MB", "32"))) * 1024 * 1024
 STREAM_CHUNK_TIMEOUT = max(10, int(os.environ.get("STREAM_CHUNK_TIMEOUT_SECONDS", "35")))
 STREAM_READ_RETRIES = max(1, min(6, int(os.environ.get("STREAM_READ_RETRIES", "3"))))
+STREAM_QUEUE_TIMEOUT = max(1.0, float(os.environ.get("STREAM_QUEUE_TIMEOUT_SECONDS", "12")))
 MAX_MEDIA_BYTES = max(1, int(os.environ.get("MAX_MEDIA_MB", "2000"))) * 1024 * 1024
+MEDIA_CACHE_TTL = max(5.0, float(os.environ.get("MEDIA_CACHE_TTL_SECONDS", "60")))
+MEDIA_CACHE_MAX = max(32, int(os.environ.get("MEDIA_CACHE_MAX", "256")))
 
 client = TelegramClient(None, API_ID, API_HASH)
 channel_cache = {}
+media_cache = {}
 stream_slots = asyncio.Semaphore(MAX_CONCURRENT_STREAMS)
 active_streams = 0
+total_stream_requests = 0
+range_requests = 0
+stream_failures = 0
+stream_retries = 0
+stream_rejections = 0
+bytes_served = 0
 
 
 async def refresh_channel_cache():
@@ -127,13 +137,20 @@ async def get_channel(channel_id: int):
     return entity
 
 
-async def get_media(channel_id: int, message_id: int):
+async def get_media(channel_id: int, message_id: int, force_refresh: bool = False):
+    key = (channel_id, message_id)
+    now = time.monotonic()
+    cached = media_cache.get(key)
+    if not force_refresh and cached and now - cached["at"] < MEDIA_CACHE_TTL:
+        return cached["message"], cached["size"], cached["mime"], cached["name"]
+
     entity = await get_channel(channel_id)
     try:
         message = await client.get_messages(entity, ids=message_id)
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Telegram media lookup failed") from exc
     if not message or not message.media or not message.file:
+        media_cache.pop(key, None)
         raise HTTPException(status_code=404, detail="Media not found")
     size = int(message.file.size or 0)
     if size <= 0:
@@ -142,6 +159,11 @@ async def get_media(channel_id: int, message_id: int):
         raise HTTPException(status_code=413, detail="Media exceeds configured VAYZEN limit")
     mime = message.file.mime_type or "application/octet-stream"
     name = (message.file.name or f"vayzen-{message_id}").replace('"', "").replace("\n", " ")
+
+    if len(media_cache) >= MEDIA_CACHE_MAX:
+        oldest = min(media_cache, key=lambda k: media_cache[k]["at"])
+        media_cache.pop(oldest, None)
+    media_cache[key] = {"at": now, "message": message, "size": size, "mime": mime, "name": name}
     return message, size, mime, name
 
 
@@ -215,18 +237,34 @@ async def health():
         "max_media_mb": MAX_MEDIA_BYTES // (1024 * 1024),
         "chunk_timeout_seconds": STREAM_CHUNK_TIMEOUT,
         "read_retries": STREAM_READ_RETRIES,
+        "queue_timeout_seconds": STREAM_QUEUE_TIMEOUT,
         "active_streams": active_streams,
         "max_concurrent_streams": MAX_CONCURRENT_STREAMS,
+        "available_stream_slots": max(0, MAX_CONCURRENT_STREAMS - active_streams),
+        "total_stream_requests": total_stream_requests,
+        "range_requests": range_requests,
+        "stream_failures": stream_failures,
+        "stream_retries": stream_retries,
+        "stream_rejections": stream_rejections,
+        "bytes_served": bytes_served,
         "signed_streams": bool(STREAM_SIGNING_SECRET),
         "cached_channels": len(channel_cache),
+        "cached_media": len(media_cache),
     }
 
 
 @app.api_route("/stream/{channel_id}/{message_id}", methods=["GET", "HEAD"])
 async def stream(channel_id: int, message_id: int, request: Request, exp: int, sig: str):
+    global active_streams, total_stream_requests, range_requests
+    global stream_failures, stream_retries, stream_rejections, bytes_served
+
     verify_signature(channel_id, message_id, exp, sig)
     message, total, mime, name = await get_media(channel_id, message_id)
     range_header = request.headers.get("range")
+    total_stream_requests += 1
+    if range_header:
+        range_requests += 1
+
     if request.method == "HEAD" and not range_header:
         start, end, partial = 0, total - 1, False
     else:
@@ -245,58 +283,82 @@ async def stream(channel_id: int, message_id: int, request: Request, exp: int, s
     if request.method == "HEAD":
         return Response(status_code=status, headers=headers, media_type=mime)
 
+    try:
+        await asyncio.wait_for(stream_slots.acquire(), timeout=STREAM_QUEUE_TIMEOUT)
+    except asyncio.TimeoutError as exc:
+        stream_rejections += 1
+        raise HTTPException(
+            status_code=503,
+            detail="Streaming capacity is busy; retry shortly",
+            headers={"Retry-After": "3"},
+        ) from exc
+
+    active_streams += 1
+
     async def body():
-        global active_streams
+        global active_streams, stream_failures, stream_retries, bytes_served
         remaining = length
         position = start
         failures = 0
-        async with stream_slots:
-            active_streams += 1
-            try:
-                while remaining > 0:
-                    if await request.is_disconnected():
-                        break
-                    try:
-                        iterator = client.iter_download(
-                            message.media,
-                            offset=position,
-                            request_size=CHUNK_SIZE,
-                            chunk_size=CHUNK_SIZE,
-                        ).__aiter__()
-                        while remaining > 0:
-                            if await request.is_disconnected():
-                                return
-                            try:
-                                chunk = await asyncio.wait_for(
-                                    iterator.__anext__(),
-                                    timeout=STREAM_CHUNK_TIMEOUT,
-                                )
-                            except StopAsyncIteration:
-                                if remaining > 0:
-                                    raise RuntimeError("Telegram stream ended before requested range completed")
-                                break
-                            if not chunk:
-                                raise RuntimeError("Telegram returned an empty media chunk")
-                            if len(chunk) > remaining:
-                                chunk = chunk[:remaining]
-                            position += len(chunk)
-                            remaining -= len(chunk)
-                            failures = 0
-                            yield chunk
-                        break
-                    except asyncio.CancelledError:
+        current_message = message
+        try:
+            while remaining > 0:
+                if await request.is_disconnected():
+                    break
+                try:
+                    iterator = client.iter_download(
+                        current_message.media,
+                        offset=position,
+                        request_size=CHUNK_SIZE,
+                        chunk_size=CHUNK_SIZE,
+                    ).__aiter__()
+                    while remaining > 0:
+                        if await request.is_disconnected():
+                            return
+                        try:
+                            chunk = await asyncio.wait_for(
+                                iterator.__anext__(),
+                                timeout=STREAM_CHUNK_TIMEOUT,
+                            )
+                        except StopAsyncIteration:
+                            if remaining > 0:
+                                raise RuntimeError("Telegram stream ended before requested range completed")
+                            break
+                        if not chunk:
+                            raise RuntimeError("Telegram returned an empty media chunk")
+                        if len(chunk) > remaining:
+                            chunk = chunk[:remaining]
+                        position += len(chunk)
+                        remaining -= len(chunk)
+                        bytes_served += len(chunk)
+                        failures = 0
+                        yield chunk
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    failures += 1
+                    if failures > STREAM_READ_RETRIES:
+                        stream_failures += 1
                         raise
-                    except Exception:
-                        failures += 1
+                    stream_retries += 1
+                    if not client.is_connected():
+                        try:
+                            await client.connect()
+                        except Exception:
+                            pass
+                    try:
+                        current_message, refreshed_total, _, _ = await get_media(
+                            channel_id, message_id, force_refresh=True
+                        )
+                        if refreshed_total != total:
+                            raise RuntimeError("Telegram media size changed during stream")
+                    except HTTPException:
                         if failures > STREAM_READ_RETRIES:
                             raise
-                        if not client.is_connected():
-                            try:
-                                await client.connect()
-                            except Exception:
-                                pass
-                        await asyncio.sleep(min(2.5, 0.4 * (2 ** (failures - 1))))
-            finally:
-                active_streams = max(0, active_streams - 1)
+                    await asyncio.sleep(min(2.5, 0.4 * (2 ** (failures - 1))))
+        finally:
+            active_streams = max(0, active_streams - 1)
+            stream_slots.release()
 
     return StreamingResponse(body(), status_code=status, headers=headers, media_type=mime)
