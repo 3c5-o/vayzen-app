@@ -750,14 +750,27 @@ async function publishMovie(userId:number,chatId:number,d:any){
   for(const v of videos){const q=normalizeVariant(v.variant||"default");if(unique.has(q))throw new Error(`جودة مكررة: ${variantLabel(q)}`);unique.add(q);v.variant=q;}
   const best=[...videos].sort((a,b)=>qualityRank(b.variant)-qualityRank(a.variant))[0];
   const bestLabel=variantLabel(best.variant);
-  const {data:movie,error}=await db.from("movies").insert({
-    title:d.title,original_title:d.original_title||"",description:d.description||"",
-    release_year:d.release_year,genres:d.genres||[],language:d.language||"",country:d.country||"",
-    duration_minutes:d.duration_minutes,quality:bestLabel,status:"draft",
-    external_source:d.external_source||null,external_id:d.external_id||null,external_metadata:d.external_metadata||{},
-    release_date:d.release_date||null,rating:d.rating||null,rating_count:d.rating_count||null,created_by:userId,
-  }).select("id,public_id").single();
-  if(error||!movie) throw error??new Error("Movie insert failed");
+
+  let movie:any=null;
+  if(d.publishing_entity_id){
+    const {data}=await db.from("movies").select("id,public_id,status").eq("id",String(d.publishing_entity_id)).maybeSingle();
+    movie=data??null;
+    if(movie?.status==="published")return movie.public_id;
+  }
+  if(!movie){
+    const {data:created,error}=await db.from("movies").insert({
+      title:d.title,original_title:d.original_title||"",description:d.description||"",
+      release_year:d.release_year,genres:d.genres||[],language:d.language||"",country:d.country||"",
+      duration_minutes:d.duration_minutes,quality:bestLabel,status:"draft",
+      external_source:d.external_source||null,external_id:d.external_id||null,external_metadata:d.external_metadata||{},
+      release_date:d.release_date||null,rating:d.rating||null,rating_count:d.rating_count||null,created_by:userId,
+    }).select("id,public_id,status").single();
+    if(error||!created) throw error??new Error("Movie insert failed");
+    movie=created;
+    d.publishing_entity_id=movie.id;
+    d.publishing_public_id=movie.public_id;
+    await setSession(userId,"movie","publishing",d);
+  }
 
   let posterPlace:any=null,backdropPlace:any=null;const videoPlaces:any[]=[];
   try{
@@ -773,9 +786,12 @@ async function publishMovie(userId:number,chatId:number,d:any){
     posterPlace=await copyTo("movies_info",chatId,d.poster_source_message_id,infoCaption);
     await saveAsset("movie",movie.id,"poster",d.poster,posterPlace);
     if(d.backdrop_url){
-      const remote=await sendRemotePhotoTo("movies_info",d.backdrop_url,`${movie.public_id} | ${d.title} | backdrop`);
-      backdropPlace=remote.place;
-      await saveAsset("movie",movie.id,"backdrop",remote.file,remote.place);
+      const existingBackdrop=await currentAsset("movie",movie.id,"backdrop");
+      if(!existingBackdrop){
+        const remote=await sendRemotePhotoTo("movies_info",d.backdrop_url,`${movie.public_id} | ${d.title} | backdrop`);
+        backdropPlace=remote.place;
+        await saveAsset("movie",movie.id,"backdrop",remote.file,remote.place);
+      }
     }
     for(const v of videos){
       const place=await copyTo("movies_storage",chatId,v.source_message_id,`${movie.public_id} | ${d.title} | ${variantLabel(v.variant)} | ${sizeLabel(v.file?.file_size)}`,v.file?.file_size);
@@ -887,7 +903,8 @@ async function publishEpisode(userId:number,chatId:number,d:any){
       if(seasonError)throw seasonError;
       seasonPromoted=true;
     }
-    if(oldAsset?.channel_id&&oldAsset?.channel_message_id)await deleteCopiedMessage({channel_id:oldAsset.channel_id,message_id:oldAsset.channel_message_id});
+    const sameTarget=oldAsset?.channel_id===place?.channel_id&&oldAsset?.channel_message_id===place?.message_id;
+    if(oldAsset?.channel_id&&oldAsset?.channel_message_id&&!sameTarget)await deleteCopiedMessage({channel_id:oldAsset.channel_id,message_id:oldAsset.channel_message_id});
     await adminLog(userId,existing?"episode_replace":"episode_publish","episode",ep.id,ep.public_id,{series:series.title});
     return ep.public_id;
   }catch(err){
@@ -910,6 +927,17 @@ async function publishEpisode(userId:number,chatId:number,d:any){
     await systemLog("error","episode publish failed",{public_id:ep.public_id});
     throw err;
   }
+}
+
+function publishingSessionIsStale(session:any){
+  const t=Date.parse(String(session?.updated_at||""));
+  return !Number.isFinite(t)||Date.now()-t>BATCH_RESUME_AFTER_MS;
+}
+async function recoverStalePublishSession(userId:number,flow:string,session:any){
+  if(session?.step!=="publishing"||!publishingSessionIsStale(session))return false;
+  const nextStep=flow==="movie"?(Array.isArray(session.draft?.videos)?"video_review":"confirm"):"confirm";
+  await setSession(userId,flow,nextStep,session.draft||{});
+  return true;
 }
 
 function adminErrorText(err:any){
@@ -961,7 +989,8 @@ async function replaceStoredAsset(opts:{
     await deleteCopiedMessage(place);
     throw err;
   }
-  if(oldAsset?.channel_id&&oldAsset?.channel_message_id){
+  const sameTarget=oldAsset?.channel_id===place?.channel_id&&oldAsset?.channel_message_id===place?.message_id;
+  if(oldAsset?.channel_id&&oldAsset?.channel_message_id&&!sameTarget){
     await deleteCopiedMessage({channel_id:oldAsset.channel_id,message_id:oldAsset.channel_message_id});
   }
   await adminLog(opts.adminId,"asset_replace",opts.entityType,opts.entityId,opts.publicId,{kind:opts.kind,variant});
@@ -1617,7 +1646,7 @@ async function systemStatusText(){
     `Telegram Streaming: ${telegram}`,
     `عمليات البث الحالية: ${activeStreams}`,
     `نافذة Range: ${rangeWindow||"—"} MB`,
-    "حد الفيديو: 800 MB",
+    `حد الفيديو: ${videoLimitLabel()}`,
     `أفلام منشورة: ${mp.count||0}`,
     `مسودات أفلام: ${md.count||0}`,
     `مسلسلات منشورة: ${sp.count||0}`,
