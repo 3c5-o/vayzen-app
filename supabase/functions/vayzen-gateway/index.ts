@@ -6,13 +6,13 @@ function envMap(name:string){
   try{return JSON.parse(Deno.env.get(name) ?? "{}") as Record<string,string>;}catch{return {};}
 }
 const secretMap = envMap("SUPABASE_SECRET_KEYS");
-const SERVICE_KEY = secretMap["default"] ?? Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? secretMap["default"] ?? "";
 const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const BOT_SECRET = Deno.env.get("TELEGRAM_BOT_SECRET") ?? "";
 const STREAM_GATEWAY = Deno.env.get("STREAM_GATEWAY") ?? "";
 const STREAM_SIGNING_SECRET = Deno.env.get("STREAM_SIGNING_SECRET") ?? "";
 const publishableMap = envMap("SUPABASE_PUBLISHABLE_KEYS");
-const PUBLIC_KEY = publishableMap["default"] ?? "";
+const PUBLIC_KEY = Deno.env.get("SUPABASE_ANON_KEY") ?? publishableMap["default"] ?? "";
 
 const db = createClient(SUPABASE_URL, SERVICE_KEY, {
   auth: { persistSession:false, autoRefreshToken:false },
