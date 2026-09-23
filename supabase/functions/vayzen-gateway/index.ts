@@ -948,6 +948,108 @@ async function message(m:any){
   if(!s) return showMenu(chatId);
   const d:any={...(s.draft??{})};
 
+  if(s.flow==="edit_content"&&s.step==="value"){
+    const type=String(d.type||""),publicId=String(d.public_id||""),field=String(d.field||"");
+    const item:any=await contentByPublicId(type,publicId);
+    if(!item){await clearSession(userId);return send(chatId,"المحتوى غير موجود.");}
+    let value:any=text;
+    if(field==="title"){
+      value=text.trim().slice(0,200);if(!value)return send(chatId,"الاسم لا يمكن أن يكون فارغًا.");
+    }else if(field==="description"){
+      value=text==="-"?"":text.slice(0,4000);
+    }else if(field==="release_year"){
+      value=yearOf(text);if(!value)return send(chatId,"السنة غير صحيحة.");
+    }else if(field==="genres"){
+      value=splitGenres(text);
+    }else if(["language","country","quality"].includes(field)){
+      value=text==="-"?"":text.slice(0,120);
+    }else if(field==="duration_minutes"){
+      value=positiveOrNull(text);if(text!=="-"&&!value)return send(chatId,"أرسل رقمًا صحيحًا أو -.");
+    }else{
+      await clearSession(userId);return send(chatId,"الحقل غير مدعوم.");
+    }
+    const table=type==="movie"?"movies":"series";
+    const {error}=await db.from(table).update({[field]:value,updated_at:new Date().toISOString()}).eq("id",item.id);
+    if(error)throw error;
+    await adminLog(userId,"content_edit",type,item.id,item.public_id,{field});
+    await clearSession(userId);
+    return sendContentItem(chatId,type,item.public_id);
+  }
+
+  if(s.flow==="replace_poster"&&s.step==="file"){
+    const type=String(d.type||""),publicId=String(d.public_id||"");
+    const item:any=await contentByPublicId(type,publicId);
+    if(!item){await clearSession(userId);return send(chatId,"المحتوى غير موجود.");}
+    const file=photoFrom(m);if(!file)return send(chatId,"أرسل صورة بوستر.");
+    await replaceStoredAsset({
+      adminId:userId,chatId,entityType:type as "movie"|"series",entityId:item.id,publicId:item.public_id,
+      kind:"poster",channelKey:type==="movie"?"movies_info":"series_info",
+      sourceMessageId:m.message_id,file,caption:`${item.public_id} | ${item.title} | Poster`
+    });
+    await clearSession(userId);
+    return sendContentItem(chatId,type,item.public_id);
+  }
+
+  if(s.flow==="replace_movie_video"&&s.step==="file"){
+    const item:any=await contentByPublicId("movie",String(d.public_id||""));
+    if(!item){await clearSession(userId);return send(chatId,"الفيلم غير موجود.");}
+    const file=videoFrom(m);if(!file)return send(chatId,"أرسل ملف فيديو.");
+    if(file.file_size&&file.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
+    await replaceStoredAsset({
+      adminId:userId,chatId,entityType:"movie",entityId:item.id,publicId:item.public_id,
+      kind:"video",channelKey:"movies_storage",sourceMessageId:m.message_id,file,
+      caption:`${item.public_id} | ${item.title} | ${item.quality||"Video"} | ${sizeLabel(file.file_size)}`
+    });
+    await clearSession(userId);
+    return sendContentItem(chatId,"movie",item.public_id);
+  }
+
+  if(s.flow==="edit_episode"&&s.step==="value"){
+    const ep:any=await episodeByPublicId(String(d.public_id||""));
+    if(!ep){await clearSession(userId);return send(chatId,"الحلقة غير موجودة.");}
+    const field=String(d.field||"");
+    if(!["title","description","quality"].includes(field)){await clearSession(userId);return sendEpisodeItem(chatId,ep.public_id);}
+    let value=text;
+    if(field==="title"){value=text.trim().slice(0,200);if(!value)return send(chatId,"اسم الحلقة لا يمكن أن يكون فارغًا.");}
+    if(field==="description")value=text==="-"?"":text.slice(0,4000);
+    if(field==="quality")value=text==="-"?"":text.slice(0,120);
+    const {error}=await db.from("episodes").update({[field]:value,updated_at:new Date().toISOString()}).eq("id",ep.id);
+    if(error)throw error;
+    await adminLog(userId,"episode_edit","episode",ep.id,ep.public_id,{field});
+    await clearSession(userId);
+    return sendEpisodeItem(chatId,ep.public_id);
+  }
+
+  if(s.flow==="replace_episode_video"&&s.step==="file"){
+    const ep:any=await episodeByPublicId(String(d.public_id||""));
+    if(!ep){await clearSession(userId);return send(chatId,"الحلقة غير موجودة.");}
+    const file=videoFrom(m);if(!file)return send(chatId,"أرسل ملف فيديو.");
+    if(file.file_size&&file.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
+    await replaceStoredAsset({
+      adminId:userId,chatId,entityType:"episode",entityId:ep.id,publicId:ep.public_id,
+      kind:"video",channelKey:"series_storage",sourceMessageId:m.message_id,file,
+      caption:`${ep.public_id} | ${ep.series?.title||"Series"} | موسم ${ep.season?.season_number||"—"} | حلقة ${ep.episode_number} | ${ep.quality||"Video"}`
+    });
+    await clearSession(userId);
+    return sendEpisodeItem(chatId,ep.public_id);
+  }
+
+  if(s.flow==="link_request"&&s.step==="content_id"){
+    const code=String(d.request_code||"");
+    const id=text.toUpperCase();
+    const type=/^MOV-\d{6}$/.test(id)?"movie":/^SER-\d{6}$/.test(id)?"series":"";
+    if(!type)return send(chatId,"ID غير صحيح. أرسل MOV-000000 أو SER-000000.");
+    const item:any=await contentByPublicId(type,id);
+    if(!item||item.status!=="published")return send(chatId,"المحتوى غير موجود أو غير منشور.");
+    const {error}=await db.from("content_requests").update({
+      status:"added",linked_entity_type:type,linked_entity_id:item.id,handled_by:userId,updated_at:new Date().toISOString()
+    }).eq("request_code",code);
+    if(error)throw error;
+    await adminLog(userId,"request_link","request",item.id,code,{content_public_id:item.public_id,type});
+    await clearSession(userId);
+    return sendRequestsManager(chatId);
+  }
+
   if(s.flow==="movie"){
     if(s.step==="title"){if(!text)return send(chatId,"أرسل الاسم.");d.title=text;await setSession(userId,"movie","original_title",d);return send(chatId,"أرسل الاسم الأصلي، أو - للتخطي.");}
     if(s.step==="original_title"){d.original_title=text==="-"?"":text;await setSession(userId,"movie","description",d);return send(chatId,"أرسل وصف الفيلم، أو - للتخطي.");}
