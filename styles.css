@@ -519,3 +519,10 @@ body{
 @media(max-width:360px){
   .grid{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
+
+
+/* Cinematic detail metadata */
+.detail-original{color:#a7a7a7;font-size:10px;margin:-2px 0 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.detail-facts{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:8px 0 2px}
+.detail-facts span{font-size:8.5px;color:#aaa;padding-left:7px;position:relative}
+.detail-facts span:not(:last-child):after{content:"•";position:absolute;left:0;color:#555}
