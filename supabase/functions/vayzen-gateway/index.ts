@@ -211,7 +211,7 @@ async function consumeRateLimit(key:string,action:string,limit:number,windowSeco
   if(error)throw error;
   if(Math.random()<0.02){
     const cutoff=new Date(Date.now()-3*86400000).toISOString();
-    db.from("api_rate_limits").delete().lt("updated_at",cutoff).then(()=>{}).catch(()=>{});
+    void db.from("api_rate_limits").delete().lt("updated_at",cutoff).then(()=>{},()=>{});
   }
   return true;
 }
@@ -984,7 +984,7 @@ async function publishEpisode(userId:number,chatId:number,d:any){
       }
     }
     if(created)await cleanupEntity("episode",ep.id);
-    else await db.from("episodes").update({status:existing.status,updated_at:new Date().toISOString()}).eq("id",ep.id);
+    else await db.from("episodes").update({status:existing?.status??"draft",updated_at:new Date().toISOString()}).eq("id",ep.id);
     if(seasonWasDraft&&seasonPromoted)await db.from("seasons").update({status:"draft",updated_at:new Date().toISOString()}).eq("id",season.id);
     await systemLog("error","episode publish failed",{public_id:ep.public_id});
     throw err;
@@ -1016,7 +1016,8 @@ async function contentByPublicId(type:string,publicId:string){
   const fields=type==="movie"
     ?"id,public_id,title,original_title,description,release_year,genres,language,country,duration_minutes,quality,status,is_featured,view_count,external_source,external_id,rating,rating_count,release_date,deleted_at,deleted_by,deleted_previous_status,created_at,updated_at"
     :"id,public_id,title,original_title,description,release_year,genres,language,country,quality,status,is_featured,view_count,external_source,external_id,rating,rating_count,first_air_date,deleted_at,deleted_by,deleted_previous_status,created_at,updated_at";
-  const {data}=await db.from(table).select(fields).eq("public_id",publicId.toUpperCase()).maybeSingle();
+  const client:any=db;
+  const {data}=await client.from(table).select(fields).eq("public_id",publicId.toUpperCase()).maybeSingle();
   return data??null;
 }
 
@@ -1233,6 +1234,7 @@ async function storeSubtitleTrack(adminId:number,chatId:number,type:string,publi
   try{
     await saveAsset(target.entityType,target.item.id,"subtitle",file,place,variant);
     const {data:asset}=await db.from("media_assets").select("id").eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("kind","subtitle").eq("variant",variant).single();
+    if(!asset?.id)throw new Error("تعذر تثبيت ملف الترجمة.");
     await db.from("media_assets").update({metadata:{language_code:code,label,source_format:file.format||"vtt"},updated_at:new Date().toISOString()}).eq("id",asset.id);
     const {count}=await db.from("subtitle_tracks").select("id",{head:true,count:"exact"}).eq("entity_type",target.entityType).eq("entity_id",target.item.id);
     const {error}=await db.from("subtitle_tracks").upsert({
@@ -2201,7 +2203,7 @@ async function tgUploadDocument(chatId:number|string,bytes:Uint8Array,fileName:s
   const form=new FormData();
   form.append("chat_id",String(chatId));
   form.append("caption",caption.slice(0,1000));
-  form.append("document",new Blob([bytes],{type:"application/json"}),fileName);
+  form.append("document",new Blob([new Uint8Array(bytes).buffer],{type:"application/json"}),fileName);
   const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`,{method:"POST",body:form});
   const j=await r.json().catch(()=>null);
   if(!r.ok||!j?.ok)throw new Error(String(j?.description||`Telegram HTTP ${r.status}`));
@@ -2299,7 +2301,7 @@ async function sendTmdbSearchResults(chatId:number,type:"movie"|"series",query:s
 
 async function tmdbMappedDetails(type:"movie"|"series",tmdbId:number){
   const bundle=await tmdbDetails(type,tmdbId);
-  const mapped=tmdbMap(type,bundle);
+  const mapped:any=tmdbMap(type,bundle);
   mapped.poster_url=await tmdbImageUrl(mapped.poster_path,"poster");
   mapped.backdrop_url=await tmdbImageUrl(mapped.backdrop_path,"backdrop");
   return {bundle,mapped};
