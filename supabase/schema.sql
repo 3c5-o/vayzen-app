@@ -113,6 +113,38 @@ create table if not exists public.admin_users (
   updated_at timestamptz not null default now()
 );
 
+create unique index if not exists admin_users_single_owner_idx
+  on public.admin_users ((role))
+  where role='owner';
+
+create index if not exists admin_users_role_active_idx
+  on public.admin_users(role,is_active,created_at);
+
+create or replace function public.protect_owner_admin()
+returns trigger language plpgsql set search_path=public as $
+begin
+  if tg_op='DELETE' then
+    if old.role='owner' then
+      raise exception 'owner account cannot be deleted';
+    end if;
+    return old;
+  end if;
+  if old.role='owner' then
+    if new.role <> 'owner'
+       or new.is_active is not true
+       or new.telegram_user_id <> old.telegram_user_id then
+      raise exception 'owner account cannot be demoted, disabled, or reassigned';
+    end if;
+  end if;
+  return new;
+end $;
+
+drop trigger if exists protect_owner_admin_trigger on public.admin_users;
+create trigger protect_owner_admin_trigger
+before update or delete on public.admin_users
+for each row execute function public.protect_owner_admin();
+
+
 create table if not exists public.bot_sessions (
   telegram_user_id bigint primary key,
   flow text not null,
