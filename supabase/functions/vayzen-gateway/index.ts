@@ -947,7 +947,27 @@ async function progressApi(req:Request){
   if(!auth)return json({error:"unauthorized"},401);
   if(req.method==="GET"){
     const {data,error}=await db.from("watch_progress").select("entity_type,entity_id,position_seconds,duration_seconds,updated_at").eq("user_id",auth.user.id).order("updated_at",{ascending:false}).limit(100);
-    if(error)throw error;return json({ok:true,progress:data??[]});
+    if(error)throw error;
+    const rows:any[]=data??[];
+    const episodeIds=rows.filter((x:any)=>x.entity_type==="episode").map((x:any)=>x.entity_id);
+    const meta=new Map<string,any>();
+    if(episodeIds.length){
+      const {data:episodes}=await db.from("episodes").select("id,public_id,title,episode_number,season_id").in("id",episodeIds);
+      const seasonIds=[...new Set((episodes??[]).map((x:any)=>x.season_id))];
+      const {data:seasons}=seasonIds.length?await db.from("seasons").select("id,series_id,season_number").in("id",seasonIds):{data:[] as any[]};
+      const seriesIds=[...new Set((seasons??[]).map((x:any)=>x.series_id))];
+      const {data:series}=seriesIds.length?await db.from("series").select("id,title,status").in("id",seriesIds):{data:[] as any[]};
+      const seasonMap=new Map((seasons??[]).map((x:any)=>[x.id,x]));
+      const seriesMap=new Map((series??[]).map((x:any)=>[x.id,x]));
+      for(const ep of episodes??[]){
+        const se:any=seasonMap.get(ep.season_id);const sr:any=se?seriesMap.get(se.series_id):null;
+        if(sr?.status==="published")meta.set(ep.id,{
+          episode_public_id:ep.public_id,episode_title:ep.title,episode_number:ep.episode_number,
+          season_number:se.season_number,series_id:sr.id,series_title:sr.title,
+        });
+      }
+    }
+    return json({ok:true,progress:rows.map((x:any)=>({...x,...(meta.get(x.entity_id)||{})}))});
   }
   const body=await req.json().catch(()=>null);
   const type=String(body?.entity_type||""),id=String(body?.entity_id||"");
