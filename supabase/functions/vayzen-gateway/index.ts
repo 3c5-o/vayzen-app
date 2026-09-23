@@ -7,6 +7,8 @@ const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const BOT_SECRET = Deno.env.get("TELEGRAM_BOT_SECRET") ?? "";
 const STREAM_GATEWAY = Deno.env.get("STREAM_GATEWAY") ?? "";
 const STREAM_SIGNING_SECRET = Deno.env.get("STREAM_SIGNING_SECRET") ?? "";
+const publishableMap = JSON.parse(Deno.env.get("SUPABASE_PUBLISHABLE_KEYS") ?? "{}");
+const PUBLIC_KEY = publishableMap["default"] ?? "";
 
 const db = createClient(SUPABASE_URL, SERVICE_KEY, {
   auth: { persistSession:false, autoRefreshToken:false },
@@ -508,6 +510,126 @@ async function media(type:string,id:string){
   return new Response(upstream.body,{status:upstream.status,headers});
 }
 
+
+async function userFromRequest(req:Request){
+  const auth=req.headers.get("authorization")||"";
+  const token=auth.toLowerCase().startsWith("bearer ")?auth.slice(7).trim():"";
+  if(!token||!PUBLIC_KEY)return null;
+  const client=createClient(SUPABASE_URL,PUBLIC_KEY,{auth:{persistSession:false,autoRefreshToken:false}});
+  const {data,error}=await client.auth.getUser(token);
+  if(error||!data.user)return null;
+  return {user:data.user,token};
+}
+
+async function authSignup(req:Request){
+  const body=await req.json().catch(()=>null);
+  const email=String(body?.email||"").trim();
+  const password=String(body?.password||"");
+  const displayName=String(body?.display_name||"").trim().slice(0,40);
+  if(!PUBLIC_KEY||!email.includes("@")||password.length<8||displayName.length<2)return json({error:"invalid signup data"},400);
+  const client=createClient(SUPABASE_URL,PUBLIC_KEY,{auth:{persistSession:false,autoRefreshToken:false}});
+  const {data,error}=await client.auth.signUp({email,password,options:{data:{display_name:displayName}}});
+  if(error)return json({error:error.message},400);
+  return json({ok:true,user:data.user?{id:data.user.id,email:data.user.email}:null,session:data.session?{access_token:data.session.access_token,refresh_token:data.session.refresh_token,expires_at:data.session.expires_at}:null});
+}
+
+async function authLogin(req:Request){
+  const body=await req.json().catch(()=>null);
+  const email=String(body?.email||"").trim();
+  const password=String(body?.password||"");
+  if(!PUBLIC_KEY)return json({error:"auth unavailable"},503);
+  const client=createClient(SUPABASE_URL,PUBLIC_KEY,{auth:{persistSession:false,autoRefreshToken:false}});
+  const {data,error}=await client.auth.signInWithPassword({email,password});
+  if(error)return json({error:"بيانات الدخول غير صحيحة"},401);
+  return json({ok:true,user:{id:data.user.id,email:data.user.email},session:{access_token:data.session.access_token,refresh_token:data.session.refresh_token,expires_at:data.session.expires_at}});
+}
+
+async function authRefresh(req:Request){
+  const body=await req.json().catch(()=>null);
+  const refreshToken=String(body?.refresh_token||"");
+  if(!PUBLIC_KEY||!refreshToken)return json({error:"invalid refresh token"},400);
+  const client=createClient(SUPABASE_URL,PUBLIC_KEY,{auth:{persistSession:false,autoRefreshToken:false}});
+  const {data,error}=await client.auth.refreshSession({refresh_token:refreshToken});
+  if(error||!data.session)return json({error:"session expired"},401);
+  return json({ok:true,session:{access_token:data.session.access_token,refresh_token:data.session.refresh_token,expires_at:data.session.expires_at}});
+}
+
+async function me(req:Request){
+  const auth=await userFromRequest(req);
+  if(!auth)return json({error:"unauthorized"},401);
+  const {data:profile}=await db.from("profiles").select("display_name,avatar_url,created_at").eq("id",auth.user.id).maybeSingle();
+  return json({ok:true,user:{id:auth.user.id,email:auth.user.email,display_name:profile?.display_name||"",avatar_url:profile?.avatar_url||"",created_at:profile?.created_at||auth.user.created_at}});
+}
+
+async function updateProfile(req:Request){
+  const auth=await userFromRequest(req);
+  if(!auth)return json({error:"unauthorized"},401);
+  const body=await req.json().catch(()=>null);
+  const name=String(body?.display_name||"").trim().slice(0,40);
+  if(name.length<2)return json({error:"invalid name"},400);
+  const {error}=await db.from("profiles").update({display_name:name,updated_at:new Date().toISOString()}).eq("id",auth.user.id);
+  if(error)throw error;
+  return json({ok:true,display_name:name});
+}
+
+async function catalog(){
+  const [m,s]=await Promise.all([
+    db.from("movies").select("id,public_id,title,original_title,description,release_year,genres,language,country,duration_minutes,quality,is_featured,view_count,created_at").eq("status","published").order("created_at",{ascending:false}),
+    db.from("series").select("id,public_id,title,original_title,description,release_year,genres,language,country,quality,is_featured,view_count,created_at").eq("status","published").order("created_at",{ascending:false})
+  ]);
+  if(m.error)throw m.error;if(s.error)throw s.error;
+  return json({ok:true,movies:m.data??[],series:s.data??[]});
+}
+
+async function seriesContent(url:URL){
+  const id=String(url.searchParams.get("id")||"");
+  if(!/^[0-9a-f-]{36}$/i.test(id))return json({error:"invalid id"},400);
+  const {data:seasons,error}=await db.from("seasons").select("id,season_number,title").eq("series_id",id).eq("status","published").order("season_number",{ascending:true});
+  if(error)throw error;
+  const out=[];
+  for(const season of seasons??[]){
+    const {data:episodes,error:e}=await db.from("episodes").select("id,public_id,episode_number,title,description,duration_minutes,quality").eq("season_id",season.id).eq("status","published").order("episode_number",{ascending:true});
+    if(e)throw e;
+    out.push({...season,episodes:episodes??[]});
+  }
+  return json({ok:true,seasons:out});
+}
+
+async function favoritesApi(req:Request){
+  const auth=await userFromRequest(req);
+  if(!auth)return json({error:"unauthorized"},401);
+  if(req.method==="GET"){
+    const {data,error}=await db.from("favorites").select("entity_type,entity_id,created_at").eq("user_id",auth.user.id).order("created_at",{ascending:false});
+    if(error)throw error;return json({ok:true,favorites:data??[]});
+  }
+  const body=await req.json().catch(()=>null);
+  const type=String(body?.entity_type||""),id=String(body?.entity_id||""),enabled=Boolean(body?.enabled);
+  if(!["movie","series"].includes(type)||!/^[0-9a-f-]{36}$/i.test(id))return json({error:"invalid favorite"},400);
+  if(enabled){
+    const {error}=await db.from("favorites").upsert({user_id:auth.user.id,entity_type:type,entity_id:id});
+    if(error)throw error;
+  }else{
+    const {error}=await db.from("favorites").delete().eq("user_id",auth.user.id).eq("entity_type",type).eq("entity_id",id);
+    if(error)throw error;
+  }
+  return json({ok:true});
+}
+
+async function progressApi(req:Request){
+  const auth=await userFromRequest(req);
+  if(!auth)return json({error:"unauthorized"},401);
+  if(req.method==="GET"){
+    const {data,error}=await db.from("watch_progress").select("entity_type,entity_id,position_seconds,duration_seconds,updated_at").eq("user_id",auth.user.id).order("updated_at",{ascending:false}).limit(100);
+    if(error)throw error;return json({ok:true,progress:data??[]});
+  }
+  const body=await req.json().catch(()=>null);
+  const type=String(body?.entity_type||""),id=String(body?.entity_id||"");
+  const position=Math.max(0,Number(body?.position_seconds||0)),duration=Math.max(0,Number(body?.duration_seconds||0));
+  if(!["movie","episode"].includes(type)||!/^[0-9a-f-]{36}$/i.test(id))return json({error:"invalid progress"},400);
+  const {error}=await db.from("watch_progress").upsert({user_id:auth.user.id,entity_type:type,entity_id:id,position_seconds:position,duration_seconds:duration,updated_at:new Date().toISOString()});
+  if(error)throw error;return json({ok:true});
+}
+
 async function publicRequest(req:Request){
   const b=await req.json().catch(()=>null);
   if(!b) return json({error:"invalid body"},400);
@@ -577,6 +699,15 @@ Deno.serve(async(req:Request)=>{
       return json({ok:true,webhook,telegram:r});
     }
     const action=url.searchParams.get("action");
+    if(action==="catalog"&&req.method==="GET") return catalog();
+    if(action==="series_content"&&req.method==="GET") return seriesContent(url);
+    if(action==="signup"&&req.method==="POST") return authSignup(req);
+    if(action==="login"&&req.method==="POST") return authLogin(req);
+    if(action==="refresh"&&req.method==="POST") return authRefresh(req);
+    if(action==="me"&&req.method==="GET") return me(req);
+    if(action==="profile"&&req.method==="POST") return updateProfile(req);
+    if(action==="favorites"&&(req.method==="GET"||req.method==="POST")) return favoritesApi(req);
+    if(action==="progress"&&(req.method==="GET"||req.method==="POST")) return progressApi(req);
     if(req.method==="POST"&&action==="request_content") return publicRequest(req);
     if(req.method==="GET"&&action==="request_status") return requestStatus(url);
     if(req.method==="POST"&&action==="report") return publicReport(req);
