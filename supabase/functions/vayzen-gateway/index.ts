@@ -502,11 +502,13 @@ async function publishMovie(userId:number,chatId:number,d:any){
   const {data:movie,error}=await db.from("movies").insert({
     title:d.title,original_title:d.original_title||"",description:d.description||"",
     release_year:d.release_year,genres:d.genres||[],language:d.language||"",country:d.country||"",
-    duration_minutes:d.duration_minutes,quality:bestLabel,status:"draft",created_by:userId,
+    duration_minutes:d.duration_minutes,quality:bestLabel,status:"draft",
+    external_source:d.external_source||null,external_id:d.external_id||null,external_metadata:d.external_metadata||{},
+    release_date:d.release_date||null,rating:d.rating||null,rating_count:d.rating_count||null,created_by:userId,
   }).select("id,public_id").single();
   if(error||!movie) throw error??new Error("Movie insert failed");
 
-  let posterPlace:any=null;const videoPlaces:any[]=[];
+  let posterPlace:any=null,backdropPlace:any=null;const videoPlaces:any[]=[];
   try{
     const infoCaption=[
       `${movie.public_id}`,"",`🎬 ${d.title}`,
@@ -519,6 +521,11 @@ async function publishMovie(userId:number,chatId:number,d:any){
     ].filter(Boolean).join("\n");
     posterPlace=await copyTo("movies_info",chatId,d.poster_source_message_id,infoCaption);
     await saveAsset("movie",movie.id,"poster",d.poster,posterPlace);
+    if(d.backdrop_url){
+      const remote=await sendRemotePhotoTo("movies_info",d.backdrop_url,`${movie.public_id} | ${d.title} | backdrop`);
+      backdropPlace=remote.place;
+      await saveAsset("movie",movie.id,"backdrop",remote.file,remote.place);
+    }
     for(const v of videos){
       const place=await copyTo("movies_storage",chatId,v.source_message_id,`${movie.public_id} | ${d.title} | ${variantLabel(v.variant)} | ${sizeLabel(v.file?.file_size)}`);
       videoPlaces.push(place);
@@ -529,7 +536,7 @@ async function publishMovie(userId:number,chatId:number,d:any){
     await adminLog(userId,"movie_publish","movie",movie.id,movie.public_id,{title:d.title,qualities:videos.map(v=>v.variant)});
     return movie.public_id;
   }catch(err){
-    await cleanupEntity("movie",movie.id,[...videoPlaces,posterPlace]);
+    await cleanupEntity("movie",movie.id,[...videoPlaces,backdropPlace,posterPlace]);
     await systemLog("error","movie publish rolled back",{public_id:movie.public_id});
     throw err;
   }
@@ -539,11 +546,13 @@ async function publishSeries(userId:number,chatId:number,d:any){
   const {data:series,error}=await db.from("series").insert({
     title:d.title,original_title:d.original_title||"",description:d.description||"",
     release_year:d.release_year,genres:d.genres||[],language:d.language||"",country:d.country||"",
-    quality:d.quality||"",status:"draft",created_by:userId,
+    quality:d.quality||"",status:"draft",
+    external_source:d.external_source||null,external_id:d.external_id||null,external_metadata:d.external_metadata||{},
+    first_air_date:d.first_air_date||null,rating:d.rating||null,rating_count:d.rating_count||null,created_by:userId,
   }).select("id,public_id").single();
   if(error||!series) throw error??new Error("Series insert failed");
 
-  let posterPlace:any=null;
+  let posterPlace:any=null,backdropPlace:any=null;
   try{
     const infoCaption=[
       `${series.public_id}`,"",`📺 ${d.title}`,
@@ -555,12 +564,17 @@ async function publishSeries(userId:number,chatId:number,d:any){
     ].filter(Boolean).join("\n");
     posterPlace=await copyTo("series_info",chatId,d.poster_source_message_id,infoCaption);
     await saveAsset("series",series.id,"poster",d.poster,posterPlace);
+    if(d.backdrop_url){
+      const remote=await sendRemotePhotoTo("series_info",d.backdrop_url,`${series.public_id} | ${d.title} | backdrop`);
+      backdropPlace=remote.place;
+      await saveAsset("series",series.id,"backdrop",remote.file,remote.place);
+    }
     const {error:publishError}=await db.from("series").update({status:"published",updated_at:new Date().toISOString()}).eq("id",series.id);
     if(publishError)throw publishError;
     await adminLog(userId,"series_publish","series",series.id,series.public_id,{title:d.title});
     return series.public_id;
   }catch(err){
-    await cleanupEntity("series",series.id,[posterPlace]);
+    await cleanupEntity("series",series.id,[backdropPlace,posterPlace]);
     await systemLog("error","series publish rolled back",{public_id:series.public_id});
     throw err;
   }
@@ -571,22 +585,29 @@ async function publishEpisode(userId:number,chatId:number,d:any){
     .eq("public_id",String(d.series_public_id).toUpperCase()).maybeSingle();
   if(!series||series.status!=="published") throw new Error("Series not found");
 
-  let {data:season}=await db.from("seasons").select("id").eq("series_id",series.id).eq("season_number",d.season_number).maybeSingle();
+  let {data:season}=await db.from("seasons").select("id,status").eq("series_id",series.id).eq("season_number",d.season_number).maybeSingle();
   if(!season){
     const {data:createdSeason,error:se}=await db.from("seasons").insert({
       series_id:series.id,season_number:d.season_number,title:`الموسم ${d.season_number}`,status:"published",
     }).select("id").single();
     if(se||!createdSeason)throw se??new Error("Season failed");
-    season=createdSeason;
+    season={...createdSeason,status:"published"};
+  }else if(season.status==="draft"){
+    await db.from("seasons").update({status:"published",updated_at:new Date().toISOString()}).eq("id",season.id);
+    season={...season,status:"published"};
   }
 
-  const {data:existing}=await db.from("episodes").select("id,public_id,status")
+  const {data:existing}=await db.from("episodes").select("id,public_id,status,title,description,duration_minutes,external_source")
     .eq("season_id",season.id).eq("episode_number",d.episode_number).maybeSingle();
 
   let ep:any=existing,created=false;
   if(existing){
+    const genericTitle=!d.title||String(d.title).trim()===`الحلقة ${d.episode_number}`;
     const {data:updated,error}=await db.from("episodes").update({
-      title:d.title||`الحلقة ${d.episode_number}`,description:d.description||"",quality:d.quality||"",
+      title:genericTitle&&existing.title?existing.title:(d.title||existing.title||`الحلقة ${d.episode_number}`),
+      description:d.description||existing.description||"",
+      duration_minutes:d.duration_minutes??existing.duration_minutes??null,
+      quality:d.quality||"",
       updated_at:new Date().toISOString(),
     }).eq("id",existing.id).select("id,public_id,status").single();
     if(error||!updated)throw error??new Error("Episode update failed");
@@ -1024,12 +1045,14 @@ function batchEpisodeSummary(d:any){
   return `معاينة الرفع الجماعي\n\n${d.series_title||d.series_public_id}\nالموسم: ${d.season_number}\nالحلقات: ${grouped.size}\nملفات الفيديو: ${items.length}\n\n${lines.slice(0,30).join("\n")}${lines.length>30?"\n…":""}`;
 }
 
-async function episodeNumberExists(seriesPublicId:string,seasonNumber:number,episodeNumber:number){
+async function episodeHasVideo(seriesPublicId:string,seasonNumber:number,episodeNumber:number){
   const series:any=await contentByPublicId("series",seriesPublicId);if(!series)return false;
   const {data:season}=await db.from("seasons").select("id").eq("series_id",series.id).eq("season_number",seasonNumber).maybeSingle();
   if(!season)return false;
-  const {data}=await db.from("episodes").select("id").eq("season_id",season.id).eq("episode_number",episodeNumber).maybeSingle();
-  return Boolean(data);
+  const {data:ep}=await db.from("episodes").select("id").eq("season_id",season.id).eq("episode_number",episodeNumber).maybeSingle();
+  if(!ep)return false;
+  const {count}=await db.from("media_assets").select("id",{head:true,count:"exact"}).eq("entity_type","episode").eq("entity_id",ep.id).eq("kind","video");
+  return Number(count||0)>0;
 }
 
 async function publishBatchEpisodes(userId:number,chatId:number,d:any){
@@ -1038,8 +1061,8 @@ async function publishBatchEpisodes(userId:number,chatId:number,d:any){
   for(const x of items){const n=Number(x.episode_number);if(!grouped.has(n))grouped.set(n,[]);grouped.get(n)!.push(x);}
   const results:any[]=[];
   for(const [episodeNumber,files] of [...grouped.entries()].sort((a,b)=>a[0]-b[0])){
-    if(await episodeNumberExists(d.series_public_id,Number(d.season_number),episodeNumber)){
-      results.push({episode:episodeNumber,ok:false,error:"الحلقة موجودة مسبقًا"});continue;
+    if(await episodeHasVideo(d.series_public_id,Number(d.season_number),episodeNumber)){
+      results.push({episode:episodeNumber,ok:false,error:"الحلقة تحتوي فيديو مسبقًا"});continue;
     }
     const sorted=[...files].sort((a,b)=>qualityRank(String(b.variant))-qualityRank(String(a.variant)));
     const first=sorted[0];
