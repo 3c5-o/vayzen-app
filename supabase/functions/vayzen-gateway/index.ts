@@ -618,6 +618,80 @@ async function deleteQuality(adminId:number,type:string,publicId:string,variant:
   await adminLog(adminId,"quality_delete",target.entityType,target.item.id,publicId,{variant:v});
 }
 
+async function sendAdminsManager(chatId:number,actor:Admin){
+  const {data,error}=await db.from("admin_users").select("telegram_user_id,display_name,role,is_active,created_at").order("created_at",{ascending:true});
+  if(error)throw error;
+  const rows:any[]=(data??[]).map((x:any)=>[{
+    text:`${x.is_active?"●":"○"} ${x.display_name||x.telegram_user_id} • ${roleLabel(x.role)}`,
+    callback_data:`adm|${x.telegram_user_id}`
+  }]);
+  rows.push([{text:"إضافة مشرف",callback_data:"adm_add"}]);
+  rows.push([{text:"رجوع",callback_data:"menu"}]);
+  return send(chatId,`إدارة المشرفين\n\nالعدد: ${(data??[]).length}`,{inline_keyboard:rows});
+}
+
+async function sendAdminItem(chatId:number,actor:Admin,targetId:number){
+  const {data:t}=await db.from("admin_users").select("telegram_user_id,display_name,role,permissions,is_active,added_by,created_at").eq("telegram_user_id",targetId).maybeSingle();
+  if(!t)return sendAdminsManager(chatId,actor);
+  const target=t as Admin;
+  const manageable=canManageAdmin(actor,target);
+  const rows:any[]=[];
+  if(manageable){
+    rows.push([{text:"تغيير الدور",callback_data:`adm_roles|${targetId}`},{text:"تعديل الصلاحيات",callback_data:`adm_perms|${targetId}`}]);
+    if(target.role!=="owner"&&target.telegram_user_id!==actor.telegram_user_id){
+      rows.push([{text:target.is_active?"تعطيل المشرف":"إعادة التفعيل",callback_data:`adm_active|${targetId}|${target.is_active?"0":"1"}`}]);
+      rows.push([{text:"حذف المشرف",callback_data:`adm_del1|${targetId}`}]);
+    }
+  }
+  rows.push([{text:"رجوع",callback_data:"admins"}]);
+  const perms=(Object.keys(permissionLabels) as AdminPermission[]).map(p=>`${can(target,p)?"✅":"—"} ${permissionLabels[p]}`).join("\n");
+  return send(chatId,`${target.display_name||target.telegram_user_id}\nID: ${target.telegram_user_id}\nالدور: ${roleLabel(target.role)}\nالحالة: ${target.is_active?"نشط":"معطّل"}\n\nالصلاحيات الفعلية:\n${perms}`,{inline_keyboard:rows});
+}
+
+async function sendAdminRoles(chatId:number,actor:Admin,targetId:number){
+  const {data:t}=await db.from("admin_users").select("telegram_user_id,display_name,role,permissions,is_active").eq("telegram_user_id",targetId).maybeSingle();
+  if(!t||!canManageAdmin(actor,t as Admin))return sendAdminsManager(chatId,actor);
+  const roles=actor.role==="owner"
+    ?["secondary_admin","content_manager","requests_manager","moderator","support"]
+    :["content_manager","requests_manager","moderator","support"];
+  const rows:any[]=roles.map(r=>[{text:`${t.role===r?"✓ ":""}${roleLabel(r)}`,callback_data:`adm_role|${targetId}|${r}`}]);
+  rows.push([{text:"رجوع",callback_data:`adm|${targetId}`}]);
+  return send(chatId,"اختر الدور الجديد:",{inline_keyboard:rows});
+}
+
+async function sendAdminPermissions(chatId:number,actor:Admin,targetId:number){
+  const {data:t}=await db.from("admin_users").select("telegram_user_id,display_name,role,permissions,is_active").eq("telegram_user_id",targetId).maybeSingle();
+  if(!t||!canManageAdmin(actor,t as Admin))return sendAdminsManager(chatId,actor);
+  if(["owner","secondary_admin"].includes(t.role))return send(chatId,"صلاحيات هذا الدور ثابتة ولا تعدّل يدويًا.",{inline_keyboard:[[{text:"رجوع",callback_data:`adm|${targetId}`}]]});
+  const rows:any[]=(Object.keys(permissionLabels) as AdminPermission[]).map(p=>[{
+    text:`${can(t as Admin,p)?"✅":"⬜"} ${permissionLabels[p]}`,
+    callback_data:`admp|${targetId}|${p}|${can(t as Admin,p)?"0":"1"}`
+  }]);
+  rows.push([{text:"إعادة للوضع الافتراضي",callback_data:`admp_reset|${targetId}`}]);
+  rows.push([{text:"رجوع",callback_data:`adm|${targetId}`}]);
+  return send(chatId,`صلاحيات ${t.display_name||targetId}:`,{inline_keyboard:rows});
+}
+
+async function sendAdminLogs(chatId:number){
+  const {data,error}=await db.from("admin_logs").select("admin_telegram_id,action,entity_type,entity_public_id,created_at,details").order("created_at",{ascending:false}).limit(15);
+  if(error)throw error;
+  const text=(data??[]).map((x:any)=>`• ${String(x.created_at).slice(0,16).replace("T"," ")} | ${x.admin_telegram_id} | ${x.action} | ${x.entity_public_id||x.entity_type||"—"}`).join("\n")||"لا يوجد نشاط إداري بعد.";
+  return send(chatId,`آخر نشاطات الإدارة:\n\n${text}`,{inline_keyboard:[[{text:"تحديث",callback_data:"admin_logs"},{text:"رجوع",callback_data:"menu"}]]});
+}
+
+async function createAdmin(actor:Admin,telegramId:number,name:string,role:string){
+  if(!Number.isInteger(telegramId)||telegramId<=0)throw new Error("Telegram ID غير صحيح");
+  if(role==="owner")throw new Error("لا يمكن إنشاء Owner جديد");
+  if(role==="secondary_admin"&&actor.role!=="owner")throw new Error("فقط المالك يستطيع إضافة أدمن ثانوي");
+  const allowed=["secondary_admin","content_manager","requests_manager","moderator","support"];
+  if(!allowed.includes(role))throw new Error("الدور غير صالح");
+  const {data:existing}=await db.from("admin_users").select("telegram_user_id,role").eq("telegram_user_id",telegramId).maybeSingle();
+  if(existing)throw new Error("هذا الحساب موجود ضمن الإدارة بالفعل");
+  const {error}=await db.from("admin_users").insert({telegram_user_id:telegramId,display_name:name.trim().slice(0,60)||String(telegramId),role,permissions:{},is_active:true,added_by:actor.telegram_user_id});
+  if(error)throw error;
+  await adminLog(actor.telegram_user_id,"admin_add","admin",undefined,String(telegramId),{role});
+}
+
 async function sendUsersManager(chatId:number){
   const {data,error}=await db.auth.admin.listUsers({page:1,perPage:8});
   if(error)throw error;
