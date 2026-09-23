@@ -1,0 +1,30 @@
+name: VAYZEN Production Smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - RELEASE_SMOKE_TRIGGER
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  production-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gateway health and Range load smoke
+        run: |
+          python scripts/load_test.py \
+            --health "https://vayzen-gateway-production.up.railway.app/health" \
+            --api "https://aszcgivlsaldcgocljwe.supabase.co/functions/v1/vayzen-gateway" \
+            --concurrency 6 \
+            --requests 24 \
+            --range-kb 256 \
+            --timeout 20 \
+            --max-error-rate 0.10 \
+            --max-p95 12
