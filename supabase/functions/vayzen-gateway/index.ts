@@ -1,6 +1,10 @@
 import { createClient } from "npm:@supabase/supabase-js@2.95.0";
 
-const MAX_VIDEO_BYTES = 800 * 1024 * 1024;
+const MAX_VIDEO_MB = 2000;
+const MAX_VIDEO_BYTES = MAX_VIDEO_MB * 1024 * 1024;
+const COPY_RETRY_DELAYS_MS = [350, 1000, 2200] as const;
+const BATCH_RESUME_AFTER_MS = 120_000;
+const STREAM_LINK_TTL_SECONDS = 6 * 60 * 60;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 function envMap(name:string){
   try{return JSON.parse(Deno.env.get(name) ?? "{}") as Record<string,string>;}catch{return {};}
@@ -518,7 +522,7 @@ async function showMenu(chatId:string|number,text="لوحة إدارة VAYZEN",a
 }
 
 async function getSession(userId:number){
-  const {data}=await db.from("bot_sessions").select("flow,step,draft")
+  const {data}=await db.from("bot_sessions").select("flow,step,draft,updated_at")
     .eq("telegram_user_id",userId).maybeSingle();
   return data??null;
 }
@@ -571,15 +575,82 @@ function sizeLabel(v:any){
   return n>=1024**3?`${(n/1024**3).toFixed(2)} GB`:`${(n/1024**2).toFixed(1)} MB`;
 }
 
-async function copyTo(key:string,fromChatId:number,messageId:number,caption:string){
+function videoLimitLabel(){return "2GB"}
+function validateVideoFile(file:any){
+  if(!file?.file_id)throw new Error("أرسل ملف فيديو صالح.");
+  const size=Number(file.file_size||0);
+  if(size>MAX_VIDEO_BYTES)throw new Error(`الفيديو أكبر من الحد الأقصى ${videoLimitLabel()}.`);
+  if(size<0)throw new Error("حجم ملف الفيديو غير صالح.");
+  return file;
+}
+function retryDelayForTelegram(err:any,attempt:number){
+  const text=err instanceof Error?err.message:String(err||"");
+  const m=text.match(/retry after\s+(\d+)/i);
+  if(m)return Math.min(10_000,Math.max(500,Number(m[1])*1000));
+  return COPY_RETRY_DELAYS_MS[Math.min(attempt-1,COPY_RETRY_DELAYS_MS.length-1)]||2200;
+}
+function sleep(ms:number){return new Promise(resolve=>setTimeout(resolve,ms))}
+async function transferJob(jobKey:string){
+  const {data}=await db.from("media_transfer_jobs")
+    .select("id,status,target_channel_id,target_message_id,attempts,max_attempts,last_error,updated_at")
+    .eq("job_key",jobKey).maybeSingle();
+  return data??null;
+}
+async function markTransferRolledBack(place:any){
+  if(!place?.channel_id||!place?.message_id)return;
+  try{
+    await db.from("media_transfer_jobs").update({
+      status:"rolled_back",updated_at:new Date().toISOString()
+    }).eq("target_channel_id",Number(place.channel_id)).eq("target_message_id",Number(place.message_id)).eq("status","completed");
+  }catch{}
+}
+
+async function copyTo(key:string,fromChatId:number,messageId:number,caption:string,fileSize?:number|null){
   const ch=await channel(key);
-  const r=await tg("copyMessage",{
-    chat_id:ch.telegram_channel_id,
-    from_chat_id:fromChatId,
-    message_id:messageId,
-    caption,
-  });
-  return {channel_id:Number(ch.telegram_channel_id),message_id:Number(r.message_id)};
+  const jobKey=await sha256Text(["copy",key,String(fromChatId),String(messageId),caption].join("|"));
+  const existing:any=await transferJob(jobKey);
+  if(existing?.status==="completed"&&existing.target_channel_id&&existing.target_message_id){
+    return {channel_id:Number(existing.target_channel_id),message_id:Number(existing.target_message_id),transfer_job_id:existing.id,reused:true};
+  }
+
+  const {data:job,error:jobError}=await db.from("media_transfer_jobs").upsert({
+    job_key:jobKey,operation:"copy_message",status:"pending",channel_key:key,
+    from_chat_id:fromChatId,source_message_id:messageId,
+    file_size:fileSize??null,max_attempts:COPY_RETRY_DELAYS_MS.length,
+    attempts:["failed","rolled_back"].includes(String(existing?.status||""))?0:Number(existing?.attempts||0),
+    last_error:null
+  },{onConflict:"job_key"}).select("id,status,attempts,max_attempts").single();
+  if(jobError||!job)throw jobError??new Error("تعذر تجهيز عملية نقل الوسائط.");
+
+  let lastErr:any=null;
+  const maxAttempts=Math.max(1,Number(job.max_attempts||COPY_RETRY_DELAYS_MS.length));
+  for(let attempt=Math.max(1,Number(job.attempts||0)+1);attempt<=maxAttempts;attempt++){
+    await db.from("media_transfer_jobs").update({
+      status:"processing",attempts:attempt,started_at:new Date().toISOString(),last_error:null
+    }).eq("id",job.id);
+    try{
+      const r=await tg("copyMessage",{
+        chat_id:ch.telegram_channel_id,
+        from_chat_id:fromChatId,
+        message_id:messageId,
+        caption,
+      });
+      const place={channel_id:Number(ch.telegram_channel_id),message_id:Number(r.message_id),transfer_job_id:job.id};
+      await db.from("media_transfer_jobs").update({
+        status:"completed",target_channel_id:place.channel_id,target_message_id:place.message_id,
+        completed_at:new Date().toISOString(),last_error:null
+      }).eq("id",job.id);
+      return place;
+    }catch(err){
+      lastErr=err;
+      const message=err instanceof Error?err.message:String(err);
+      await db.from("media_transfer_jobs").update({
+        status:attempt>=maxAttempts?"failed":"pending",last_error:message.slice(0,500)
+      }).eq("id",job.id);
+      if(attempt<maxAttempts)await sleep(retryDelayForTelegram(err,attempt));
+    }
+  }
+  throw lastErr??new Error("فشل نقل ملف الوسائط بعد عدة محاولات.");
 }
 
 function normalizeVariant(value:any){
@@ -610,7 +681,10 @@ async function saveAsset(entity_type:string,entity_id:string,kind:string,file:an
 
 async function deleteCopiedMessage(place:any){
   if(!place?.channel_id||!place?.message_id)return;
-  try{await tg("deleteMessage",{chat_id:place.channel_id,message_id:place.message_id});}catch{}
+  try{
+    await tg("deleteMessage",{chat_id:place.channel_id,message_id:place.message_id});
+    await markTransferRolledBack(place);
+  }catch{}
 }
 
 async function cleanupEntity(entityType:"movie"|"series"|"episode",entityId:string,places:any[]=[]){
@@ -673,18 +747,32 @@ function seriesSummary(d:any){
 async function publishMovie(userId:number,chatId:number,d:any){
   const videos:any[]=Array.isArray(d.videos)&&d.videos.length?d.videos:(d.video?[{variant:normalizeVariant(d.quality||"default"),file:d.video,source_message_id:d.video_source_message_id}]:[]);
   if(!videos.length)throw new Error("Movie video missing");
+  for(const v of videos)validateVideoFile(v.file);
   const unique=new Set<string>();
   for(const v of videos){const q=normalizeVariant(v.variant||"default");if(unique.has(q))throw new Error(`جودة مكررة: ${variantLabel(q)}`);unique.add(q);v.variant=q;}
   const best=[...videos].sort((a,b)=>qualityRank(b.variant)-qualityRank(a.variant))[0];
   const bestLabel=variantLabel(best.variant);
-  const {data:movie,error}=await db.from("movies").insert({
-    title:d.title,original_title:d.original_title||"",description:d.description||"",
-    release_year:d.release_year,genres:d.genres||[],language:d.language||"",country:d.country||"",
-    duration_minutes:d.duration_minutes,quality:bestLabel,status:"draft",
-    external_source:d.external_source||null,external_id:d.external_id||null,external_metadata:d.external_metadata||{},
-    release_date:d.release_date||null,rating:d.rating||null,rating_count:d.rating_count||null,created_by:userId,
-  }).select("id,public_id").single();
-  if(error||!movie) throw error??new Error("Movie insert failed");
+
+  let movie:any=null;
+  if(d.publishing_entity_id){
+    const {data}=await db.from("movies").select("id,public_id,status").eq("id",String(d.publishing_entity_id)).maybeSingle();
+    movie=data??null;
+    if(movie?.status==="published")return movie.public_id;
+  }
+  if(!movie){
+    const {data:created,error}=await db.from("movies").insert({
+      title:d.title,original_title:d.original_title||"",description:d.description||"",
+      release_year:d.release_year,genres:d.genres||[],language:d.language||"",country:d.country||"",
+      duration_minutes:d.duration_minutes,quality:bestLabel,status:"draft",
+      external_source:d.external_source||null,external_id:d.external_id||null,external_metadata:d.external_metadata||{},
+      release_date:d.release_date||null,rating:d.rating||null,rating_count:d.rating_count||null,created_by:userId,
+    }).select("id,public_id,status").single();
+    if(error||!created) throw error??new Error("Movie insert failed");
+    movie=created;
+    d.publishing_entity_id=movie.id;
+    d.publishing_public_id=movie.public_id;
+    await setSession(userId,"movie","publishing",d);
+  }
 
   let posterPlace:any=null,backdropPlace:any=null;const videoPlaces:any[]=[];
   try{
@@ -700,12 +788,15 @@ async function publishMovie(userId:number,chatId:number,d:any){
     posterPlace=await copyTo("movies_info",chatId,d.poster_source_message_id,infoCaption);
     await saveAsset("movie",movie.id,"poster",d.poster,posterPlace);
     if(d.backdrop_url){
-      const remote=await sendRemotePhotoTo("movies_info",d.backdrop_url,`${movie.public_id} | ${d.title} | backdrop`);
-      backdropPlace=remote.place;
-      await saveAsset("movie",movie.id,"backdrop",remote.file,remote.place);
+      const existingBackdrop=await currentAsset("movie",movie.id,"backdrop");
+      if(!existingBackdrop){
+        const remote=await sendRemotePhotoTo("movies_info",d.backdrop_url,`${movie.public_id} | ${d.title} | backdrop`);
+        backdropPlace=remote.place;
+        await saveAsset("movie",movie.id,"backdrop",remote.file,remote.place);
+      }
     }
     for(const v of videos){
-      const place=await copyTo("movies_storage",chatId,v.source_message_id,`${movie.public_id} | ${d.title} | ${variantLabel(v.variant)} | ${sizeLabel(v.file?.file_size)}`);
+      const place=await copyTo("movies_storage",chatId,v.source_message_id,`${movie.public_id} | ${d.title} | ${variantLabel(v.variant)} | ${sizeLabel(v.file?.file_size)}`,v.file?.file_size);
       videoPlaces.push(place);
       await saveAsset("movie",movie.id,"video",v.file,place,v.variant);
     }
@@ -759,6 +850,7 @@ async function publishSeries(userId:number,chatId:number,d:any){
 }
 
 async function publishEpisode(userId:number,chatId:number,d:any){
+  validateVideoFile(d.video);
   const {data:series}=await db.from("series").select("id,title,public_id,status")
     .eq("public_id",String(d.series_public_id).toUpperCase()).maybeSingle();
   if(!series||series.status!=="published") throw new Error("Series not found");
@@ -803,7 +895,7 @@ async function publishEpisode(userId:number,chatId:number,d:any){
   let assetWritten=false,seasonPromoted=false;
   try{
     place=await copyTo("series_storage",chatId,d.video_source_message_id,
-      `${ep.public_id} | ${series.title} | موسم ${d.season_number} | حلقة ${d.episode_number} | ${variantLabel(variant)}`);
+      `${ep.public_id} | ${series.title} | موسم ${d.season_number} | حلقة ${d.episode_number} | ${variantLabel(variant)}`,d.video?.file_size);
     await saveAsset("episode",ep.id,"video",d.video,place,variant);
     assetWritten=true;
     const {error:publishError}=await db.from("episodes").update({status:"published",quality:d.quality||variantLabel(variant),updated_at:new Date().toISOString()}).eq("id",ep.id);
@@ -813,7 +905,8 @@ async function publishEpisode(userId:number,chatId:number,d:any){
       if(seasonError)throw seasonError;
       seasonPromoted=true;
     }
-    if(oldAsset?.channel_id&&oldAsset?.channel_message_id)await deleteCopiedMessage({channel_id:oldAsset.channel_id,message_id:oldAsset.channel_message_id});
+    const sameTarget=oldAsset?.channel_id===place?.channel_id&&oldAsset?.channel_message_id===place?.message_id;
+    if(oldAsset?.channel_id&&oldAsset?.channel_message_id&&!sameTarget)await deleteCopiedMessage({channel_id:oldAsset.channel_id,message_id:oldAsset.channel_message_id});
     await adminLog(userId,existing?"episode_replace":"episode_publish","episode",ep.id,ep.public_id,{series:series.title});
     return ep.public_id;
   }catch(err){
@@ -836,6 +929,17 @@ async function publishEpisode(userId:number,chatId:number,d:any){
     await systemLog("error","episode publish failed",{public_id:ep.public_id});
     throw err;
   }
+}
+
+function publishingSessionIsStale(session:any){
+  const t=Date.parse(String(session?.updated_at||""));
+  return !Number.isFinite(t)||Date.now()-t>BATCH_RESUME_AFTER_MS;
+}
+async function recoverStalePublishSession(userId:number,flow:string,session:any){
+  if(session?.step!=="publishing"||!publishingSessionIsStale(session))return false;
+  const nextStep=flow==="movie"?(Array.isArray(session.draft?.videos)?"video_review":"confirm"):"confirm";
+  await setSession(userId,flow,nextStep,session.draft||{});
+  return true;
 }
 
 function adminErrorText(err:any){
@@ -878,15 +982,17 @@ async function replaceStoredAsset(opts:{
   kind:"poster"|"video";channelKey:string;sourceMessageId:number;file:any;caption:string;variant?:string;
 }){
   const variant=normalizeVariant(opts.variant||"default");
+  if(opts.kind==="video")validateVideoFile(opts.file);
   const oldAsset:any=await currentAsset(opts.entityType,opts.entityId,opts.kind,variant);
-  const place=await copyTo(opts.channelKey,opts.chatId,opts.sourceMessageId,opts.caption);
+  const place=await copyTo(opts.channelKey,opts.chatId,opts.sourceMessageId,opts.caption,opts.file?.file_size);
   try{
     await saveAsset(opts.entityType,opts.entityId,opts.kind,opts.file,place,variant);
   }catch(err){
     await deleteCopiedMessage(place);
     throw err;
   }
-  if(oldAsset?.channel_id&&oldAsset?.channel_message_id){
+  const sameTarget=oldAsset?.channel_id===place?.channel_id&&oldAsset?.channel_message_id===place?.message_id;
+  if(oldAsset?.channel_id&&oldAsset?.channel_message_id&&!sameTarget){
     await deleteCopiedMessage({channel_id:oldAsset.channel_id,message_id:oldAsset.channel_message_id});
   }
   await adminLog(opts.adminId,"asset_replace",opts.entityType,opts.entityId,opts.publicId,{kind:opts.kind,variant});
@@ -1255,9 +1361,14 @@ async function publishBatchEpisodes(userId:number,chatId:number,d:any){
   const items:any[]=Array.isArray(d.items)?d.items:[];
   const grouped=new Map<number,any[]>();
   for(const x of items){const n=Number(x.episode_number);if(!grouped.has(n))grouped.set(n,[]);grouped.get(n)!.push(x);}
-  const results:any[]=[];
+  const results:any[]=Array.isArray(d.batch_results)?[...d.batch_results]:[];
   for(const [episodeNumber,files] of [...grouped.entries()].sort((a,b)=>a[0]-b[0])){
-    if(await episodeHasVideo(d.series_public_id,Number(d.season_number),episodeNumber)){
+    const previous=results.find((x:any)=>Number(x.episode)===episodeNumber);
+    if(previous?.ok&&!(previous.failedVariants?.length))continue;
+    for(let i=results.length-1;i>=0;i--)if(Number(results[i]?.episode)===episodeNumber)results.splice(i,1);
+    const hasVideo=await episodeHasVideo(d.series_public_id,Number(d.season_number),episodeNumber);
+    const isResume=Boolean(d.batch_retry||previous);
+    if(hasVideo&&!isResume){
       results.push({episode:episodeNumber,ok:false,error:"الحلقة تحتوي فيديو مسبقًا"});continue;
     }
     const sorted=[...files].sort((a,b)=>qualityRank(String(b.variant))-qualityRank(String(a.variant)));
@@ -1281,6 +1392,10 @@ async function publishBatchEpisodes(userId:number,chatId:number,d:any){
       }
       results.push({episode:episodeNumber,ok:true,public_id:epPublicId,failedVariants});
     }catch(err){results.push({episode:episodeNumber,ok:false,error:adminErrorText(err)});}
+    d.batch_results=results;
+    d.batch_retry=true;
+    d.batch_last_episode=episodeNumber;
+    await setSession(userId,"batch_episode","publishing",d);
   }
   await adminLog(userId,"batch_episode_publish","series",undefined,d.series_public_id,{season_number:d.season_number,results});
   return results;
@@ -1542,7 +1657,7 @@ async function systemStatusText(){
     `Telegram Streaming: ${telegram}`,
     `عمليات البث الحالية: ${activeStreams}`,
     `نافذة Range: ${rangeWindow||"—"} MB`,
-    "حد الفيديو: 800 MB",
+    `حد الفيديو: ${videoLimitLabel()}`,
     `أفلام منشورة: ${mp.count||0}`,
     `مسودات أفلام: ${md.count||0}`,
     `مسلسلات منشورة: ${sp.count||0}`,
@@ -1790,24 +1905,36 @@ async function callback(q:any){
   }
   if(a==="confirm_batch_episode"){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
-    const session=await getSession(userId);
+    let session=await getSession(userId);
     if(!session||session.flow!=="batch_episode")return showMenu(chatId,"انتهت جلسة الرفع الجماعي.");
-    if(session.step==="publishing")return send(chatId,"النشر الجماعي قيد التنفيذ الآن.");
-    if(session.step!=="confirm")return showMenu(chatId,"انتهت جلسة الرفع الجماعي.");
-    await setSession(userId,"batch_episode","publishing",session.draft);
-    await send(chatId,"جاري نشر الحلقات والجودات...");
-    const draft:any=session.draft||{};
+    if(session.step==="publishing"){
+      if(!publishingSessionIsStale(session))return send(chatId,"النشر الجماعي قيد التنفيذ الآن.");
+      await setSession(userId,"batch_episode","confirm",{...(session.draft||{}),batch_retry:true});
+      session=await getSession(userId);
+    }
+    if(!session||session.step!=="confirm")return showMenu(chatId,"انتهت جلسة الرفع الجماعي.");
+    const draft:any={...(session.draft||{}),batch_retry:Boolean((session.draft as any)?.batch_retry)};
+    await setSession(userId,"batch_episode","publishing",draft);
+    await send(chatId,draft.batch_retry?"استئناف نشر الملفات المتبقية...":"جاري نشر الحلقات والجودات...");
     try{
       const results=await publishBatchEpisodes(userId,chatId,draft);
-      await clearSession(userId);
       const ok=results.filter((x:any)=>x.ok).length,failed=results.length-ok;
       const partial=results.filter((x:any)=>x.ok&&x.failedVariants?.length);
       const failures=results.filter((x:any)=>!x.ok).map((x:any)=>`E${x.episode}: ${x.error}`).slice(0,12).join("\n");
       const partialText=partial.map((x:any)=>`E${x.episode}: فشل ${x.failedVariants.join(" / ")}`).slice(0,8).join("\n");
-      return send(chatId,`اكتمل النشر الجماعي.\n\nنجح: ${ok}\nفشل: ${failed}${partial.length?`\nجودات جزئية: ${partial.length}`:""}${failures?`\n\nالفشل:\n${failures}`:""}${partialText?`\n\nجودات تحتاج إعادة محاولة:\n${partialText}`:""}`,{inline_keyboard:[[{text:"فتح المسلسل",callback_data:`se|${draft.series_public_id}`},{text:"القائمة",callback_data:"menu"}]]});
+      const needsRetry=failed>0||partial.length>0;
+      if(needsRetry){
+        await setSession(userId,"batch_episode","confirm",{...draft,batch_results:results,batch_retry:true});
+      }else{
+        await clearSession(userId);
+      }
+      const buttons=needsRetry
+        ?[[{text:"إعادة محاولة الفاشل",callback_data:"confirm_batch_episode"}],[{text:"فتح المسلسل",callback_data:`se|${draft.series_public_id}`},{text:"القائمة",callback_data:"menu"}]]
+        :[[{text:"فتح المسلسل",callback_data:`se|${draft.series_public_id}`},{text:"القائمة",callback_data:"menu"}]];
+      return send(chatId,`${needsRetry?"اكتمل النشر جزئيًا.":"اكتمل النشر الجماعي."}\n\nنجح: ${ok}\nفشل: ${failed}${partial.length?`\nجودات جزئية: ${partial.length}`:""}${failures?`\n\nالفشل:\n${failures}`:""}${partialText?`\n\nجودات تحتاج إعادة محاولة:\n${partialText}`:""}`,{inline_keyboard:buttons});
     }catch(err){
-      await setSession(userId,"batch_episode","confirm",session.draft);
-      return send(chatId,`فشل النشر الجماعي.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"إعادة المحاولة",callback_data:"confirm_batch_episode"},{text:"إلغاء",callback_data:"cancel"}]]});
+      await setSession(userId,"batch_episode","confirm",{...(session.draft||{}),batch_retry:true});
+      return send(chatId,`فشل النشر الجماعي.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"استئناف المحاولة",callback_data:"confirm_batch_episode"},{text:"إلغاء",callback_data:"cancel"}]]});
     }
   }
 
@@ -1843,12 +1970,16 @@ async function callback(q:any){
   }
   if(a==="confirm_movie"){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
-    const session=await getSession(userId);
+    let session=await getSession(userId);
     if(!session||session.flow!=="movie") return showMenu(chatId,"انتهت جلسة الفيلم.");
-    if(session.step==="publishing")return send(chatId,"الفيلم قيد النشر الآن، انتظر اكتمال العملية.");
-    if(!["confirm","video_review"].includes(session.step))return showMenu(chatId,"انتهت جلسة الفيلم.");
+    if(session.step==="publishing"){
+      if(!publishingSessionIsStale(session))return send(chatId,"الفيلم قيد النشر الآن، انتظر اكتمال العملية.");
+      await recoverStalePublishSession(userId,"movie",session);
+      session=await getSession(userId);
+    }
+    if(!session||!["confirm","video_review"].includes(session.step))return showMenu(chatId,"انتهت جلسة الفيلم.");
     await setSession(userId,"movie","publishing",session.draft);
-    await send(chatId,"جاري نشر الفيلم ونقل الملفات...");
+    await send(chatId,session.draft?.publishing_entity_id?"استئناف نشر الفيلم من آخر نقطة...":"جاري نشر الفيلم ونقل الملفات...");
     try{
       const id=await publishMovie(userId,chatId,session.draft);
       await clearSession(userId);
@@ -1919,10 +2050,14 @@ async function callback(q:any){
   }
   if(a==="confirm_episode"){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
-    const session=await getSession(userId);
+    let session=await getSession(userId);
     if(!session||session.flow!=="episode") return showMenu(chatId,"انتهت جلسة الحلقة.");
-    if(session.step==="publishing")return send(chatId,"الحلقة قيد النشر الآن، انتظر اكتمال العملية.");
-    if(session.step!=="confirm")return showMenu(chatId,"انتهت جلسة الحلقة.");
+    if(session.step==="publishing"){
+      if(!publishingSessionIsStale(session))return send(chatId,"الحلقة قيد النشر الآن، انتظر اكتمال العملية.");
+      await recoverStalePublishSession(userId,"episode",session);
+      session=await getSession(userId);
+    }
+    if(!session||session.step!=="confirm")return showMenu(chatId,"انتهت جلسة الحلقة.");
     await setSession(userId,"episode","publishing",session.draft);
     await send(chatId,"جاري نشر الحلقة ونقل الفيديو...");
     try{
@@ -2001,7 +2136,7 @@ async function callback(q:any){
     const [,type,id]=a.split("|");
     if(type!=="movie")return sendContentManager(chatId);
     await setSession(userId,"replace_movie_video","file",{type,public_id:id});
-    return send(chatId,"أرسل فيديو الفيلم الجديد. الحد الأقصى 800MB.");
+    return send(chatId,"أرسل فيديو الفيلم الجديد. الحد الأقصى 2GB.");
   }
   if(a.startsWith("se|")){
     if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
@@ -2063,7 +2198,7 @@ async function callback(q:any){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
     const [,type,id,variant]=a.split("|");
     await setSession(userId,"replace_quality","file",{type,public_id:id,variant:normalizeVariant(variant)});
-    return send(chatId,`أرسل فيديو ${variantLabel(variant)} الجديد. الحد الأقصى 800MB.`);
+    return send(chatId,`أرسل فيديو ${variantLabel(variant)} الجديد. الحد الأقصى 2GB.`);
   }
   if(a.startsWith("qd1|")){
     if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
@@ -2101,7 +2236,7 @@ async function callback(q:any){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
     const [,id]=a.split("|");
     await setSession(userId,"replace_episode_video","file",{public_id:id});
-    return send(chatId,"أرسل فيديو الحلقة الجديد. الحد الأقصى 800MB.");
+    return send(chatId,"أرسل فيديو الحلقة الجديد. الحد الأقصى 2GB.");
   }
   if(a.startsWith("epd1|")){
     if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
@@ -2435,7 +2570,7 @@ async function message(m:any){
     }
     if(s.step==="receiving"){
       const file=videoFrom(m);if(!file)return send(chatId,"أرسل ملف فيديو، أو اضغط إنهاء ومراجعة.");
-      if(file.file_size&&file.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
+      try{validateVideoFile(file)}catch(err){return send(chatId,adminErrorText(err));}
       const items:any[]=Array.isArray(d.items)?d.items:[];
       if(items.length>=120)return send(chatId,"وصلت إلى 120 ملفًا في هذه الدفعة. اضغط إنهاء ومراجعة ثم ابدأ دفعة جديدة.",{inline_keyboard:[[{text:"إنهاء ومراجعة",callback_data:"batch_finish"}]]});
       const parsed=parseBatchEpisodeCaption(caption,Number(d.next_episode||1));
@@ -2486,13 +2621,13 @@ async function message(m:any){
     if(variant==="default"&&raw!=="default")return send(chatId,"اسم الجودة غير صالح. استخدم مثل 480p أو 720p أو 1080p أو 4K.");
     d.variant=variant;
     await setSession(userId,"add_quality","file",d);
-    return send(chatId,`أرسل فيديو جودة ${variantLabel(variant)}. الحد الأقصى 800MB.`);
+    return send(chatId,`أرسل فيديو جودة ${variantLabel(variant)}. الحد الأقصى 2GB.`);
   }
   if(s.flow==="add_quality"&&s.step==="file"){
     const target:any=await qualityTarget(String(d.type||""),String(d.public_id||""));
     if(!target){await clearSession(userId);return send(chatId,"المحتوى غير موجود.");}
     const file=videoFrom(m);if(!file)return send(chatId,"أرسل ملف فيديو.");
-    if(file.file_size&&file.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
+    try{validateVideoFile(file)}catch(err){return send(chatId,adminErrorText(err));}
     const variant=normalizeVariant(d.variant);
     const title=target.item.title||target.item.series?.title||target.item.public_id;
     await replaceStoredAsset({
@@ -2508,7 +2643,7 @@ async function message(m:any){
     const target:any=await qualityTarget(String(d.type||""),String(d.public_id||""));
     if(!target){await clearSession(userId);return send(chatId,"المحتوى غير موجود.");}
     const file=videoFrom(m);if(!file)return send(chatId,"أرسل ملف فيديو.");
-    if(file.file_size&&file.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
+    try{validateVideoFile(file)}catch(err){return send(chatId,adminErrorText(err));}
     const variant=normalizeVariant(d.variant);
     const title=target.item.title||target.item.series?.title||target.item.public_id;
     await replaceStoredAsset({
@@ -2566,7 +2701,7 @@ async function message(m:any){
     const item:any=await contentByPublicId("movie",String(d.public_id||""));
     if(!item){await clearSession(userId);return send(chatId,"الفيلم غير موجود.");}
     const file=videoFrom(m);if(!file)return send(chatId,"أرسل ملف فيديو.");
-    if(file.file_size&&file.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
+    try{validateVideoFile(file)}catch(err){return send(chatId,adminErrorText(err));}
     await replaceStoredAsset({
       adminId:userId,chatId,entityType:"movie",entityId:item.id,publicId:item.public_id,
       kind:"video",channelKey:"movies_storage",sourceMessageId:m.message_id,file,
@@ -2596,7 +2731,7 @@ async function message(m:any){
     const ep:any=await episodeByPublicId(String(d.public_id||""));
     if(!ep){await clearSession(userId);return send(chatId,"الحلقة غير موجودة.");}
     const file=videoFrom(m);if(!file)return send(chatId,"أرسل ملف فيديو.");
-    if(file.file_size&&file.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
+    try{validateVideoFile(file)}catch(err){return send(chatId,adminErrorText(err));}
     await replaceStoredAsset({
       adminId:userId,chatId,entityType:"episode",entityId:ep.id,publicId:ep.public_id,
       kind:"video",channelKey:"series_storage",sourceMessageId:m.message_id,file,
@@ -2633,18 +2768,18 @@ async function message(m:any){
     if(s.step==="duration"){const n=positiveOrNull(text);if(text!=="-"&&!n)return send(chatId,"أرسل رقمًا صحيحًا أو -.");d.duration_minutes=n;await setSession(userId,"movie","quality",d);return send(chatId,"أرسل الجودة، مثال 1080p.");}
     if(s.step==="quality"){
       d.quality=text;
-      if(d.poster){await setSession(userId,"movie","video",d);return send(chatId,`أرسل فيديو جودة ${variantLabel(normalizeVariant(text))}. الحد الحالي 800MB.`);}
+      if(d.poster){await setSession(userId,"movie","video",d);return send(chatId,`أرسل فيديو جودة ${variantLabel(normalizeVariant(text))}. الحد الحالي 2GB.`);}
       await setSession(userId,"movie","poster",d);return send(chatId,"أرسل بوستر الفيلم.");
     }
     if(s.step==="poster"){
       const f=photoFrom(m);if(!f)return send(chatId,"أرسل صورة البوستر.");
       d.poster=f;d.poster_source_message_id=m.message_id;
       if(d.tmdb_imported&&!d.quality){await setSession(userId,"movie","quality",d);return send(chatId,"أرسل جودة أول فيديو، مثال 1080p.");}
-      await setSession(userId,"movie","video",d);return send(chatId,"أرسل فيديو الفيلم. الحد الحالي 800MB.");
+      await setSession(userId,"movie","video",d);return send(chatId,"أرسل فيديو الفيلم. الحد الحالي 2GB.");
     }
     if(s.step==="video"){
       const f=videoFrom(m);if(!f)return send(chatId,"أرسل ملف فيديو.");
-      if(f.file_size&&f.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
+      try{validateVideoFile(f)}catch(err){return send(chatId,adminErrorText(err));}
       const variant=normalizeVariant(d.pending_quality||d.quality||"default");
       const videos=Array.isArray(d.videos)?d.videos:[];
       if(videos.some((x:any)=>normalizeVariant(x.variant)===variant))return send(chatId,`جودة ${variantLabel(variant)} موجودة مسبقًا. اختر جودة أخرى.`);
@@ -2664,7 +2799,7 @@ async function message(m:any){
       if(videos.some((x:any)=>normalizeVariant(x.variant)===variant))return send(chatId,"هذه الجودة موجودة مسبقًا.");
       d.pending_quality=variant;
       await setSession(userId,"movie","video",d);
-      return send(chatId,`أرسل فيديو جودة ${variantLabel(variant)}. الحد 800MB.`);
+      return send(chatId,`أرسل فيديو جودة ${variantLabel(variant)}. الحد 2GB.`);
     }
   }
 
@@ -2694,10 +2829,10 @@ async function message(m:any){
     if(s.step==="episode"){const n=Number(text);if(!Number.isInteger(n)||n<1)return send(chatId,"رقم الحلقة غير صحيح.");d.episode_number=n;await setSession(userId,"episode","title",d);return send(chatId,"أرسل اسم الحلقة، أو - للاسم التلقائي.");}
     if(s.step==="title"){d.title=text==="-"?`الحلقة ${d.episode_number}`:text;await setSession(userId,"episode","description",d);return send(chatId,"أرسل وصف الحلقة، أو - للتخطي.");}
     if(s.step==="description"){d.description=text==="-"?"":text;await setSession(userId,"episode","quality",d);return send(chatId,"أرسل الجودة.");}
-    if(s.step==="quality"){d.quality=text;await setSession(userId,"episode","video",d);return send(chatId,"أرسل فيديو الحلقة. الحد 800MB.");}
+    if(s.step==="quality"){d.quality=text;await setSession(userId,"episode","video",d);return send(chatId,"أرسل فيديو الحلقة. الحد 2GB.");}
     if(s.step==="video"){
       const f=videoFrom(m);if(!f)return send(chatId,"أرسل ملف فيديو.");
-      if(f.file_size&&f.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
+      try{validateVideoFile(f)}catch(err){return send(chatId,adminErrorText(err));}
       d.video=f;d.video_source_message_id=m.message_id;
       await setSession(userId,"episode","confirm",d);
       return send(chatId,`معاينة الحلقة:\n${d.series_public_id}\nالموسم: ${d.season_number}\nالحلقة: ${d.episode_number}\nالعنوان: ${d.title}\nالجودة: ${d.quality}\nالحجم: ${sizeLabel(f.file_size)}`,{inline_keyboard:[[{text:"نشر الحلقة",callback_data:"confirm_episode"},{text:"إلغاء",callback_data:"cancel"}]]});
@@ -2794,8 +2929,8 @@ async function media(type:string,id:string,req?:Request){
     const signingSecret=await streamSigningSecret();
     const gatewayBase=await streamGateway();
     if(!gatewayBase||!signingSecret) return json({error:"streaming gateway not configured"},503);
-    if(a.file_size&&Number(a.file_size)>MAX_VIDEO_BYTES) return json({error:"file exceeds current 800MB limit"},413);
-    const exp=Math.floor(Date.now()/1000)+600;
+    if(a.file_size&&Number(a.file_size)>MAX_VIDEO_BYTES) return json({error:"file exceeds current 2GB limit"},413);
+    const exp=Math.floor(Date.now()/1000)+STREAM_LINK_TTL_SECONDS;
     const payload=`${a.channel_id}:${a.channel_message_id}:${exp}`;
     const sig=await hmacHex(payload,signingSecret);
     return Response.redirect(`${gatewayBase}/stream/${a.channel_id}/${a.channel_message_id}?exp=${exp}&sig=${sig}`,307);
@@ -3062,7 +3197,7 @@ Deno.serve(async(req:Request)=>{
     const url=new URL(req.url);
     if(req.method==="GET"&&url.searchParams.get("health")==="1"){
       return json({
-        ok:true,name:"VAYZEN",maxVideoMB:800,
+        ok:true,name:"VAYZEN",maxVideoMB:MAX_VIDEO_MB,
         botConfigured:Boolean(BOT_TOKEN),
         webhookSecretConfigured:Boolean(BOT_SECRET),
         streamGatewayConfigured:Boolean(await streamGateway()),
