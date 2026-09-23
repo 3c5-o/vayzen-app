@@ -1957,12 +1957,16 @@ async function callback(q:any){
   }
   if(a==="confirm_movie"){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
-    const session=await getSession(userId);
+    let session=await getSession(userId);
     if(!session||session.flow!=="movie") return showMenu(chatId,"انتهت جلسة الفيلم.");
-    if(session.step==="publishing")return send(chatId,"الفيلم قيد النشر الآن، انتظر اكتمال العملية.");
-    if(!["confirm","video_review"].includes(session.step))return showMenu(chatId,"انتهت جلسة الفيلم.");
+    if(session.step==="publishing"){
+      if(!publishingSessionIsStale(session))return send(chatId,"الفيلم قيد النشر الآن، انتظر اكتمال العملية.");
+      await recoverStalePublishSession(userId,"movie",session);
+      session=await getSession(userId);
+    }
+    if(!session||!["confirm","video_review"].includes(session.step))return showMenu(chatId,"انتهت جلسة الفيلم.");
     await setSession(userId,"movie","publishing",session.draft);
-    await send(chatId,"جاري نشر الفيلم ونقل الملفات...");
+    await send(chatId,session.draft?.publishing_entity_id?"استئناف نشر الفيلم من آخر نقطة...":"جاري نشر الفيلم ونقل الملفات...");
     try{
       const id=await publishMovie(userId,chatId,session.draft);
       await clearSession(userId);
@@ -2033,10 +2037,14 @@ async function callback(q:any){
   }
   if(a==="confirm_episode"){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
-    const session=await getSession(userId);
+    let session=await getSession(userId);
     if(!session||session.flow!=="episode") return showMenu(chatId,"انتهت جلسة الحلقة.");
-    if(session.step==="publishing")return send(chatId,"الحلقة قيد النشر الآن، انتظر اكتمال العملية.");
-    if(session.step!=="confirm")return showMenu(chatId,"انتهت جلسة الحلقة.");
+    if(session.step==="publishing"){
+      if(!publishingSessionIsStale(session))return send(chatId,"الحلقة قيد النشر الآن، انتظر اكتمال العملية.");
+      await recoverStalePublishSession(userId,"episode",session);
+      session=await getSession(userId);
+    }
+    if(!session||session.step!=="confirm")return showMenu(chatId,"انتهت جلسة الحلقة.");
     await setSession(userId,"episode","publishing",session.draft);
     await send(chatId,"جاري نشر الحلقة ونقل الفيديو...");
     try{
