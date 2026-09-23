@@ -605,7 +605,15 @@ async function markTransferRolledBack(place:any){
   }catch{}
 }
 
-async function copyTo(key:string,fromChatId:number,messageId:number,caption:string,fileSize?:number|null){
+type TransferContext={
+  entityType?:"movie"|"series"|"episode";
+  entityId?:string;
+  entityPublicId?:string;
+  kind?:"poster"|"video"|"backdrop"|"subtitle"|"trailer";
+  variant?:string;
+  file?:any;
+};
+async function copyTo(key:string,fromChatId:number,messageId:number,caption:string,fileSize?:number|null,ctx:TransferContext={}){
   const ch=await channel(key);
   const jobKey=await sha256Text(["copy",key,String(fromChatId),String(messageId),caption].join("|"));
   const existing:any=await transferJob(jobKey);
@@ -618,6 +626,19 @@ async function copyTo(key:string,fromChatId:number,messageId:number,caption:stri
     from_chat_id:fromChatId,source_message_id:messageId,
     file_size:fileSize??null,max_attempts:COPY_RETRY_DELAYS_MS.length,
     attempts:["failed","rolled_back"].includes(String(existing?.status||""))?0:Number(existing?.attempts||0),
+    caption,
+    entity_type:ctx.entityType??null,
+    entity_id:ctx.entityId??null,
+    entity_public_id:ctx.entityPublicId??null,
+    kind:ctx.kind??null,
+    variant:ctx.variant?normalizeVariant(ctx.variant):null,
+    file_metadata:ctx.file?{
+      file_id:ctx.file.file_id??null,
+      file_unique_id:ctx.file.file_unique_id??null,
+      mime_type:ctx.file.mime_type??null,
+      file_name:ctx.file.file_name??null,
+      file_size:ctx.file.file_size??null
+    }:{},
     last_error:null
   },{onConflict:"job_key"}).select("id,status,attempts,max_attempts").single();
   if(jobError||!job)throw jobError??new Error("تعذر تجهيز عملية نقل الوسائط.");
@@ -785,7 +806,7 @@ async function publishMovie(userId:number,chatId:number,d:any){
       `المدة: ${d.duration_minutes?d.duration_minutes+" دقيقة":"—"}`,
       `الجودات: ${videos.map(v=>variantLabel(v.variant)).join(" • ")}`,"",d.description||"","",`Movie ID: ${movie.public_id}`,
     ].filter(Boolean).join("\n");
-    posterPlace=await copyTo("movies_info",chatId,d.poster_source_message_id,infoCaption);
+    posterPlace=await copyTo("movies_info",chatId,d.poster_source_message_id,infoCaption,d.poster?.file_size,{entityType:"movie",entityId:movie.id,entityPublicId:movie.public_id,kind:"poster",variant:"default",file:d.poster});
     await saveAsset("movie",movie.id,"poster",d.poster,posterPlace);
     if(d.backdrop_url){
       const existingBackdrop=await currentAsset("movie",movie.id,"backdrop");
@@ -796,7 +817,7 @@ async function publishMovie(userId:number,chatId:number,d:any){
       }
     }
     for(const v of videos){
-      const place=await copyTo("movies_storage",chatId,v.source_message_id,`${movie.public_id} | ${d.title} | ${variantLabel(v.variant)} | ${sizeLabel(v.file?.file_size)}`,v.file?.file_size);
+      const place=await copyTo("movies_storage",chatId,v.source_message_id,`${movie.public_id} | ${d.title} | ${variantLabel(v.variant)} | ${sizeLabel(v.file?.file_size)}`,v.file?.file_size,{entityType:"movie",entityId:movie.id,entityPublicId:movie.public_id,kind:"video",variant:v.variant,file:v.file});
       videoPlaces.push(place);
       await saveAsset("movie",movie.id,"video",v.file,place,v.variant);
     }
@@ -831,7 +852,7 @@ async function publishSeries(userId:number,chatId:number,d:any){
       `اللغة: ${d.language||"—"}`,`الدولة: ${d.country||"—"}`,
       `الجودة: ${d.quality||"—"}`,"",d.description||"","",`Series ID: ${series.public_id}`,
     ].filter(Boolean).join("\n");
-    posterPlace=await copyTo("series_info",chatId,d.poster_source_message_id,infoCaption);
+    posterPlace=await copyTo("series_info",chatId,d.poster_source_message_id,infoCaption,d.poster?.file_size,{entityType:"series",entityId:series.id,entityPublicId:series.public_id,kind:"poster",variant:"default",file:d.poster});
     await saveAsset("series",series.id,"poster",d.poster,posterPlace);
     if(d.backdrop_url){
       const remote=await sendRemotePhotoTo("series_info",d.backdrop_url,`${series.public_id} | ${d.title} | backdrop`);
@@ -895,7 +916,8 @@ async function publishEpisode(userId:number,chatId:number,d:any){
   let assetWritten=false,seasonPromoted=false;
   try{
     place=await copyTo("series_storage",chatId,d.video_source_message_id,
-      `${ep.public_id} | ${series.title} | موسم ${d.season_number} | حلقة ${d.episode_number} | ${variantLabel(variant)}`,d.video?.file_size);
+      `${ep.public_id} | ${series.title} | موسم ${d.season_number} | حلقة ${d.episode_number} | ${variantLabel(variant)}`,d.video?.file_size,
+      {entityType:"episode",entityId:ep.id,entityPublicId:ep.public_id,kind:"video",variant,file:d.video});
     await saveAsset("episode",ep.id,"video",d.video,place,variant);
     assetWritten=true;
     const {error:publishError}=await db.from("episodes").update({status:"published",quality:d.quality||variantLabel(variant),updated_at:new Date().toISOString()}).eq("id",ep.id);
@@ -984,7 +1006,7 @@ async function replaceStoredAsset(opts:{
   const variant=normalizeVariant(opts.variant||"default");
   if(opts.kind==="video")validateVideoFile(opts.file);
   const oldAsset:any=await currentAsset(opts.entityType,opts.entityId,opts.kind,variant);
-  const place=await copyTo(opts.channelKey,opts.chatId,opts.sourceMessageId,opts.caption,opts.file?.file_size);
+  const place=await copyTo(opts.channelKey,opts.chatId,opts.sourceMessageId,opts.caption,opts.file?.file_size,{entityType:opts.entityType,entityId:opts.entityId,entityPublicId:opts.publicId,kind:opts.kind,variant,file:opts.file});
   try{
     await saveAsset(opts.entityType,opts.entityId,opts.kind,opts.file,place,variant);
   }catch(err){
