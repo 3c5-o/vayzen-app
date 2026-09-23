@@ -308,6 +308,7 @@ async function openDetails(type,id){
     ${type==="series"?'<div class="seasons-wrap"><div class="season-tabs" id="seasonTabs"></div><div class="episode-list" id="episodeList"></div></div>':""}
   `;
   openModal("detailModal");
+  if(history.state?.overlay!=="detail")history.pushState({vayzen:true,page:state.currentPage,overlay:"detail",type,id},"","#detail");
 
   $("#favoriteBtn").onclick=()=>toggleFavorite(type,id);
   $("#detailReport").onclick=()=>openReport(type,item.public_id);
@@ -755,19 +756,43 @@ document.addEventListener("fullscreenchange",()=>{
   showPlayerControls();
 });
 
-function go(page){
-  $$(".page").forEach(p=>p.classList.toggle("active",p.dataset.page===page));
-  $$(".nav-item").forEach(n=>n.classList.toggle("active",n.dataset.nav===page));
-  window.scrollTo({top:0,behavior:"smooth"});
+function applyPage(page){
+  const valid=["home","movies","series","mylist","account"];
+  if(!valid.includes(page))page="home";
+  state.currentPage=page;
+  $(".page").forEach(p=>p.classList.toggle("active",p.dataset.page===page));
+  $(".nav-item").forEach(n=>n.classList.toggle("active",n.dataset.nav===page));
+  $("#searchPanel")?.classList.add("hidden");
+  window.scrollTo({top:0,behavior:"instant"});
   if(page==="mylist")renderMyList();
   if(page==="account")renderAccount();
 }
-$$(".nav-item").forEach(b=>b.onclick=()=>go(b.dataset.nav));
-$$("[data-go]").forEach(b=>b.onclick=()=>go(b.dataset.go));
-$$("[data-auth-open]").forEach(b=>b.onclick=()=>openAuth(b.dataset.authOpen||"login"));
-$$("[data-auth-tab]").forEach(b=>b.onclick=()=>setAuthTab(b.dataset.authTab));
-$$("[data-close]").forEach(b=>b.onclick=()=>closeModal(b.dataset.close));
-$$(".modal").forEach(m=>m.addEventListener("click",e=>{if(e.target===m)closeModal(m.id)}));
+function go(page,{push=true}={}){
+  applyPage(page);
+  if(push&&history.state?.page!==page)history.pushState({vayzen:true,page},"","#"+page);
+}
+if(!history.state?.vayzen)history.replaceState({vayzen:true,page:"home"},"","#home");
+else if(history.state.page)applyPage(history.state.page);
+window.addEventListener("popstate",e=>{
+  const st=e.state||{vayzen:true,page:"home"};
+  if(playerLayer.classList.contains("open"))closePlayer({fromHistory:true});
+  $(".modal.open").forEach(m=>closeModal(m.id));
+  if(st.page)applyPage(st.page);
+});
+$(".nav-item").forEach(b=>b.onclick=()=>go(b.dataset.nav));
+$("[data-go]").forEach(b=>b.onclick=()=>go(b.dataset.go));
+$("[data-auth-open]").forEach(b=>b.onclick=()=>openAuth(b.dataset.authOpen||"login"));
+$("[data-auth-tab]").forEach(b=>b.onclick=()=>setAuthTab(b.dataset.authTab));
+$("[data-close]").forEach(b=>b.onclick=()=>{
+  const id=b.dataset.close;
+  if(id==="detailModal"&&history.state?.overlay==="detail")history.back();
+  else closeModal(id);
+});
+$(".modal").forEach(m=>m.addEventListener("click",e=>{
+  if(e.target!==m)return;
+  if(m.id==="detailModal"&&history.state?.overlay==="detail")history.back();
+  else closeModal(m.id);
+}));
 
 $("#globalSearchBtn").onclick=()=>{$("#searchPanel").classList.toggle("hidden");if(!$("#searchPanel").classList.contains("hidden"))$("#searchInput").focus()};
 $("#clearSearch").onclick=()=>{$("#searchInput").value="";state.query="";renderCatalog()};
@@ -786,6 +811,7 @@ async function boot(){
     loadPrefs();loadSession();
     await loadCatalog();
     await loadUserState();
+    applyPage(history.state?.page||"home");
   }finally{
     clearTimeout(splashTimer);
     setTimeout(()=>$("#splash")?.classList.add("hide"),250);
