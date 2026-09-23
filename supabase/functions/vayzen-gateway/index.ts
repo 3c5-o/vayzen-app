@@ -1177,7 +1177,13 @@ async function message(m:any){
   return showMenu(chatId);
 }
 
-async function asset(type:string,id:string){
+function qualityRank(v:string){
+  const x=normalizeVariant(v);
+  if(x==="4k")return 4000;
+  const m=x.match(/^(\d{3,4})p$/);
+  return m?Number(m[1]):(x==="default"?1:0);
+}
+async function asset(type:string,id:string,variant="default"){
   if(!/^[0-9a-f-]{36}$/i.test(id)) return null;
   let entity_type="",kind="";
   if(type==="movie_poster"||type==="movie_video"){
@@ -1198,10 +1204,33 @@ async function asset(type:string,id:string){
     entity_type="episode";kind="video";
   }else return null;
 
-  const {data}=await db.from("media_assets")
-    .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_size")
-    .eq("entity_type",entity_type).eq("entity_id",id).eq("kind",kind).eq("variant","default").maybeSingle();
-  return data??null;
+  const requested=kind==="video"?normalizeVariant(variant):"default";
+  const {data:direct}=await db.from("media_assets")
+    .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_size,variant")
+    .eq("entity_type",entity_type).eq("entity_id",id).eq("kind",kind).eq("variant",requested).maybeSingle();
+  if(direct)return direct;
+  if(kind!=="video"||requested!=="default")return null;
+  const {data:list}=await db.from("media_assets")
+    .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_size,variant")
+    .eq("entity_type",entity_type).eq("entity_id",id).eq("kind","video");
+  const sorted=(list??[]).sort((a:any,b:any)=>qualityRank(String(b.variant))-qualityRank(String(a.variant)));
+  return sorted[0]??null;
+}
+
+async function publicMediaVariants(url:URL){
+  const type=String(url.searchParams.get("type")||"");
+  const id=String(url.searchParams.get("id")||"");
+  if(!["movie","episode"].includes(type)||!/^[0-9a-f-]{36}$/i.test(id))return json({error:"invalid media target"},400);
+  const probe=await asset(type==="movie"?"movie_video":"episode_video",id,"default");
+  if(!probe)return json({error:"not found"},404);
+  const {data,error}=await db.from("media_assets")
+    .select("variant,file_size,mime_type")
+    .eq("entity_type",type).eq("entity_id",id).eq("kind","video");
+  if(error)throw error;
+  const variants=(data??[])
+    .map((x:any)=>({variant:String(x.variant||"default"),label:variantLabel(String(x.variant||"default")),file_size:x.file_size||null,mime_type:x.mime_type||null}))
+    .sort((a:any,b:any)=>qualityRank(b.variant)-qualityRank(a.variant));
+  return json({ok:true,variants});
 }
 
 async function streamSigningSecret(){
@@ -1223,7 +1252,8 @@ async function hmacHex(payload:string,secret:string){
 }
 
 async function media(type:string,id:string,req?:Request){
-  const a:any=await asset(type,id);
+  const quality=req?new URL(req.url).searchParams.get("quality")||"default":"default";
+  const a:any=await asset(type,id,quality);
   if(!a) return json({error:"not found"},404);
   if(type==="movie_video"||type==="episode_video"){
     const signingSecret=await streamSigningSecret();
@@ -1513,6 +1543,7 @@ Deno.serve(async(req:Request)=>{
     const action=url.searchParams.get("action");
     if(action==="catalog"&&req.method==="GET") return catalog();
     if(action==="series_content"&&req.method==="GET") return seriesContent(url);
+    if(action==="media_variants"&&req.method==="GET") return publicMediaVariants(url);
     if(action==="signup"&&req.method==="POST") return authSignup(req);
     if(action==="login"&&req.method==="POST") return authLogin(req);
     if(action==="refresh"&&req.method==="POST") return authRefresh(req);
