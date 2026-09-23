@@ -290,6 +290,38 @@ async function decorateInlineKeyboard(markup?:unknown){
     }))
   };
 }
+function stripBotUiIcons(markup?:unknown){
+  const raw=markup as TelegramMarkup|undefined;
+  if(!raw?.inline_keyboard)return markup;
+  return {
+    ...raw,
+    inline_keyboard:raw.inline_keyboard.map(row=>row.map(button=>{
+      const {icon_custom_emoji_id:_icon,...rest}=button;
+      return rest;
+    }))
+  };
+}
+function markupHasBotUiIcons(markup?:unknown){
+  const raw=markup as TelegramMarkup|undefined;
+  return Boolean(raw?.inline_keyboard?.some(row=>row.some(button=>Boolean(button.icon_custom_emoji_id))));
+}
+async function tgWithMarkup(method:string,body:Record<string,unknown>,markup?:unknown){
+  const decorated=markup?await decorateInlineKeyboard(markup):undefined;
+  try{
+    return await tg(method,{...body,...(decorated?{reply_markup:decorated}:{})});
+  }catch(err){
+    if(!decorated||!markupHasBotUiIcons(decorated))throw err;
+    const fallback=stripBotUiIcons(decorated);
+    try{
+      const result=await tg(method,{...body,reply_markup:fallback});
+      const message=err instanceof Error?err.message:String(err);
+      await systemLog("warning","Telegram rejected custom button icons; fallback used",{error:message.slice(0,220)});
+      return result;
+    }catch{
+      throw err;
+    }
+  }
+}
 async function ensureBotUiIcons(ownerId:number,force=false){
   const {data}=await db.from("app_settings").select("value").eq("key","bot_ui_icons").maybeSingle();
   const current:any=data?.value||{};
@@ -348,8 +380,7 @@ async function channel(key:string){
 }
 
 async function send(chatId:string|number,text:string,reply_markup?:unknown){
-  const decorated=reply_markup?await decorateInlineKeyboard(reply_markup):undefined;
-  return tg("sendMessage",{chat_id:chatId,text,...(decorated?{reply_markup:decorated}:{})});
+  return tgWithMarkup("sendMessage",{chat_id:chatId,text},reply_markup);
 }
 
 
@@ -382,15 +413,15 @@ async function sendTmdbPreview(chatId:number,type:"movie"|"series",mapped:any,bu
     "",
     `TMDb ID: ${mapped.external_id}`
   ].filter(Boolean).join("\n").slice(0,980);
-  const reply_markup=await decorateInlineKeyboard({inline_keyboard:[
+  const reply_markup={inline_keyboard:[
     [{text:"استخدام هذه النتيجة",callback_data:`tmdb_use|${type==="movie"?"m":"s"}|${mapped.external_id}`}],
     [{text:"بحث جديد",callback_data:`tmdb_again|${type==="movie"?"m":"s"}`},{text:"إلغاء",callback_data:"cancel"}]
-  ]});
+  ]};
   if(posterUrl){
-    const m=await tg("sendPhoto",{chat_id:chatId,photo:posterUrl,caption,reply_markup});
+    const m=await tgWithMarkup("sendPhoto",{chat_id:chatId,photo:posterUrl,caption},reply_markup);
     return {message:m,poster:photoFrom(m),poster_source_message_id:Number(m.message_id)};
   }
-  const m=await tg("sendMessage",{chat_id:chatId,text:caption,reply_markup});
+  const m=await tgWithMarkup("sendMessage",{chat_id:chatId,text:caption},reply_markup);
   return {message:m,poster:null,poster_source_message_id:null};
 }
 
