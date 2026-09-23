@@ -44,6 +44,34 @@ def request_once(url: str, range_bytes: int, timeout: float):
     return {"ok": ok, "status": status, "bytes": size, "seconds": elapsed, "error": error}
 
 
+def discover_stream_api(api_url: str, timeout: float):
+    sep = "&" if "?" in api_url else "?"
+    catalog_url = api_url + sep + "action=catalog"
+    req = urllib.request.Request(catalog_url, headers={"User-Agent": "VAYZEN-Release-Load-Test/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as res:
+        data = json.loads(res.read().decode("utf-8"))
+    movies = data.get("movies") or []
+    if movies:
+        movie_id = movies[0].get("id")
+        if movie_id:
+            return api_url + sep + "media=movie_video&id=" + str(movie_id)
+
+    series = data.get("series") or []
+    for item in series[:5]:
+        series_id = item.get("id")
+        if not series_id:
+            continue
+        content_url = api_url + sep + "action=series_content&id=" + str(series_id)
+        req = urllib.request.Request(content_url, headers={"User-Agent": "VAYZEN-Release-Load-Test/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            content = json.loads(res.read().decode("utf-8"))
+        for season in content.get("seasons") or []:
+            eps = season.get("episodes") or []
+            if eps and eps[0].get("id"):
+                return api_url + sep + "media=episode_video&id=" + str(eps[0]["id"])
+    raise RuntimeError("No published playable media found through catalog API")
+
+
 def health_check(url: str, timeout: float):
     started = time.perf_counter()
     req = urllib.request.Request(url, headers={"User-Agent": "VAYZEN-Release-Load-Test/1.0"})
@@ -67,6 +95,7 @@ def main():
     p = argparse.ArgumentParser(description="VAYZEN gateway smoke/load tester")
     p.add_argument("--url", help="Signed /stream URL for Range testing")
     p.add_argument("--health", help="Gateway /health URL")
+    p.add_argument("--api", help="VAYZEN public API URL; auto-discovers a playable movie/episode")
     p.add_argument("--concurrency", type=int, default=6)
     p.add_argument("--requests", type=int, default=24)
     p.add_argument("--range-kb", type=int, default=512)
@@ -75,8 +104,8 @@ def main():
     p.add_argument("--max-p95", type=float, default=8.0)
     args = p.parse_args()
 
-    if not args.url and not args.health:
-        p.error("provide --health and/or --url")
+    if not args.url and not args.health and not args.api:
+        p.error("provide --health, --url and/or --api")
 
     if args.health:
         try:
@@ -87,7 +116,16 @@ def main():
             print(f"HEALTH_FAIL: {exc}", file=sys.stderr)
             return 2
 
-    if not args.url:
+    stream_url = args.url
+    if not stream_url and args.api:
+        try:
+            stream_url = discover_stream_api(args.api, args.timeout)
+            print(json.dumps({"discovered_stream": stream_url}, ensure_ascii=False))
+        except Exception as exc:
+            print(f"DISCOVERY_FAIL: {exc}", file=sys.stderr)
+            return 5
+
+    if not stream_url:
         return 0
 
     concurrency = min(64, max(1, args.concurrency))
@@ -96,7 +134,7 @@ def main():
 
     started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = [pool.submit(request_once, args.url, range_bytes, args.timeout) for _ in range(total)]
+        futures = [pool.submit(request_once, stream_url, range_bytes, args.timeout) for _ in range(total)]
         results = [f.result() for f in concurrent.futures.as_completed(futures)]
     wall = time.perf_counter() - started
 
