@@ -854,30 +854,62 @@ async function callback(q:any){
   }
 
   if(a==="stats"){
-    const [m,s,e,r,p,u]=await Promise.all([
+    const [m,sr,e,r,p,u,du,topM,topS]=await Promise.all([
       db.from("movies").select("id",{head:true,count:"exact"}),
       db.from("series").select("id",{head:true,count:"exact"}),
       db.from("episodes").select("id",{head:true,count:"exact"}),
       db.from("content_requests").select("id",{head:true,count:"exact"}).eq("status","new"),
       db.from("reports").select("id",{head:true,count:"exact"}).eq("status","new"),
       db.from("profiles").select("id",{head:true,count:"exact"}),
+      db.from("profiles").select("id",{head:true,count:"exact"}).eq("is_disabled",true),
+      db.from("movies").select("public_id,title,view_count").eq("status","published").order("view_count",{ascending:false}).limit(3),
+      db.from("series").select("public_id,title,view_count").eq("status","published").order("view_count",{ascending:false}).limit(3),
     ]);
-    return showMenu(chatId,`إحصائيات VAYZEN\n\nالأفلام: ${m.count||0}\nالمسلسلات: ${s.count||0}\nالحلقات: ${e.count||0}\nالمستخدمون: ${u.count||0}\nطلبات جديدة: ${r.count||0}\nبلاغات جديدة: ${p.count||0}`);
+    const topMovies=(topM.data??[]).map((x:any)=>`• ${x.title}: ${x.view_count||0}`).join("\n")||"—";
+    const topSeries=(topS.data??[]).map((x:any)=>`• ${x.title}: ${x.view_count||0}`).join("\n")||"—";
+    return showMenu(chatId,`إحصائيات VAYZEN\n\nالأفلام: ${m.count||0}\nالمسلسلات: ${sr.count||0}\nالحلقات: ${e.count||0}\nالمستخدمون: ${u.count||0}\nالحسابات المعطلة: ${du.count||0}\nطلبات جديدة: ${r.count||0}\nبلاغات جديدة: ${p.count||0}\n\nأكثر الأفلام مشاهدة:\n${topMovies}\n\nأكثر المسلسلات مشاهدة:\n${topSeries}`);
   }
   if(a==="system_status"){
     if(!can(admin,"logs")&&admin.role!=="owner"&&admin.role!=="secondary_admin")return send(chatId,"لا تملك صلاحية مراقبة النظام.");
     return showMenu(chatId,await systemStatusText());
+  }
+  if(a==="users"){
+    if(!["owner","secondary_admin"].includes(admin.role))return send(chatId,"لا تملك صلاحية إدارة المستخدمين.");
+    return sendUsersManager(chatId);
+  }
+  if(a.startsWith("usr|")){
+    if(!["owner","secondary_admin"].includes(admin.role))return send(chatId,"لا تملك صلاحية إدارة المستخدمين.");
+    const [,id]=a.split("|");return sendUserItem(chatId,id);
+  }
+  if(a.startsWith("usb|")){
+    if(!["owner","secondary_admin"].includes(admin.role))return send(chatId,"لا تملك صلاحية إدارة المستخدمين.");
+    const [,id,value]=a.split("|");
+    const disabled=value==="1";
+    const {error}=await db.from("profiles").update({is_disabled:disabled,updated_at:new Date().toISOString()}).eq("id",id);
+    if(error)throw error;
+    await adminLog(userId,disabled?"user_disable":"user_enable","user",id,undefined,{});
+    return sendUserItem(chatId,id);
   }
 
   if(a==="requests"){
     if(!can(admin,"requests")) return send(chatId,"لا تملك صلاحية الطلبات.");
     return sendRequestsManager(chatId);
   }
+  if(a.startsWith("rql|")){
+    if(!can(admin,"requests"))return send(chatId,"لا تملك صلاحية الطلبات.");
+    const [,code]=a.split("|");
+    await setSession(userId,"link_request","content_id",{request_code:code});
+    return send(chatId,`أرسل Movie ID أو Series ID للمحتوى الذي يحقق الطلب ${code}.\nمثال: MOV-000004 أو SER-000001`);
+  }
   if(a.startsWith("rq|")){
     if(!can(admin,"requests"))return send(chatId,"لا تملك صلاحية الطلبات.");
     const [,code,status]=a.split("|");
-    if(!["reviewing","added","rejected"].includes(status))return sendRequestsManager(chatId);
-    const {error}=await db.from("content_requests").update({status,handled_by:userId,updated_at:new Date().toISOString()}).eq("request_code",code);
+    if(!["reviewing","rejected","duplicate"].includes(status))return sendRequestsManager(chatId);
+    const {error}=await db.from("content_requests").update({
+      status,handled_by:userId,
+      ...(status!=="reviewing"?{linked_entity_type:null,linked_entity_id:null}:{}),
+      updated_at:new Date().toISOString()
+    }).eq("request_code",code);
     if(error)throw error;
     await adminLog(userId,"request_status","request",undefined,code,{status});
     return sendRequestsManager(chatId);
