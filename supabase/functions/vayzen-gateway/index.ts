@@ -1831,7 +1831,7 @@ async function sendJobItem(chatId:number,id:string){
     .eq("id",id).maybeSingle();
   if(!j)return sendJobCenter(chatId);
   const rows:any[]=[];
-  if(["failed","rolled_back"].includes(j.status)&&j.entity_type&&j.entity_id&&j.kind){
+  if(["failed","rolled_back"].includes(j.status)&&j.entity_type&&j.entity_id&&j.kind&&j.kind!=="subtitle"){
     rows.push([{text:"إعادة المحاولة",callback_data:`job_retry|${j.id}`}]);
   }
   rows.push([{text:"رجوع للعمليات",callback_data:"jobs"}]);
@@ -1846,6 +1846,7 @@ async function retryMediaTransferJob(adminId:number,id:string){
     .select("*").eq("id",id).maybeSingle();
   if(error||!j)throw error??new Error("العملية غير موجودة");
   if(!["failed","rolled_back"].includes(j.status))throw new Error("العملية لا تحتاج إعادة محاولة");
+  if(j.kind==="subtitle")throw new Error("أعد رفع ملف الترجمة من مدير الترجمات للحفاظ على بيانات اللغة.");
   if(!j.entity_type||!j.entity_id||!j.kind)throw new Error("هذه عملية قديمة ولا تحتوي سياقًا كافيًا لإعادة المحاولة التلقائية");
   const file:any=j.file_metadata||{};
   if(!file.file_id)throw new Error("بيانات الملف غير مكتملة");
@@ -2165,6 +2166,15 @@ async function runOperationalCheck(){
     db.from("media_health_issues").select("id",{head:true,count:"exact"}).eq("status","open").eq("severity","critical"),
     db.from("admin_users").select("telegram_user_id",{head:true,count:"exact"}).eq("role","owner").eq("is_active",true)
   ]);
+  if(Number(staleJobs.count||0)>0){
+    try{
+      await db.from("media_transfer_jobs").update({
+        status:"failed",
+        last_error:"Interrupted transfer detected by production monitor; safe retry is available.",
+        updated_at:new Date().toISOString()
+      }).eq("status","processing").lt("updated_at",staleCutoff);
+    }catch{}
+  }
   try{
     const {data:owner}=await db.from("admin_users").select("telegram_user_id").eq("role","owner").eq("is_active",true).maybeSingle();
     if(owner?.telegram_user_id)await purgeExpiredTrash(Number(owner.telegram_user_id));
