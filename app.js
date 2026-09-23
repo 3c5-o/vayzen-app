@@ -1,4 +1,5 @@
-const API="/api";
+const STATIC_API="https://aszcgivlsaldcgocljwe.supabase.co/functions/v1/vayzen-gateway";
+const API=location.hostname.endsWith(".github.io")?STATIC_API:"/api";
 const SESSION_KEY="vayzen.session";
 const PREFS_KEY="vayzen.prefs";
 const DEVICE_KEY="vayzen.device";
