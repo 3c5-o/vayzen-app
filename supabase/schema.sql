@@ -105,7 +105,7 @@ create table if not exists public.admin_users (
   telegram_user_id bigint primary key,
   display_name text not null default '',
   role text not null default 'moderator'
-    check (role in ('owner','secondary_admin','content_manager','requests_manager','moderator','support')),
+    check (role in ('owner','secondary_admin','content_manager','requests_manager','user_manager','viewer','moderator','support')),
   permissions jsonb not null default '{}'::jsonb,
   is_active boolean not null default true,
   added_by bigint,
