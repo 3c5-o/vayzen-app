@@ -760,8 +760,8 @@ function applyPage(page){
   const valid=["home","movies","series","mylist","account"];
   if(!valid.includes(page))page="home";
   state.currentPage=page;
-  $(".page").forEach(p=>p.classList.toggle("active",p.dataset.page===page));
-  $(".nav-item").forEach(n=>n.classList.toggle("active",n.dataset.nav===page));
+  Array.from(document.querySelectorAll(".page")).forEach(p=>p.classList.toggle("active",p.dataset.page===page));
+  Array.from(document.querySelectorAll(".nav-item")).forEach(n=>n.classList.toggle("active",n.dataset.nav===page));
   $("#searchPanel")?.classList.add("hidden");
   window.scrollTo({top:0,behavior:"instant"});
   if(page==="mylist")renderMyList();
@@ -776,19 +776,19 @@ else if(history.state.page)applyPage(history.state.page);
 window.addEventListener("popstate",e=>{
   const st=e.state||{vayzen:true,page:"home"};
   if(playerLayer.classList.contains("open"))closePlayer({fromHistory:true});
-  $(".modal.open").forEach(m=>closeModal(m.id));
+  Array.from(document.querySelectorAll(".modal.open")).forEach(m=>closeModal(m.id));
   if(st.page)applyPage(st.page);
 });
-$(".nav-item").forEach(b=>b.onclick=()=>go(b.dataset.nav));
-$("[data-go]").forEach(b=>b.onclick=()=>go(b.dataset.go));
-$("[data-auth-open]").forEach(b=>b.onclick=()=>openAuth(b.dataset.authOpen||"login"));
-$("[data-auth-tab]").forEach(b=>b.onclick=()=>setAuthTab(b.dataset.authTab));
-$("[data-close]").forEach(b=>b.onclick=()=>{
+Array.from(document.querySelectorAll(".nav-item")).forEach(b=>b.onclick=()=>go(b.dataset.nav));
+Array.from(document.querySelectorAll("[data-go]")).forEach(b=>b.onclick=()=>go(b.dataset.go));
+Array.from(document.querySelectorAll("[data-auth-open]")).forEach(b=>b.onclick=()=>openAuth(b.dataset.authOpen||"login"));
+Array.from(document.querySelectorAll("[data-auth-tab]")).forEach(b=>b.onclick=()=>setAuthTab(b.dataset.authTab));
+Array.from(document.querySelectorAll("[data-close]")).forEach(b=>b.onclick=()=>{
   const id=b.dataset.close;
   if(id==="detailModal"&&history.state?.overlay==="detail")history.back();
   else closeModal(id);
 });
-$(".modal").forEach(m=>m.addEventListener("click",e=>{
+Array.from(document.querySelectorAll(".modal")).forEach(m=>m.addEventListener("click",e=>{
   if(e.target!==m)return;
   if(m.id==="detailModal"&&history.state?.overlay==="detail")history.back();
   else closeModal(m.id);
