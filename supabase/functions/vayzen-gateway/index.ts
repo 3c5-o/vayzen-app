@@ -345,17 +345,185 @@ async function publishEpisode(userId:number,chatId:number,d:any){
   }
 }
 
+function adminErrorText(err:any){
+  const raw=err instanceof Error?err.message:String(err||"خطأ غير معروف");
+  if(raw.includes("chat not found"))return "تعذر الوصول إلى قناة التخزين. تحقق أن البوت مشرف في القناة.";
+  if(raw.includes("file exceeds"))return "حجم الملف أكبر من الحد المسموح.";
+  if(raw.includes("Series not found"))return "المسلسل غير موجود أو غير منشور.";
+  return raw.slice(0,180);
+}
+
+async function contentByPublicId(type:string,publicId:string){
+  const table=type==="movie"?"movies":type==="series"?"series":null;
+  if(!table)return null;
+  const {data}=await db.from(table).select("id,public_id,title,status,is_featured,view_count,created_at").eq("public_id",publicId.toUpperCase()).maybeSingle();
+  return data??null;
+}
+
+async function sendContentManager(chatId:number){
+  const [{data:m},{data:s}]=await Promise.all([
+    db.from("movies").select("public_id,title,status,is_featured").order("created_at",{ascending:false}).limit(6),
+    db.from("series").select("public_id,title,status,is_featured").order("created_at",{ascending:false}).limit(6),
+  ]);
+  const all=[
+    ...(m??[]).map((x:any)=>({...x,type:"movie"})),
+    ...(s??[]).map((x:any)=>({...x,type:"series"})),
+  ];
+  const text=all.length
+    ?"إدارة المحتوى\n\nاختر عنصرًا للتحكم بالنشر أو التمييز أو الحذف."
+    :"لا يوجد محتوى بعد.";
+  const rows=all.map((x:any)=>[{
+    text:`${x.status==="published"?"●":"○"} ${x.public_id} | ${String(x.title).slice(0,28)}${x.is_featured?" ★":""}`,
+    callback_data:`cm|${x.type}|${x.public_id}`
+  }]);
+  rows.push([{text:"رجوع للقائمة",callback_data:"menu"}]);
+  return send(chatId,text,{inline_keyboard:rows});
+}
+
+async function sendContentItem(chatId:number,type:string,publicId:string){
+  const item:any=await contentByPublicId(type,publicId);
+  if(!item)return sendContentManager(chatId);
+  const nextStatus=item.status==="published"?"hidden":"published";
+  const rows=[
+    [{text:nextStatus==="published"?"نشر المحتوى":"إخفاء المحتوى",callback_data:`cs|${type}|${item.public_id}|${nextStatus}`}],
+    [{text:item.is_featured?"إلغاء التمييز":"تمييز في الرئيسية",callback_data:`cf|${type}|${item.public_id}|${item.is_featured?"0":"1"}`}],
+    [{text:"حذف",callback_data:`cd1|${type}|${item.public_id}`}],
+    [{text:"رجوع",callback_data:"content"}],
+  ];
+  return send(chatId,
+    `${item.public_id}\n${item.title}\n\nالحالة: ${item.status}\nمميز: ${item.is_featured?"نعم":"لا"}\nالمشاهدات: ${item.view_count||0}`,
+    {inline_keyboard:rows}
+  );
+}
+
+async function deleteContent(adminId:number,type:string,publicId:string){
+  const item:any=await contentByPublicId(type,publicId);
+  if(!item)throw new Error("المحتوى غير موجود");
+  const places:any[]=[];
+
+  if(type==="movie"){
+    const {data:assets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","movie").eq("entity_id",item.id);
+    places.push(...(assets??[]).map((x:any)=>({channel_id:x.channel_id,message_id:x.channel_message_id})));
+    for(const p of places)await deleteCopiedMessage(p);
+    await db.from("media_assets").delete().eq("entity_type","movie").eq("entity_id",item.id);
+    const {error}=await db.from("movies").delete().eq("id",item.id);if(error)throw error;
+  }else{
+    const {data:seasons}=await db.from("seasons").select("id").eq("series_id",item.id);
+    const seasonIds=(seasons??[]).map((x:any)=>x.id);
+    let episodeIds:string[]=[];
+    if(seasonIds.length){
+      const {data:eps}=await db.from("episodes").select("id").in("season_id",seasonIds);
+      episodeIds=(eps??[]).map((x:any)=>x.id);
+    }
+    const {data:seriesAssets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","series").eq("entity_id",item.id);
+    places.push(...(seriesAssets??[]).map((x:any)=>({channel_id:x.channel_id,message_id:x.channel_message_id})));
+    if(episodeIds.length){
+      const {data:episodeAssets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","episode").in("entity_id",episodeIds);
+      places.push(...(episodeAssets??[]).map((x:any)=>({channel_id:x.channel_id,message_id:x.channel_message_id})));
+      await db.from("media_assets").delete().eq("entity_type","episode").in("entity_id",episodeIds);
+    }
+    for(const p of places)await deleteCopiedMessage(p);
+    await db.from("media_assets").delete().eq("entity_type","series").eq("entity_id",item.id);
+    const {error}=await db.from("series").delete().eq("id",item.id);if(error)throw error;
+  }
+  await adminLog(adminId,"content_delete",type,item.id,item.public_id,{title:item.title});
+}
+
+async function sendRequestsManager(chatId:number){
+  const {data}=await db.from("content_requests").select("request_code,request_type,title,status")
+    .order("created_at",{ascending:false}).limit(6);
+  const rows:any[]=[];
+  for(const x of data??[]){
+    if(!["added","rejected","duplicate"].includes(x.status)){
+      rows.push([
+        {text:`مراجعة ${x.request_code}`,callback_data:`rq|${x.request_code}|reviewing`},
+        {text:"تمت الإضافة",callback_data:`rq|${x.request_code}|added`},
+        {text:"رفض",callback_data:`rq|${x.request_code}|rejected`},
+      ]);
+    }
+  }
+  rows.push([{text:"رجوع للقائمة",callback_data:"menu"}]);
+  return send(chatId,
+    "طلبات المستخدمين:\n"+((data??[]).map((x:any)=>`• ${x.request_code} | ${x.title} | ${x.status}`).join("\n")||"لا توجد طلبات"),
+    {inline_keyboard:rows}
+  );
+}
+
+async function sendReportsManager(chatId:number){
+  const {data}=await db.from("reports").select("report_code,entity_public_id,reason,status")
+    .order("created_at",{ascending:false}).limit(6);
+  const rows:any[]=[];
+  for(const x of data??[]){
+    if(!["resolved","rejected"].includes(x.status)){
+      rows.push([
+        {text:`مراجعة ${x.report_code}`,callback_data:`rp|${x.report_code}|reviewing`},
+        {text:"تم الحل",callback_data:`rp|${x.report_code}|resolved`},
+        {text:"رفض",callback_data:`rp|${x.report_code}|rejected`},
+      ]);
+    }
+  }
+  rows.push([{text:"رجوع للقائمة",callback_data:"menu"}]);
+  return send(chatId,
+    "البلاغات:\n"+((data??[]).map((x:any)=>`• ${x.report_code} | ${x.entity_public_id||"—"} | ${x.reason} | ${x.status}`).join("\n")||"لا توجد بلاغات"),
+    {inline_keyboard:rows}
+  );
+}
+
+async function systemStatusText(){
+  const [mp,md,sp,ep,rq,rp,lastError]=await Promise.all([
+    db.from("movies").select("id",{head:true,count:"exact"}).eq("status","published"),
+    db.from("movies").select("id",{head:true,count:"exact"}).eq("status","draft"),
+    db.from("series").select("id",{head:true,count:"exact"}).eq("status","published"),
+    db.from("episodes").select("id",{head:true,count:"exact"}).eq("status","published"),
+    db.from("content_requests").select("id",{head:true,count:"exact"}).eq("status","new"),
+    db.from("reports").select("id",{head:true,count:"exact"}).eq("status","new"),
+    db.from("system_logs").select("message,created_at").eq("level","error").order("created_at",{ascending:false}).limit(1),
+  ]);
+  let gateway="غير متصل",telegram="غير معروف";
+  try{
+    const base=await streamGateway();
+    if(base){
+      const controller=new AbortController();
+      const timer=setTimeout(()=>controller.abort(),6000);
+      try{
+        const res=await fetch(base+"/health",{signal:controller.signal});
+        const j=await res.json().catch(()=>null);
+        gateway=res.ok&&j?.ok?"يعمل":`HTTP ${res.status}`;
+        telegram=j?.ok?"متصل":"غير متصل";
+      }finally{clearTimeout(timer)}
+    }
+  }catch{gateway="غير متصل"}
+  const le=(lastError.data??[])[0];
+  return [
+    "حالة VAYZEN",
+    "",
+    `البوت: ${BOT_TOKEN?"مهيأ":"غير مهيأ"}`,
+    `بوابة البث: ${gateway}`,
+    `Telegram Streaming: ${telegram}`,
+    `أفلام منشورة: ${mp.count||0}`,
+    `مسودات أفلام: ${md.count||0}`,
+    `مسلسلات منشورة: ${sp.count||0}`,
+    `حلقات منشورة: ${ep.count||0}`,
+    `طلبات جديدة: ${rq.count||0}`,
+    `بلاغات جديدة: ${rp.count||0}`,
+    "",
+    `آخر خطأ: ${le?.message?String(le.message).slice(0,140):"لا يوجد"}`,
+  ].join("\n");
+}
+
 async function callback(q:any){
   const userId=Number(q.from?.id||0);
-  const admin=await getAdmin(userId);
-  if(!admin){
-    await tg("answerCallbackQuery",{callback_query_id:q.id,text:"غير مصرح"});
-    return;
-  }
-  await tg("answerCallbackQuery",{callback_query_id:q.id});
   const chatId=Number(q.message?.chat?.id||userId);
   const a=String(q.data||"");
 
+  // Acknowledge immediately. Telegram callback IDs expire quickly and database work
+  // must never delay this response.
+  try{await tg("answerCallbackQuery",{callback_query_id:q.id});}catch{}
+
+  const admin=await getAdmin(userId);
+  if(!admin)return send(chatId,"غير مصرح لك باستخدام لوحة الإدارة.");
+
+  if(a==="menu")return showMenu(chatId);
   if(a==="cancel"){
     await clearSession(userId);
     return showMenu(chatId,"تم إلغاء العملية.");
@@ -376,57 +544,126 @@ async function callback(q:any){
     return send(chatId,"أرسل Series ID، مثال: SER-000001");
   }
   if(a==="confirm_movie"){
-    const s=await getSession(userId);
-    if(!s||s.flow!=="movie"||s.step!=="confirm") return showMenu(chatId,"انتهت جلسة الفيلم.");
-    const id=await publishMovie(userId,chatId,s.draft);
-    await clearSession(userId);
-    return showMenu(chatId,`تم نشر الفيلم بنجاح.\nMovie ID: ${id}`);
+    const session=await getSession(userId);
+    if(!session||session.flow!=="movie"||session.step!=="confirm") return showMenu(chatId,"انتهت جلسة الفيلم.");
+    try{
+      const id=await publishMovie(userId,chatId,session.draft);
+      await clearSession(userId);
+      return showMenu(chatId,`تم نشر الفيلم بنجاح.\nMovie ID: ${id}`);
+    }catch(err){
+      return send(chatId,`فشل نشر الفيلم.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"إعادة المحاولة",callback_data:"confirm_movie"},{text:"إلغاء",callback_data:"cancel"}]]});
+    }
   }
   if(a==="confirm_series"){
-    const s=await getSession(userId);
-    if(!s||s.flow!=="series"||s.step!=="confirm") return showMenu(chatId,"انتهت جلسة المسلسل.");
-    const id=await publishSeries(userId,chatId,s.draft);
-    await clearSession(userId);
-    return showMenu(chatId,`تم نشر المسلسل بنجاح.\nSeries ID: ${id}`);
+    const session=await getSession(userId);
+    if(!session||session.flow!=="series"||session.step!=="confirm") return showMenu(chatId,"انتهت جلسة المسلسل.");
+    try{
+      const id=await publishSeries(userId,chatId,session.draft);
+      await clearSession(userId);
+      return showMenu(chatId,`تم نشر المسلسل بنجاح.\nSeries ID: ${id}`);
+    }catch(err){
+      return send(chatId,`فشل نشر المسلسل.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"إعادة المحاولة",callback_data:"confirm_series"},{text:"إلغاء",callback_data:"cancel"}]]});
+    }
   }
   if(a==="confirm_episode"){
-    const s=await getSession(userId);
-    if(!s||s.flow!=="episode"||s.step!=="confirm") return showMenu(chatId,"انتهت جلسة الحلقة.");
-    const id=await publishEpisode(userId,chatId,s.draft);
-    await clearSession(userId);
-    return showMenu(chatId,`تم نشر الحلقة بنجاح.\nEpisode ID: ${id}`);
+    const session=await getSession(userId);
+    if(!session||session.flow!=="episode"||session.step!=="confirm") return showMenu(chatId,"انتهت جلسة الحلقة.");
+    try{
+      const id=await publishEpisode(userId,chatId,session.draft);
+      await clearSession(userId);
+      return showMenu(chatId,`تم نشر الحلقة بنجاح.\nEpisode ID: ${id}`);
+    }catch(err){
+      return send(chatId,`فشل نشر الحلقة.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"إعادة المحاولة",callback_data:"confirm_episode"},{text:"إلغاء",callback_data:"cancel"}]]});
+    }
   }
+
   if(a==="content"){
-    const [{data:m},{data:s}]=await Promise.all([
-      db.from("movies").select("public_id,title").order("created_at",{ascending:false}).limit(8),
-      db.from("series").select("public_id,title").order("created_at",{ascending:false}).limit(8),
-    ]);
-    return showMenu(chatId,
-      "آخر الأفلام:\n"+((m??[]).map((x:any)=>`• ${x.public_id} | ${x.title}`).join("\n")||"—")+
-      "\n\nآخر المسلسلات:\n"+((s??[]).map((x:any)=>`• ${x.public_id} | ${x.title}`).join("\n")||"—")
-    );
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    return sendContentManager(chatId);
   }
+  if(a.startsWith("cm|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,type,id]=a.split("|");return sendContentItem(chatId,type,id);
+  }
+  if(a.startsWith("cs|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,type,id,status]=a.split("|");
+    if(!["published","hidden"].includes(status))return sendContentItem(chatId,type,id);
+    const item:any=await contentByPublicId(type,id);if(!item)return sendContentManager(chatId);
+    const table=type==="movie"?"movies":"series";
+    const {error}=await db.from(table).update({status,updated_at:new Date().toISOString()}).eq("id",item.id);
+    if(error)throw error;
+    await adminLog(userId,"content_status",type,item.id,item.public_id,{status});
+    return sendContentItem(chatId,type,id);
+  }
+  if(a.startsWith("cf|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,type,id,value]=a.split("|");
+    const item:any=await contentByPublicId(type,id);if(!item)return sendContentManager(chatId);
+    const table=type==="movie"?"movies":"series";
+    const featured=value==="1";
+    const {error}=await db.from(table).update({is_featured:featured,updated_at:new Date().toISOString()}).eq("id",item.id);
+    if(error)throw error;
+    await adminLog(userId,"content_feature",type,item.id,item.public_id,{featured});
+    return sendContentItem(chatId,type,id);
+  }
+  if(a.startsWith("cd1|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,type,id]=a.split("|");
+    return send(chatId,`تأكيد حذف ${id}؟ الحذف يزيله من التطبيق ومن تخزين البوت قدر الإمكان.`,{inline_keyboard:[
+      [{text:"تأكيد الحذف",callback_data:`cd2|${type}|${id}`}],
+      [{text:"تراجع",callback_data:`cm|${type}|${id}`}],
+    ]});
+  }
+  if(a.startsWith("cd2|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,type,id]=a.split("|");
+    await deleteContent(userId,type,id);
+    return sendContentManager(chatId);
+  }
+
   if(a==="stats"){
-    const [m,s,e,r,p]=await Promise.all([
+    const [m,s,e,r,p,u]=await Promise.all([
       db.from("movies").select("id",{head:true,count:"exact"}),
       db.from("series").select("id",{head:true,count:"exact"}),
       db.from("episodes").select("id",{head:true,count:"exact"}),
       db.from("content_requests").select("id",{head:true,count:"exact"}).eq("status","new"),
       db.from("reports").select("id",{head:true,count:"exact"}).eq("status","new"),
+      db.from("profiles").select("id",{head:true,count:"exact"}),
     ]);
-    return showMenu(chatId,`إحصائيات VAYZEN\n\nالأفلام: ${m.count||0}\nالمسلسلات: ${s.count||0}\nالحلقات: ${e.count||0}\nطلبات جديدة: ${r.count||0}\nبلاغات جديدة: ${p.count||0}`);
+    return showMenu(chatId,`إحصائيات VAYZEN\n\nالأفلام: ${m.count||0}\nالمسلسلات: ${s.count||0}\nالحلقات: ${e.count||0}\nالمستخدمون: ${u.count||0}\nطلبات جديدة: ${r.count||0}\nبلاغات جديدة: ${p.count||0}`);
   }
+  if(a==="system_status"){
+    if(!can(admin,"logs")&&admin.role!=="owner"&&admin.role!=="secondary_admin")return send(chatId,"لا تملك صلاحية مراقبة النظام.");
+    return showMenu(chatId,await systemStatusText());
+  }
+
   if(a==="requests"){
     if(!can(admin,"requests")) return send(chatId,"لا تملك صلاحية الطلبات.");
-    const {data}=await db.from("content_requests").select("request_code,request_type,title,status")
-      .order("created_at",{ascending:false}).limit(12);
-    return showMenu(chatId,"الطلبات:\n"+((data??[]).map((x:any)=>`• ${x.request_code} | ${x.title} | ${x.status}`).join("\n")||"لا توجد طلبات"));
+    return sendRequestsManager(chatId);
   }
+  if(a.startsWith("rq|")){
+    if(!can(admin,"requests"))return send(chatId,"لا تملك صلاحية الطلبات.");
+    const [,code,status]=a.split("|");
+    if(!["reviewing","added","rejected"].includes(status))return sendRequestsManager(chatId);
+    const {error}=await db.from("content_requests").update({status,handled_by:userId,updated_at:new Date().toISOString()}).eq("request_code",code);
+    if(error)throw error;
+    await adminLog(userId,"request_status","request",undefined,code,{status});
+    return sendRequestsManager(chatId);
+  }
+
   if(a==="reports"){
     if(!can(admin,"reports")) return send(chatId,"لا تملك صلاحية البلاغات.");
-    const {data}=await db.from("reports").select("report_code,entity_public_id,reason,status")
-      .order("created_at",{ascending:false}).limit(12);
-    return showMenu(chatId,"البلاغات:\n"+((data??[]).map((x:any)=>`• ${x.report_code} | ${x.entity_public_id||"—"} | ${x.reason} | ${x.status}`).join("\n")||"لا توجد بلاغات"));
+    return sendReportsManager(chatId);
+  }
+  if(a.startsWith("rp|")){
+    if(!can(admin,"reports"))return send(chatId,"لا تملك صلاحية البلاغات.");
+    const [,code,status]=a.split("|");
+    if(!["reviewing","resolved","rejected"].includes(status))return sendReportsManager(chatId);
+    const {error}=await db.from("reports").update({status,handled_by:userId,updated_at:new Date().toISOString()}).eq("report_code",code);
+    if(error)throw error;
+    await adminLog(userId,"report_status","report",undefined,code,{status});
+    return sendReportsManager(chatId);
   }
   return showMenu(chatId);
 }
