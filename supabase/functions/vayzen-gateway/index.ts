@@ -1835,6 +1835,302 @@ async function systemStatusText(){
 }
 
 
+async function healthIssue(runId:string,severity:"warning"|"error"|"critical",parts:string[],data:any){
+  const fingerprint=await sha256Text(parts.join("|"));
+  const now=new Date().toISOString();
+  const {error}=await db.from("media_health_issues").upsert({
+    fingerprint,run_id:runId,severity,status:"open",
+    entity_type:data.entity_type??null,entity_id:data.entity_id??null,entity_public_id:data.entity_public_id??null,
+    kind:data.kind??null,variant:data.variant??null,message:data.message,details:data.details??{},
+    last_seen_at:now,resolved_at:null
+  },{onConflict:"fingerprint"});
+  if(error)throw error;
+  return fingerprint;
+}
+
+async function resolveHealthFingerprint(fingerprint:string){
+  await db.from("media_health_issues").update({
+    status:"resolved",resolved_at:new Date().toISOString(),last_seen_at:new Date().toISOString()
+  }).eq("fingerprint",fingerprint).eq("status","open");
+}
+
+async function probeVideoAsset(a:any){
+  const gatewayBase=await streamGateway();
+  const signingSecret=await streamSigningSecret();
+  if(!gatewayBase||!signingSecret)throw new Error("Streaming gateway not configured");
+  const exp=Math.floor(Date.now()/1000)+60;
+  const payload=`${a.channel_id}:${a.channel_message_id}:${exp}`;
+  const sig=await hmacHex(payload,signingSecret);
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),8000);
+  try{
+    const r=await fetch(`${gatewayBase}/stream/${a.channel_id}/${a.channel_message_id}?exp=${exp}&sig=${sig}`,{
+      method:"HEAD",headers:{Range:"bytes=0-0"},signal:controller.signal
+    });
+    if(!r.ok&&r.status!==206)throw new Error(`HTTP ${r.status}`);
+    return true;
+  }finally{clearTimeout(timer)}
+}
+
+async function runMediaHealthCheck(adminId:number){
+  const {data:run,error:runError}=await db.from("media_health_runs").insert({
+    status:"running",started_by:adminId
+  }).select("id").single();
+  if(runError||!run)throw runError??new Error("تعذر بدء فحص الوسائط");
+
+  let checked=0,healthy=0,warnings=0,broken=0;
+  try{
+    const {data:assets,error}=await db.from("media_assets")
+      .select("id,entity_type,entity_id,kind,variant,channel_id,channel_message_id,telegram_file_id,file_size,mime_type,updated_at")
+      .order("updated_at",{ascending:false}).limit(120);
+    if(error)throw error;
+    const rows:any[]=assets??[];
+
+    const entityMaps:any={movie:new Map(),series:new Map(),episode:new Map()};
+    for(const type of ["movie","series","episode"]){
+      const ids=[...new Set(rows.filter((x:any)=>x.entity_type===type).map((x:any)=>x.entity_id))];
+      if(!ids.length)continue;
+      const table=type==="movie"?"movies":type==="series"?"series":"episodes";
+      const {data}=await db.from(table).select("id,public_id,status,deleted_at").in("id",ids);
+      for(const x of data??[])entityMaps[type].set(x.id,x);
+    }
+
+    let networkBudget=24;
+    for(const a of rows){
+      checked++;
+      const entity=entityMaps[a.entity_type]?.get(a.entity_id);
+      const base=[a.entity_type,a.entity_id,a.kind,String(a.variant||"default")];
+      const issueTypes=["orphan","missing_size","missing_file","stream_probe"];
+      const fingerprints:any={};
+      for(const t of issueTypes)fingerprints[t]=await sha256Text([...base,t].join("|"));
+      const seen=new Set<string>();
+
+      if(!entity){
+        await healthIssue(run.id,"critical",[...base,"orphan"],{
+          entity_type:a.entity_type,entity_id:a.entity_id,kind:a.kind,variant:a.variant,
+          message:"Media asset مرتبط بمحتوى غير موجود",details:{asset_id:a.id}
+        });seen.add("orphan");broken++;
+      }else if(entity.deleted_at){
+        healthy++;
+      }else{
+        let localIssue=false;
+        if(a.kind==="video"&&(!a.file_size||Number(a.file_size)<=0)){
+          await healthIssue(run.id,"warning",[...base,"missing_size"],{
+            entity_type:a.entity_type,entity_id:a.entity_id,entity_public_id:entity.public_id,kind:a.kind,variant:a.variant,
+            message:"حجم ملف الفيديو غير معروف",details:{asset_id:a.id}
+          });seen.add("missing_size");warnings++;localIssue=true;
+        }
+        if(a.kind!=="video"&&!a.telegram_file_id){
+          await healthIssue(run.id,"warning",[...base,"missing_file"],{
+            entity_type:a.entity_type,entity_id:a.entity_id,entity_public_id:entity.public_id,kind:a.kind,variant:a.variant,
+            message:"Telegram file_id مفقود",details:{asset_id:a.id}
+          });seen.add("missing_file");warnings++;localIssue=true;
+        }
+        if(a.kind==="video"&&networkBudget>0){
+          networkBudget--;
+          try{await probeVideoAsset(a)}
+          catch(err){
+            await healthIssue(run.id,"error",[...base,"stream_probe"],{
+              entity_type:a.entity_type,entity_id:a.entity_id,entity_public_id:entity.public_id,kind:a.kind,variant:a.variant,
+              message:"فشل الوصول إلى فيديو Telegram عبر Gateway",
+              details:{asset_id:a.id,error:adminErrorText(err)}
+            });seen.add("stream_probe");broken++;localIssue=true;
+          }
+        }
+        if(!localIssue)healthy++;
+      }
+      for(const t of issueTypes)if(!seen.has(t))await resolveHealthFingerprint(fingerprints[t]);
+    }
+
+    for(const [table,type] of [["movies","movie"],["episodes","episode"]] as const){
+      const {data:published}=await db.from(table).select("id,public_id").eq("status","published").is("deleted_at",null).limit(150);
+      for(const item of published??[]){
+        const {count}=await db.from("media_assets").select("id",{head:true,count:"exact"}).eq("entity_type",type).eq("entity_id",item.id).eq("kind","video");
+        const fp=await sha256Text([type,item.id,"published_without_video"].join("|"));
+        if(!count){
+          await healthIssue(run.id,"critical",[type,item.id,"published_without_video"],{
+            entity_type:type,entity_id:item.id,entity_public_id:item.public_id,kind:"video",variant:null,
+            message:"محتوى منشور بدون ملف فيديو",details:{}
+          });broken++;
+        }else await resolveHealthFingerprint(fp);
+      }
+    }
+
+    const status=broken>0?"partial":"completed";
+    await db.from("media_health_runs").update({
+      status,checked_assets:checked,healthy_assets:healthy,warning_assets:warnings,broken_assets:broken,
+      completed_at:new Date().toISOString(),details:{network_probes:Math.min(24,checked)}
+    }).eq("id",run.id);
+    await adminLog(adminId,"media_health_check","system",undefined,undefined,{run_id:run.id,checked,healthy,warnings,broken});
+    return {id:run.id,status,checked,healthy,warnings,broken};
+  }catch(err){
+    await db.from("media_health_runs").update({
+      status:"failed",completed_at:new Date().toISOString(),details:{error:adminErrorText(err)}
+    }).eq("id",run.id);
+    throw err;
+  }
+}
+
+async function sendMediaHealthManager(chatId:number){
+  const [run,issues]=await Promise.all([
+    db.from("media_health_runs").select("id,status,checked_assets,healthy_assets,warning_assets,broken_assets,completed_at").order("started_at",{ascending:false}).limit(1),
+    db.from("media_health_issues").select("severity,entity_public_id,kind,variant,message,last_seen_at").eq("status","open").order("last_seen_at",{ascending:false}).limit(8)
+  ]);
+  const last:any=(run.data??[])[0];
+  const lines=(issues.data??[]).map((x:any)=>`• ${x.severity.toUpperCase()} • ${x.entity_public_id||"—"} • ${x.kind||"—"} • ${x.message}`).join("\n");
+  return send(chatId,`فحص مكتبة الوسائط\n\nآخر فحص: ${last?.completed_at||"لم يُنفذ"}\nتم فحصه: ${last?.checked_assets||0}\nسليم: ${last?.healthy_assets||0}\nتحذير: ${last?.warning_assets||0}\nمشاكل: ${last?.broken_assets||0}\n\nالمشاكل المفتوحة:\n${lines||"لا توجد مشاكل مفتوحة."}`,{
+    inline_keyboard:[
+      [{text:"بدء فحص جديد",callback_data:"health_run"}],
+      [{text:"رجوع",callback_data:"menu"}]
+    ]
+  });
+}
+
+async function upsertOperationalCondition(fingerprint:string,active:boolean,severity:"info"|"warning"|"error"|"critical",source:string,title:string,message:string,details:any={}){
+  const {data:existing}=await db.from("operational_alerts").select("id,status,notified_at").eq("fingerprint",fingerprint).maybeSingle();
+  if(!active){
+    if(existing?.status==="open")await db.from("operational_alerts").update({status:"resolved",resolved_at:new Date().toISOString(),last_seen_at:new Date().toISOString()}).eq("id",existing.id);
+    return;
+  }
+  const now=new Date().toISOString();
+  const shouldNotify=!existing||existing.status!=="open"||!existing.notified_at||Date.now()-Date.parse(existing.notified_at)>60*60_000;
+  const {data:row,error}=await db.from("operational_alerts").upsert({
+    fingerprint,severity,status:"open",source,title,message,details,last_seen_at:now,resolved_at:null,
+    ...(shouldNotify?{notified_at:now}:{})
+  },{onConflict:"fingerprint"}).select("id").single();
+  if(error)throw error;
+  if(shouldNotify){
+    const {data:owner}=await db.from("admin_users").select("telegram_user_id").eq("role","owner").eq("is_active",true).maybeSingle();
+    if(owner?.telegram_user_id){
+      try{await tg("sendMessage",{chat_id:Number(owner.telegram_user_id),text:`VAYZEN ALERT • ${severity.toUpperCase()}\n\n${title}\n${message}`})}catch{}
+    }
+  }
+  return row;
+}
+
+async function runOperationalCheck(){
+  let gatewayOk=false,gatewayDetail="غير متصل";
+  try{
+    const base=await streamGateway();
+    const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),6000);
+    try{
+      const r=await fetch(base+"/health",{signal:controller.signal});
+      const j=await r.json().catch(()=>null);
+      gatewayOk=Boolean(r.ok&&j?.ok);
+      gatewayDetail=gatewayOk?`active=${Number(j?.active_streams||0)}`:`HTTP ${r.status}`;
+    }finally{clearTimeout(timer)}
+  }catch(err){gatewayDetail=adminErrorText(err)}
+
+  const staleCutoff=new Date(Date.now()-5*60_000).toISOString();
+  const [failedJobs,staleJobs,criticalHealth,ownerCount]=await Promise.all([
+    db.from("media_transfer_jobs").select("id",{head:true,count:"exact"}).eq("status","failed"),
+    db.from("media_transfer_jobs").select("id",{head:true,count:"exact"}).eq("status","processing").lt("updated_at",staleCutoff),
+    db.from("media_health_issues").select("id",{head:true,count:"exact"}).eq("status","open").eq("severity","critical"),
+    db.from("admin_users").select("telegram_user_id",{head:true,count:"exact"}).eq("role","owner").eq("is_active",true)
+  ]);
+
+  await Promise.all([
+    upsertOperationalCondition("gateway_down",!gatewayOk,"critical","gateway","بوابة البث غير متاحة",gatewayDetail),
+    upsertOperationalCondition("failed_media_jobs",Number(failedJobs.count||0)>0,"error","media_jobs","عمليات وسائط فاشلة",`عدد العمليات الفاشلة: ${failedJobs.count||0}`,{count:failedJobs.count||0}),
+    upsertOperationalCondition("stale_media_jobs",Number(staleJobs.count||0)>0,"warning","media_jobs","عمليات وسائط معلقة",`عمليات processing أقدم من 5 دقائق: ${staleJobs.count||0}`,{count:staleJobs.count||0}),
+    upsertOperationalCondition("critical_media_health",Number(criticalHealth.count||0)>0,"critical","media_health","مشاكل حرجة في مكتبة الوسائط",`المشاكل الحرجة المفتوحة: ${criticalHealth.count||0}`,{count:criticalHealth.count||0}),
+    upsertOperationalCondition("owner_missing",Number(ownerCount.count||0)!==1,"critical","security","حساب المالك غير سليم",`عدد حسابات Owner الفعالة: ${ownerCount.count||0}`)
+  ]);
+  return {gateway_ok:gatewayOk,failed_jobs:failedJobs.count||0,stale_jobs:staleJobs.count||0,critical_health:criticalHealth.count||0};
+}
+
+async function maybeOperationalCheck(){
+  try{
+    const {data}=await db.from("app_settings").select("value").eq("key","monitor_runtime").maybeSingle();
+    const last=Date.parse(String((data as any)?.value?.last_checked_at||""));
+    if(Number.isFinite(last)&&Date.now()-last<5*60_000)return;
+    await db.from("app_settings").upsert({key:"monitor_runtime",value:{last_checked_at:new Date().toISOString()},updated_at:new Date().toISOString()});
+    await runOperationalCheck();
+  }catch{}
+}
+
+async function sendAlertsManager(chatId:number){
+  const {data}=await db.from("operational_alerts").select("severity,source,title,message,last_seen_at").eq("status","open").order("last_seen_at",{ascending:false}).limit(10);
+  const lines=(data??[]).map((x:any)=>`• ${x.severity.toUpperCase()} • ${x.title}\n  ${x.message}`).join("\n");
+  return send(chatId,`تنبيهات التشغيل\n\n${lines||"لا توجد تنبيهات مفتوحة."}`,{inline_keyboard:[
+    [{text:"فحص الآن",callback_data:"ops_run"},{text:"فحص الوسائط",callback_data:"health"}],
+    [{text:"رجوع",callback_data:"menu"}]
+  ]});
+}
+
+async function tgUploadDocument(chatId:number|string,bytes:Uint8Array,fileName:string,caption:string){
+  const form=new FormData();
+  form.append("chat_id",String(chatId));
+  form.append("caption",caption.slice(0,1000));
+  form.append("document",new Blob([bytes],{type:"application/json"}),fileName);
+  const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`,{method:"POST",body:form});
+  const j=await r.json().catch(()=>null);
+  if(!r.ok||!j?.ok)throw new Error(String(j?.description||`Telegram HTTP ${r.status}`));
+  return j.result;
+}
+
+async function createMetadataBackup(adminId:number,chatId:number){
+  const now=new Date();
+  const code=`BKP-${now.toISOString().replace(/[-:TZ.]/g,"").slice(0,14)}`;
+  const {data:snapshot,error:snapshotError}=await db.from("backup_snapshots").insert({
+    backup_code:code,status:"creating",scope:"metadata",created_by:adminId
+  }).select("id").single();
+  if(snapshotError||!snapshot)throw snapshotError??new Error("تعذر إنشاء سجل النسخة الاحتياطية");
+
+  try{
+    const [movies,series,seasons,episodes,assets,subs,channels,admins,settings]=await Promise.all([
+      db.from("movies").select("*").limit(10000),
+      db.from("series").select("*").limit(10000),
+      db.from("seasons").select("*").limit(10000),
+      db.from("episodes").select("*").limit(20000),
+      db.from("media_assets").select("*").limit(30000),
+      db.from("subtitle_tracks").select("*").limit(10000),
+      db.from("telegram_channels").select("channel_key,telegram_channel_id,title,purpose,is_active,created_at,updated_at"),
+      db.from("admin_users").select("telegram_user_id,display_name,role,permissions,is_active,added_by,created_at,updated_at"),
+      db.from("app_settings").select("key,value,updated_at").in("key",["app","features","limits","media_pipeline","stream_gateway","release"])
+    ]);
+    const all=[movies,series,seasons,episodes,assets,subs,channels,admins,settings];
+    const err=all.find((x:any)=>x.error)?.error;if(err)throw err;
+    const payload={
+      format:"vayzen-metadata-backup-v1",backup_code:code,created_at:now.toISOString(),release:"1.0.0",
+      movies:movies.data??[],series:series.data??[],seasons:seasons.data??[],episodes:episodes.data??[],
+      media_assets:assets.data??[],subtitle_tracks:subs.data??[],telegram_channels:channels.data??[],
+      admin_users:admins.data??[],app_settings:settings.data??[]
+    };
+    const jsonText=JSON.stringify(payload,null,2);
+    const bytes=new TextEncoder().encode(jsonText);
+    const checksum=await sha256Text(jsonText);
+    const rowCounts={
+      movies:(movies.data??[]).length,series:(series.data??[]).length,seasons:(seasons.data??[]).length,
+      episodes:(episodes.data??[]).length,media_assets:(assets.data??[]).length,subtitle_tracks:(subs.data??[]).length
+    };
+    const msg=await tgUploadDocument(chatId,bytes,`vayzen-${code}.json`,`VAYZEN Metadata Backup\n${code}\nSHA256: ${checksum.slice(0,16)}…`);
+    try{
+      const ch=await channel("admin_logs");
+      if(Number(ch.telegram_channel_id)!==Number(chatId))await tgUploadDocument(Number(ch.telegram_channel_id),bytes,`vayzen-${code}.json`,`VAYZEN Backup • ${code}`);
+    }catch{}
+    await db.from("backup_snapshots").update({
+      status:"completed",row_counts:rowCounts,checksum,
+      telegram_channel_id:Number(chatId),telegram_message_id:Number(msg.message_id),
+      completed_at:new Date().toISOString()
+    }).eq("id",snapshot.id);
+    await adminLog(adminId,"backup_export","system",undefined,code,{row_counts:rowCounts,checksum});
+    return {code,rowCounts,checksum,size:bytes.length};
+  }catch(err){
+    await db.from("backup_snapshots").update({status:"failed",error:adminErrorText(err),completed_at:new Date().toISOString()}).eq("id",snapshot.id);
+    throw err;
+  }
+}
+
+async function sendBackupManager(chatId:number){
+  const {data}=await db.from("backup_snapshots").select("backup_code,status,row_counts,created_at,completed_at,error").order("created_at",{ascending:false}).limit(6);
+  const lines=(data??[]).map((x:any)=>`• ${x.backup_code} • ${x.status} • ${x.completed_at||x.created_at}`).join("\n");
+  return send(chatId,`النسخ الاحتياطية للبيانات\n\n${lines||"لا توجد نسخ بعد."}\n\nالنسخة تستبعد كلمات المرور والتوكنات والأسرار.`,{inline_keyboard:[
+    [{text:"إنشاء Backup الآن",callback_data:"backup_create"}],
+    [{text:"رجوع",callback_data:"menu"}]
+  ]});
+}
+
 async function sendTmdbSettings(chatId:number){
   const status=await tmdbStatus();
   const state=status.configured?"متصل":"غير مربوط";
