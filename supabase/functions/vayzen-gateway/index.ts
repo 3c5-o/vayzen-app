@@ -1090,6 +1090,106 @@ async function publishBatchEpisodes(userId:number,chatId:number,d:any){
   return results;
 }
 
+
+async function tmdbImportSeriesStructure(adminId:number,seriesPublicId:string,tmdbId:number){
+  const series:any=await contentByPublicId("series",seriesPublicId);
+  if(!series)throw new Error("المسلسل غير موجود.");
+  const root:any=await tmdbApi(`/tv/${tmdbId}`,{language:"ar-SA"});
+  const seasons=(Array.isArray(root.seasons)?root.seasons:[])
+    .filter((x:any)=>Number(x.season_number)>0)
+    .sort((a:any,b:any)=>Number(a.season_number)-Number(b.season_number))
+    .slice(0,60);
+
+  let seasonsAdded=0,seasonsUpdated=0,episodesAdded=0,episodesUpdated=0;
+  const failed:number[]=[];
+
+  for(let offset=0;offset<seasons.length;offset+=3){
+    const chunk=seasons.slice(offset,offset+3);
+    const bundles=await Promise.all(chunk.map(async (summary:any)=>{
+      const n=Number(summary.season_number);
+      try{
+        const [ar,en]=await Promise.all([
+          tmdbApi(`/tv/${tmdbId}/season/${n}`,{language:"ar-SA",append_to_response:"images,translations",include_image_language:"ar,en,null"}),
+          tmdbApi(`/tv/${tmdbId}/season/${n}`,{language:"en-US"}),
+        ]);
+        return {n,ar,en,error:null};
+      }catch(error){return {n,ar:null,en:null,error};}
+    }));
+
+    for(const b of bundles){
+      if(b.error||!b.ar){failed.push(b.n);continue;}
+      const ar:any=b.ar,en:any=b.en||{};
+      const seasonTitle=String(ar.name||en.name||`الموسم ${b.n}`).trim();
+      const seasonAir=safeIsoDate(ar.air_date||en.air_date);
+      const {data:existingSeason}=await db.from("seasons")
+        .select("id,status,title,external_source")
+        .eq("series_id",series.id).eq("season_number",b.n).maybeSingle();
+
+      let season:any=existingSeason;
+      if(existingSeason){
+        const patch:any={
+          external_source:"tmdb",external_id:Number(ar.id||en.id)||null,
+          external_metadata:{primary:ar,fallback:en},air_date:seasonAir,updated_at:new Date().toISOString()
+        };
+        if(existingSeason.external_source==="tmdb"||!existingSeason.title||existingSeason.title===`الموسم ${b.n}`)patch.title=seasonTitle;
+        const {data:updated,error}=await db.from("seasons").update(patch).eq("id",existingSeason.id).select("id,status,title,external_source").single();
+        if(error)throw error;season=updated;seasonsUpdated++;
+      }else{
+        const {data:created,error}=await db.from("seasons").insert({
+          series_id:series.id,season_number:b.n,title:seasonTitle,status:"draft",
+          external_source:"tmdb",external_id:Number(ar.id||en.id)||null,
+          external_metadata:{primary:ar,fallback:en},air_date:seasonAir
+        }).select("id,status,title,external_source").single();
+        if(error||!created)throw error??new Error("Season import failed");
+        season=created;seasonsAdded++;
+      }
+
+      const arEpisodes=Array.isArray(ar.episodes)?ar.episodes:[];
+      const enMap=new Map<number,any>((Array.isArray(en.episodes)?en.episodes:[]).map((x:any)=>[Number(x.episode_number),x]));
+      const {data:existingEpisodes}=await db.from("episodes")
+        .select("id,episode_number,title,description,duration_minutes,external_source")
+        .eq("season_id",season.id);
+      const existingMap=new Map<number,any>((existingEpisodes??[]).map((x:any)=>[Number(x.episode_number),x]));
+
+      for(const epAr of arEpisodes){
+        const n=Number(epAr.episode_number);if(!Number.isInteger(n)||n<1)continue;
+        const epEn:any=enMap.get(n)||{};
+        const title=String(epAr.name||epEn.name||`الحلقة ${n}`).trim();
+        const description=String(epAr.overview||epEn.overview||"").trim();
+        const duration=Number(epAr.runtime||epEn.runtime)||null;
+        const airDate=safeIsoDate(epAr.air_date||epEn.air_date);
+        const rating=Number(epAr.vote_average||epEn.vote_average)||null;
+        const ratingCount=Number(epAr.vote_count||epEn.vote_count)||null;
+        const existing:any=existingMap.get(n);
+
+        if(existing){
+          const patch:any={
+            external_source:"tmdb",external_id:Number(epAr.id||epEn.id)||null,
+            external_metadata:{primary:epAr,fallback:epEn},
+            air_date:airDate,rating,rating_count:ratingCount,updated_at:new Date().toISOString()
+          };
+          if(existing.external_source==="tmdb"||!existing.title||existing.title===`الحلقة ${n}`)patch.title=title;
+          if(existing.external_source==="tmdb"||!existing.description)patch.description=description;
+          if(existing.external_source==="tmdb"||!existing.duration_minutes)patch.duration_minutes=duration;
+          const {error}=await db.from("episodes").update(patch).eq("id",existing.id);if(error)throw error;
+          episodesUpdated++;
+        }else{
+          const {error}=await db.from("episodes").insert({
+            season_id:season.id,episode_number:n,title,description,duration_minutes:duration,quality:"",
+            status:"draft",external_source:"tmdb",external_id:Number(epAr.id||epEn.id)||null,
+            external_metadata:{primary:epAr,fallback:epEn},air_date:airDate,rating,rating_count:ratingCount,created_by:adminId
+          });
+          if(error)throw error;episodesAdded++;
+        }
+      }
+    }
+  }
+
+  const result={seasons_total:seasons.length,seasons_added:seasonsAdded,seasons_updated:seasonsUpdated,episodes_added:episodesAdded,episodes_updated:episodesUpdated,failed_seasons:failed};
+  await adminLog(adminId,"tmdb_series_structure_import","series",series.id,series.public_id,{tmdb_id:tmdbId,...result});
+  return result;
+}
+
 async function sendEpisodeSeriesPicker(chatId:number){
   const {data,error}=await db.from("series").select("public_id,title,status").eq("status","published").order("updated_at",{ascending:false}).limit(20);
   if(error)throw error;
