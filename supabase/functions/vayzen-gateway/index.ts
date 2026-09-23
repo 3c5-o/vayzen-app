@@ -1645,6 +1645,67 @@ async function message(m:any){
   if(!s) return showMenu(chatId);
   const d:any={...(s.draft??{})};
 
+  if(s.flow==="add_admin"){
+    if(!can(admin,"admins")){await clearSession(userId);return send(chatId,"لا تملك صلاحية إدارة المشرفين.");}
+    if(s.step==="telegram_id"){
+      const id=Number(text);
+      if(!Number.isInteger(id)||id<=0)return send(chatId,"Telegram User ID غير صحيح. أرسل الرقم فقط.");
+      const {data:exists}=await db.from("admin_users").select("telegram_user_id").eq("telegram_user_id",id).maybeSingle();
+      if(exists)return send(chatId,"هذا الحساب موجود ضمن الإدارة بالفعل.");
+      d.telegram_id=id;await setSession(userId,"add_admin","name",d);
+      return send(chatId,"أرسل اسم المشرف الذي سيظهر في لوحة الإدارة.");
+    }
+    if(s.step==="name"){
+      const name=text.trim().slice(0,60);if(name.length<2)return send(chatId,"الاسم قصير جدًا.");
+      d.display_name=name;await setSession(userId,"add_admin","role",d);
+      const roles:any[]=[];
+      if(admin.role==="owner")roles.push([{text:"أدمن ثانوي",callback_data:"adm_new_role|secondary_admin"}]);
+      roles.push([{text:"مشرف محتوى",callback_data:"adm_new_role|content_manager"},{text:"مشرف طلبات",callback_data:"adm_new_role|requests_manager"}]);
+      roles.push([{text:"مشرف",callback_data:"adm_new_role|moderator"},{text:"دعم",callback_data:"adm_new_role|support"}]);
+      roles.push([{text:"إلغاء",callback_data:"cancel"}]);
+      return send(chatId,`اختر دور ${name}:`,{inline_keyboard:roles});
+    }
+    if(s.step==="role")return send(chatId,"اختر الدور من الأزرار الظاهرة.");
+  }
+
+  if(s.flow==="batch_episode"){
+    if(!can(admin,"content")||!can(admin,"publish")){await clearSession(userId);return send(chatId,"لا تملك صلاحية النشر.");}
+    if(s.step==="season"){
+      const n=Number(text);if(!Number.isInteger(n)||n<1||n>999)return send(chatId,"رقم الموسم غير صحيح.");
+      d.season_number=n;await setSession(userId,"batch_episode","start",d);
+      return send(chatId,`الموسم ${n}\nأرسل رقم أول حلقة، مثال: 1`);
+    }
+    if(s.step==="start"){
+      const n=Number(text);if(!Number.isInteger(n)||n<1||n>9999)return send(chatId,"رقم الحلقة غير صحيح.");
+      d.next_episode=n;d.items=Array.isArray(d.items)?d.items:[];
+      await setSession(userId,"batch_episode","receiving",d);
+      return send(chatId,`بدأ الاستقبال من الحلقة ${n}.\n\nأرسل الفيديوهات بالترتيب. بدون Caption: كل فيديو = الحلقة التالية.\nوللتحديد اليدوي استخدم:\nE03 | 1080p\nأو\nE03 | اسم الحلقة | 1080p`,{inline_keyboard:[[{text:"إنهاء ومراجعة",callback_data:"batch_finish"},{text:"إلغاء",callback_data:"cancel"}]]});
+    }
+    if(s.step==="receiving"){
+      const file=videoFrom(m);if(!file)return send(chatId,"أرسل ملف فيديو، أو اضغط إنهاء ومراجعة.");
+      if(file.file_size&&file.file_size>MAX_VIDEO_BYTES)return send(chatId,"الفيديو أكبر من 800MB.");
+      const items:any[]=Array.isArray(d.items)?d.items:[];
+      if(items.length>=120)return send(chatId,"وصلت إلى 120 ملفًا في هذه الدفعة. اضغط إنهاء ومراجعة ثم ابدأ دفعة جديدة.",{inline_keyboard:[[{text:"إنهاء ومراجعة",callback_data:"batch_finish"}]]});
+      const parsed=parseBatchEpisodeCaption(caption,Number(d.next_episode||1));
+      if(parsed.variant==="default"){
+        const fn=String(file.file_name||"").toLowerCase();const qm=fn.match(/(?:^|[^0-9])(360p|480p|540p|720p|1080p|1440p|2160p|4k)(?:[^0-9]|$)/i);
+        if(qm)parsed.variant=normalizeVariant(qm[1]);
+      }
+      if(items.some((x:any)=>Number(x.episode_number)===parsed.episode_number&&normalizeVariant(x.variant)===parsed.variant)){
+        return send(chatId,`E${parsed.episode_number} بجودة ${variantLabel(parsed.variant)} موجودة داخل الدفعة بالفعل.`);
+      }
+      items.push({episode_number:parsed.episode_number,title:parsed.title,variant:parsed.variant,file,source_message_id:m.message_id});
+      d.items=items;
+      if(!parsed.explicitEpisode)d.next_episode=parsed.episode_number+1;
+      else if(parsed.episode_number>=Number(d.next_episode||1))d.next_episode=parsed.episode_number+1;
+      await setSession(userId,"batch_episode","receiving",d);
+      const episodes=new Set(items.map((x:any)=>Number(x.episode_number))).size;
+      return send(chatId,`تم استلام E${String(parsed.episode_number).padStart(2,"0")} • ${variantLabel(parsed.variant)}\nالحلقات: ${episodes} • الملفات: ${items.length} • التالي: E${String(d.next_episode).padStart(2,"0")}`,{inline_keyboard:[[{text:"إنهاء ومراجعة",callback_data:"batch_finish"},{text:"إلغاء",callback_data:"cancel"}]]});
+    }
+    if(s.step==="confirm")return send(chatId,batchEpisodeSummary(d),{inline_keyboard:[[{text:"نشر الكل",callback_data:"confirm_batch_episode"},{text:"متابعة الإضافة",callback_data:"batch_resume"}],[{text:"إلغاء",callback_data:"cancel"}]]});
+    if(s.step==="publishing")return send(chatId,"النشر الجماعي قيد التنفيذ.");
+  }
+
   if(s.flow==="search_user"&&s.step==="query"){
     await clearSession(userId);
     return searchUsers(chatId,text);
