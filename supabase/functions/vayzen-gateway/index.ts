@@ -1408,8 +1408,8 @@ async function sendUserItem(chatId:number,userId:string){
 
 async function sendContentManager(chatId:number){
   const [m,s]=await Promise.all([
-    db.from("movies").select("id",{head:true,count:"exact"}),
-    db.from("series").select("id",{head:true,count:"exact"}),
+    db.from("movies").select("id",{head:true,count:"exact"}).is("deleted_at",null),
+    db.from("series").select("id",{head:true,count:"exact"}).is("deleted_at",null),
   ]);
   return send(chatId,
     `إدارة المحتوى\n\nالأفلام: ${m.count||0}\nالمسلسلات: ${s.count||0}\n\nاختر القسم:`,
@@ -1423,7 +1423,7 @@ async function sendContentManager(chatId:number){
 
 async function sendContentList(chatId:number,type:"movie"|"series"){
   const table=type==="movie"?"movies":"series";
-  const {data,error}=await db.from(table).select("public_id,title,status,is_featured,created_at").order("created_at",{ascending:false}).limit(20);
+  const {data,error}=await db.from(table).select("public_id,title,status,is_featured,created_at").is("deleted_at",null).order("created_at",{ascending:false}).limit(20);
   if(error)throw error;
   const rows:any[]=(data??[]).map((x:any)=>[{
     text:`${x.status==="published"?"●":"○"} ${String(x.title).slice(0,30)}${x.is_featured?" ★":""}`,
@@ -1440,7 +1440,7 @@ async function searchContent(chatId:number,query:string,type?:string){
   const rows:any[]=[];
   for(const t of types){
     const table=t==="movie"?"movies":"series";
-    const {data}=await db.from(table).select("public_id,title,status,is_featured").or(`title.ilike.%${q}%,public_id.ilike.%${q}%`).limit(10);
+    const {data}=await db.from(table).select("public_id,title,status,is_featured").is("deleted_at",null).or(`title.ilike.%${q}%,public_id.ilike.%${q}%`).limit(10);
     for(const x of data??[])rows.push([{text:`${t==="movie"?"فيلم":"مسلسل"} • ${String(x.title).slice(0,28)}`,callback_data:`cm|${t}|${x.public_id}`}]);
   }
   rows.push([{text:"بحث جديد",callback_data:type?`content_search_type|${type}`:"content_search"},{text:"رجوع",callback_data:type==="movie"?"content_movies":type==="series"?"content_series":"content"}]);
@@ -1448,7 +1448,7 @@ async function searchContent(chatId:number,query:string,type?:string){
 }
 
 async function sendBatchSeriesPicker(chatId:number){
-  const {data,error}=await db.from("series").select("public_id,title,status").eq("status","published").order("updated_at",{ascending:false}).limit(20);
+  const {data,error}=await db.from("series").select("public_id,title,status").eq("status","published").is("deleted_at",null).order("updated_at",{ascending:false}).limit(20);
   if(error)throw error;
   const rows:any[]=(data??[]).map((x:any)=>[{text:String(x.title).slice(0,34),callback_data:`batch_for|${x.public_id}`}]);
   rows.push([{text:"رجوع",callback_data:"menu"}]);
@@ -1908,16 +1908,21 @@ async function sendReportsManager(chatId:number){
 }
 
 async function systemStatusText(){
-  const [mp,md,sp,ep,rq,rp,lastError]=await Promise.all([
-    db.from("movies").select("id",{head:true,count:"exact"}).eq("status","published"),
-    db.from("movies").select("id",{head:true,count:"exact"}).eq("status","draft"),
-    db.from("series").select("id",{head:true,count:"exact"}).eq("status","published"),
-    db.from("episodes").select("id",{head:true,count:"exact"}).eq("status","published"),
+  const [mp,md,sp,ep,rq,rp,failedJobs,processingJobs,openAlerts,healthIssues,lastHealth,lastError]=await Promise.all([
+    db.from("movies").select("id",{head:true,count:"exact"}).eq("status","published").is("deleted_at",null),
+    db.from("movies").select("id",{head:true,count:"exact"}).eq("status","draft").is("deleted_at",null),
+    db.from("series").select("id",{head:true,count:"exact"}).eq("status","published").is("deleted_at",null),
+    db.from("episodes").select("id",{head:true,count:"exact"}).eq("status","published").is("deleted_at",null),
     db.from("content_requests").select("id",{head:true,count:"exact"}).eq("status","new"),
     db.from("reports").select("id",{head:true,count:"exact"}).eq("status","new"),
-    db.from("system_logs").select("message,created_at").eq("level","error").order("created_at",{ascending:false}).limit(1),
+    db.from("media_transfer_jobs").select("id",{head:true,count:"exact"}).eq("status","failed"),
+    db.from("media_transfer_jobs").select("id",{head:true,count:"exact"}).eq("status","processing"),
+    db.from("operational_alerts").select("id",{head:true,count:"exact"}).eq("status","open"),
+    db.from("media_health_issues").select("id",{head:true,count:"exact"}).eq("status","open"),
+    db.from("media_health_runs").select("status,checked_assets,healthy_assets,warning_assets,broken_assets,completed_at").order("started_at",{ascending:false}).limit(1),
+    db.from("system_logs").select("message,created_at").in("level",["error","critical"]).order("created_at",{ascending:false}).limit(1),
   ]);
-  let gateway="غير متصل",telegram="غير معروف",activeStreams=0,rangeWindow=0;
+  let gateway="غير متصل",telegram="غير معروف",activeStreams=0,maxStreams=0,rangeWindow=0,retries=0,rejections=0,failures=0,bytesServed=0;
   try{
     const base=await streamGateway();
     if(base){
@@ -1929,31 +1934,41 @@ async function systemStatusText(){
         gateway=res.ok&&j?.ok?"يعمل":`HTTP ${res.status}`;
         telegram=j?.ok?"متصل":"غير متصل";
         activeStreams=Number(j?.active_streams||0);
+        maxStreams=Number(j?.max_concurrent_streams||0);
         rangeWindow=Number(j?.range_window_mb||0);
+        retries=Number(j?.stream_retries||0);
+        rejections=Number(j?.stream_rejections||0);
+        failures=Number(j?.stream_failures||0);
+        bytesServed=Number(j?.bytes_served||0);
       }finally{clearTimeout(timer)}
     }
   }catch{gateway="غير متصل"}
   const le=(lastError.data??[])[0];
+  const lh=(lastHealth.data??[])[0];
   return [
-    "حالة VAYZEN",
+    "حالة VAYZEN • Production",
     "",
     `البوت: ${BOT_TOKEN?"مهيأ":"غير مهيأ"}`,
     `بوابة البث: ${gateway}`,
     `Telegram Streaming: ${telegram}`,
-    `عمليات البث الحالية: ${activeStreams}`,
+    `البث الحالي: ${activeStreams}/${maxStreams||"—"}`,
     `نافذة Range: ${rangeWindow||"—"} MB`,
     `حد الفيديو: ${videoLimitLabel()}`,
-    `أفلام منشورة: ${mp.count||0}`,
-    `مسودات أفلام: ${md.count||0}`,
-    `مسلسلات منشورة: ${sp.count||0}`,
-    `حلقات منشورة: ${ep.count||0}`,
-    `طلبات جديدة: ${rq.count||0}`,
-    `بلاغات جديدة: ${rp.count||0}`,
+    `Gateway retries: ${retries} • failures: ${failures} • rejected: ${rejections}`,
+    `بيانات مرسلة: ${bytesServed?sizeLabel(bytesServed):"—"}`,
+    "",
+    `Jobs قيد التنفيذ: ${processingJobs.count||0} • فاشلة: ${failedJobs.count||0}`,
+    `تنبيهات مفتوحة: ${openAlerts.count||0}`,
+    `مشاكل وسائط مفتوحة: ${healthIssues.count||0}`,
+    `آخر Media Check: ${lh?.completed_at||"لم يُنفذ"} • سليم ${lh?.healthy_assets||0} / مشاكل ${lh?.broken_assets||0}`,
+    "",
+    `أفلام منشورة: ${mp.count||0} • مسودات: ${md.count||0}`,
+    `مسلسلات منشورة: ${sp.count||0} • حلقات: ${ep.count||0}`,
+    `طلبات جديدة: ${rq.count||0} • بلاغات: ${rp.count||0}`,
     "",
     `آخر خطأ: ${le?.message?String(le.message).slice(0,140):"لا يوجد"}`,
   ].join("\n");
 }
-
 
 async function healthIssue(runId:string,severity:"warning"|"error"|"critical",parts:string[],data:any){
   const fingerprint=await sha256Text(parts.join("|"));
@@ -2148,6 +2163,10 @@ async function runOperationalCheck(){
     db.from("media_health_issues").select("id",{head:true,count:"exact"}).eq("status","open").eq("severity","critical"),
     db.from("admin_users").select("telegram_user_id",{head:true,count:"exact"}).eq("role","owner").eq("is_active",true)
   ]);
+  try{
+    const {data:owner}=await db.from("admin_users").select("telegram_user_id").eq("role","owner").eq("is_active",true).maybeSingle();
+    if(owner?.telegram_user_id)await purgeExpiredTrash(Number(owner.telegram_user_id));
+  }catch{}
 
   await Promise.all([
     upsertOperationalCondition("gateway_down",!gatewayOk,"critical","gateway","بوابة البث غير متاحة",gatewayDetail),
