@@ -183,7 +183,7 @@ function renderHero(){
   $("#heroText").textContent=x.description||"شاهد التفاصيل واكتشف المزيد على VAYZEN.";
   $("#heroMedia").style.backgroundImage=`url("${mediaUrl(type==="movie"?"movie_poster":"series_poster",x.id)}")`;
   $("#heroDetails").onclick=()=>openDetails(type,x.id);
-  $("#heroPlay").onclick=()=>type==="movie"?openPlayer({type:"movie",id:x.id,title:x.title,publicId:x.public_id,src:mediaUrl("movie_video",x.id)}):openDetails(type,x.id);
+  $("#heroPlay").onclick=()=>type==="movie"?openPlayer({type:"movie",id:x.id,title:x.title,publicId:x.public_id,quality:x.quality||"",src:mediaUrl("movie_video",x.id)}):openDetails(type,x.id);
 }
 
 function guestProgress(){
@@ -295,7 +295,14 @@ async function openDetails(type,id){
         <div class="detail-poster"><img src="${poster}" alt=""></div>
         <div class="detail-copy">
           <h2>${esc(item.title)}</h2>
+          ${item.original_title&&item.original_title!==item.title?`<div class="detail-original">${esc(item.original_title)}</div>`:""}
           <div class="tags"><span class="tag">${esc(item.release_year||"—")}</span><span class="tag">${esc(item.quality||"—")}</span>${genreTags}</div>
+          <div class="detail-facts">
+            ${item.language?`<span>${esc(item.language)}</span>`:""}
+            ${item.country?`<span>${esc(item.country)}</span>`:""}
+            ${type==="movie"&&item.duration_minutes?`<span>${esc(item.duration_minutes)} دقيقة</span>`:""}
+            ${Number(item.view_count)>0?`<span>${Number(item.view_count).toLocaleString("ar-IQ")} مشاهدة</span>`:""}
+          </div>
           <p>${esc(item.description||"لا يوجد وصف متاح.")}</p>
         </div>
       </div>
@@ -313,7 +320,7 @@ async function openDetails(type,id){
   $("#favoriteBtn").onclick=()=>toggleFavorite(type,id);
   $("#detailReport").onclick=()=>openReport(type,item.public_id);
   if(type==="movie"){
-    $("#detailPlay").onclick=()=>openPlayer({type:"movie",id:item.id,title:item.title,publicId:item.public_id,src:mediaUrl("movie_video",item.id)});
+    $("#detailPlay").onclick=()=>openPlayer({type:"movie",id:item.id,title:item.title,publicId:item.public_id,quality:item.quality||"",src:mediaUrl("movie_video",item.id)});
   }else{
     $("#detailPlay").onclick=()=>$("#seasonTabs")?.scrollIntoView({behavior:"smooth",block:"center"});
     await loadSeriesContent(item);
