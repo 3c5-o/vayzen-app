@@ -30,7 +30,7 @@ svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.9;stroke
 .svg-sprite{position:absolute;width:0;height:0;overflow:hidden}
 .hidden{display:none!important}
 .app-shell{max-width:1180px;margin:auto;min-height:100vh}
-.splash{position:fixed;inset:0;z-index:500;background:#07080c;display:grid;place-items:center;transition:.45s opacity,.45s visibility}
+.splash{position:fixed;inset:0;z-index:500;background:#07080c;display:grid;place-items:center;transition:.45s opacity,.45s visibility;animation:splashFailSafe .01s linear 4s forwards}
 .splash.hide{opacity:0;visibility:hidden}
 .splash-mark,.brand-mark{display:grid;place-items:center;background:
  linear-gradient(145deg,#8c63ff 0%,#6b3df1 52%,#321673 100%);
@@ -124,3 +124,5 @@ svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.9;stroke
   .bottom-nav{left:50%;transform:translateX(-50%);max-width:640px;border:1px solid var(--line);border-bottom:0;border-radius:20px 20px 0 0}
   .detail-summary{padding-left:30px;padding-right:30px}.detail-actions,.seasons-wrap{padding-left:30px;padding-right:30px}
 }
+
+@keyframes splashFailSafe{to{opacity:0;visibility:hidden;pointer-events:none}}
