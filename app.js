@@ -810,7 +810,12 @@ else if(history.state.page)applyPage(history.state.page);
 window.addEventListener("popstate",e=>{
   const st=e.state||{vayzen:true,page:"home"};
   if(playerLayer.classList.contains("open"))closePlayer({fromHistory:true});
-  Array.from(document.querySelectorAll(".modal.open")).forEach(m=>closeModal(m.id));
+  if(st.overlay==="detail"){
+    Array.from(document.querySelectorAll(".modal.open")).forEach(m=>{if(m.id!=="detailModal")closeModal(m.id)});
+    $("#detailModal")?.classList.add("open");
+  }else{
+    Array.from(document.querySelectorAll(".modal.open")).forEach(m=>closeModal(m.id));
+  }
   if(st.page)applyPage(st.page);
 });
 Array.from(document.querySelectorAll(".nav-item")).forEach(b=>b.onclick=()=>go(b.dataset.nav));
