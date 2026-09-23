@@ -571,6 +571,30 @@ function videoFrom(m:any){
   }
   return null;
 }
+function subtitleFileFrom(m:any){
+  const d=m.document;
+  if(!d?.file_id)return null;
+  const name=String(d.file_name||"").trim();
+  const ext=(name.split(".").pop()||"").toLowerCase();
+  const mime=String(d.mime_type||"").toLowerCase();
+  if(!["vtt","srt"].includes(ext)&&!["text/vtt","application/x-subrip","text/plain"].includes(mime))return null;
+  const format=ext==="srt"?"srt":"vtt";
+  return {
+    file_id:d.file_id,file_unique_id:d.file_unique_id??null,
+    mime_type:format==="vtt"?"text/vtt":"application/x-subrip",
+    file_name:name||`subtitle.${format}`,file_size:d.file_size??null,format
+  };
+}
+function normalizeLanguageCode(v:any){
+  const s=String(v||"").trim().toLowerCase().replace(/_/g,"-");
+  return /^[a-z]{2,3}(?:-[a-z]{2})?$/.test(s)?s:"";
+}
+function subtitleVariant(lang:string){return normalizeVariant("sub_"+normalizeLanguageCode(lang).replace(/-/g,"_"))}
+function subtitleLabel(code:string){
+  const map:Record<string,string>={ar:"العربية",en:"English",tr:"Türkçe",ku:"Kurdî",fa:"فارسی",fr:"Français",es:"Español"};
+  return map[code]||code.toUpperCase();
+}
+
 function yearOf(v:string){
   const n=Number(v.trim());
   return Number.isInteger(n)&&n>=1888&&n<=2100?n:null;
@@ -1164,6 +1188,86 @@ async function deleteQuality(adminId:number,type:string,publicId:string,variant:
   const {error}=await db.from("media_assets").delete().eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("kind","video").eq("variant",v);
   if(error)throw error;
   await adminLog(adminId,"quality_delete",target.entityType,target.item.id,publicId,{variant:v});
+}
+
+async function subtitleTarget(type:string,publicId:string){
+  if(type==="movie"){
+    const item:any=await contentByPublicId("movie",publicId);
+    return item?{entityType:"movie",item,channelKey:"movies_storage"}:null;
+  }
+  if(type==="episode"){
+    const item:any=await episodeByPublicId(publicId);
+    return item?{entityType:"episode",item,channelKey:"series_storage"}:null;
+  }
+  return null;
+}
+
+async function sendSubtitleManager(chatId:number,type:string,publicId:string){
+  const target:any=await subtitleTarget(type,publicId);
+  if(!target)return send(chatId,"المحتوى غير موجود.");
+  const {data,error}=await db.from("subtitle_tracks")
+    .select("id,language_code,label,source_format,is_default,created_at")
+    .eq("entity_type",target.entityType).eq("entity_id",target.item.id)
+    .order("is_default",{ascending:false}).order("created_at",{ascending:true});
+  if(error)throw error;
+  const rows:any[]=(data??[]).map((x:any)=>[{
+    text:`${x.is_default?"●":"○"} ${x.label} • ${String(x.source_format).toUpperCase()}`,
+    callback_data:`sub_item|${type}|${publicId}|${x.language_code}`
+  }]);
+  rows.push([{text:"إضافة ترجمة",callback_data:`sub_add|${type}|${publicId}`}]);
+  rows.push([{text:"رجوع",callback_data:type==="movie"?`cm|movie|${publicId}`:`epi|${publicId}`}]);
+  return send(chatId,`ترجمات ${target.item.title||target.item.public_id}\n\nالمسارات: ${(data??[]).length}`,{inline_keyboard:rows});
+}
+
+async function storeSubtitleTrack(adminId:number,chatId:number,type:string,publicId:string,lang:string,label:string,file:any,sourceMessageId:number){
+  const target:any=await subtitleTarget(type,publicId);
+  if(!target)throw new Error("المحتوى غير موجود");
+  const code=normalizeLanguageCode(lang);if(!code)throw new Error("رمز اللغة غير صالح");
+  if(Number(file.file_size||0)>8*1024*1024)throw new Error("ملف الترجمة أكبر من 8MB.");
+  const variant=subtitleVariant(code);
+  const old:any=await currentAsset(target.entityType,target.item.id,"subtitle",variant);
+  const place=await copyTo(target.channelKey,chatId,sourceMessageId,
+    `${publicId} | Subtitle | ${label} | ${String(file.format||"vtt").toUpperCase()}`,
+    file.file_size,{entityType:target.entityType,entityId:target.item.id,entityPublicId:publicId,kind:"subtitle",variant,file});
+  try{
+    await saveAsset(target.entityType,target.item.id,"subtitle",file,place,variant);
+    const {data:asset}=await db.from("media_assets").select("id").eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("kind","subtitle").eq("variant",variant).single();
+    await db.from("media_assets").update({metadata:{language_code:code,label,source_format:file.format||"vtt"},updated_at:new Date().toISOString()}).eq("id",asset.id);
+    const {count}=await db.from("subtitle_tracks").select("id",{head:true,count:"exact"}).eq("entity_type",target.entityType).eq("entity_id",target.item.id);
+    const {error}=await db.from("subtitle_tracks").upsert({
+      entity_type:target.entityType,entity_id:target.item.id,language_code:code,label,
+      source_format:file.format||"vtt",is_default:Number(count||0)===0,media_asset_id:asset.id,created_by:adminId,updated_at:new Date().toISOString()
+    },{onConflict:"entity_type,entity_id,language_code"});
+    if(error)throw error;
+  }catch(err){
+    await deleteCopiedMessage(place);throw err;
+  }
+  const sameTarget=old?.channel_id===place.channel_id&&old?.channel_message_id===place.message_id;
+  if(old?.channel_id&&old?.channel_message_id&&!sameTarget)await deleteCopiedMessage({channel_id:old.channel_id,message_id:old.channel_message_id});
+  await adminLog(adminId,"subtitle_upsert",target.entityType,target.item.id,publicId,{language_code:code,label,format:file.format||"vtt"});
+}
+
+async function deleteSubtitleTrack(adminId:number,type:string,publicId:string,lang:string){
+  const target:any=await subtitleTarget(type,publicId);
+  if(!target)throw new Error("المحتوى غير موجود");
+  const code=normalizeLanguageCode(lang);if(!code)throw new Error("رمز لغة غير صالح");
+  const variant=subtitleVariant(code);
+  const old:any=await currentAsset(target.entityType,target.item.id,"subtitle",variant);
+  if(old)await deleteCopiedMessage({channel_id:old.channel_id,message_id:old.channel_message_id});
+  const {error}=await db.from("subtitle_tracks").delete().eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("language_code",code);
+  if(error)throw error;
+  await db.from("media_assets").delete().eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("kind","subtitle").eq("variant",variant);
+  await adminLog(adminId,"subtitle_delete",target.entityType,target.item.id,publicId,{language_code:code});
+}
+
+async function setDefaultSubtitle(adminId:number,type:string,publicId:string,lang:string){
+  const target:any=await subtitleTarget(type,publicId);
+  if(!target)throw new Error("المحتوى غير موجود");
+  const code=normalizeLanguageCode(lang);if(!code)throw new Error("رمز لغة غير صالح");
+  await db.from("subtitle_tracks").update({is_default:false,updated_at:new Date().toISOString()}).eq("entity_type",target.entityType).eq("entity_id",target.item.id);
+  const {error}=await db.from("subtitle_tracks").update({is_default:true,updated_at:new Date().toISOString()}).eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("language_code",code);
+  if(error)throw error;
+  await adminLog(adminId,"subtitle_default",target.entityType,target.item.id,publicId,{language_code:code});
 }
 
 async function sendAdminsManager(chatId:number,actor:Admin){
