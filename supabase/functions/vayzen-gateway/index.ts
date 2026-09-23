@@ -11,6 +11,7 @@ const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const BOT_SECRET = Deno.env.get("TELEGRAM_BOT_SECRET") ?? "";
 const STREAM_GATEWAY = Deno.env.get("STREAM_GATEWAY") ?? "";
 const STREAM_SIGNING_SECRET = Deno.env.get("STREAM_SIGNING_SECRET") ?? "";
+const TMDB_API_BASE = "https://api.themoviedb.org/3";
 const publishableMap = envMap("SUPABASE_PUBLISHABLE_KEYS");
 const PUBLIC_KEY = Deno.env.get("SUPABASE_ANON_KEY") ?? publishableMap["default"] ?? "";
 
@@ -34,6 +35,135 @@ function json(data:unknown,status=200){
 async function sha256Text(value:string){
   const bytes=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(value));
   return [...new Uint8Array(bytes)].map(b=>b.toString(16).padStart(2,"0")).join("");
+}
+
+
+function bytesToB64(bytes:Uint8Array){
+  let s="";for(const b of bytes)s+=String.fromCharCode(b);return btoa(s);
+}
+function b64ToBytes(value:string){
+  const s=atob(value);const out=new Uint8Array(s.length);for(let i=0;i<s.length;i++)out[i]=s.charCodeAt(i);return out;
+}
+async function localSecretKey(){
+  if(!SERVICE_KEY)throw new Error("Server encryption key unavailable");
+  const raw=await crypto.subtle.digest("SHA-256",new TextEncoder().encode("vayzen:tmdb:v1:"+SERVICE_KEY));
+  return crypto.subtle.importKey("raw",raw,{name:"AES-GCM"},false,["encrypt","decrypt"]);
+}
+async function encryptLocalSecret(value:string){
+  const key=await localSecretKey();const iv=crypto.getRandomValues(new Uint8Array(12));
+  const cipher=await crypto.subtle.encrypt({name:"AES-GCM",iv},key,new TextEncoder().encode(value));
+  return `v1.${bytesToB64(iv)}.${bytesToB64(new Uint8Array(cipher))}`;
+}
+async function decryptLocalSecret(value:string){
+  const [version,iv64,data64]=String(value||"").split(".");
+  if(version!=="v1"||!iv64||!data64)throw new Error("Invalid encrypted secret");
+  const key=await localSecretKey();
+  const plain=await crypto.subtle.decrypt({name:"AES-GCM",iv:b64ToBytes(iv64)},key,b64ToBytes(data64));
+  return new TextDecoder().decode(plain);
+}
+async function tmdbSetting(){
+  const {data,error}=await db.from("app_settings").select("value,updated_at").eq("key","tmdb").maybeSingle();
+  if(error)throw error;
+  return data??null;
+}
+async function tmdbAccessToken(){
+  const row:any=await tmdbSetting();
+  const enc=String(row?.value?.token_enc||"");
+  if(!row?.value?.enabled||!enc)throw new Error("TMDb غير مربوط. أضف Access Token من إعدادات TMDb.");
+  return decryptLocalSecret(enc);
+}
+async function tmdbApi(path:string,params:Record<string,string|number|boolean|undefined>={},tokenOverride=""){
+  const token=tokenOverride||await tmdbAccessToken();
+  const url=new URL(TMDB_API_BASE+(path.startsWith("/")?path:"/"+path));
+  for(const [k,v] of Object.entries(params))if(v!==undefined&&v!==null&&String(v)!=="")url.searchParams.set(k,String(v));
+  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),15000);
+  try{
+    const r=await fetch(url,{headers:{Authorization:`Bearer ${token}`,accept:"application/json"},signal:controller.signal});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(String(j?.status_message||`TMDb HTTP ${r.status}`));
+    return j;
+  }finally{clearTimeout(timer);}
+}
+async function saveTmdbAccessToken(tokenRaw:string){
+  const token=tokenRaw.trim();
+  if(token.length<20||/\s/.test(token))throw new Error("Access Token غير صالح.");
+  const config:any=await tmdbApi("/configuration",{},token);
+  const images=config?.images||{};
+  const tokenEnc=await encryptLocalSecret(token);
+  const value={
+    enabled:true,
+    api_base:TMDB_API_BASE,
+    token_enc:tokenEnc,
+    token_hint:token.slice(-6),
+    config:{
+      secure_base_url:String(images.secure_base_url||"https://image.tmdb.org/t/p/"),
+      poster_sizes:Array.isArray(images.poster_sizes)?images.poster_sizes:[],
+      backdrop_sizes:Array.isArray(images.backdrop_sizes)?images.backdrop_sizes:[],
+      still_sizes:Array.isArray(images.still_sizes)?images.still_sizes:[],
+    },
+    verified_at:new Date().toISOString(),
+  };
+  const {error}=await db.from("app_settings").upsert({key:"tmdb",value,updated_at:new Date().toISOString()});
+  if(error)throw error;
+  return value;
+}
+async function tmdbStatus(){
+  const row:any=await tmdbSetting();const v=row?.value||{};
+  return {configured:Boolean(v.enabled&&v.token_enc),hint:String(v.token_hint||""),verified_at:v.verified_at||null};
+}
+async function tmdbImageUrl(path:string,kind:"poster"|"backdrop"|"still"="poster"){
+  if(!path)return "";
+  const row:any=await tmdbSetting();const cfg=row?.value?.config||{};
+  const base=String(cfg.secure_base_url||"https://image.tmdb.org/t/p/");
+  const sizes=Array.isArray(cfg[kind+"_sizes"])?cfg[kind+"_sizes"]:[];
+  const preferred=kind==="backdrop"?"w1280":kind==="still"?"w780":"w500";
+  const size=sizes.includes(preferred)?preferred:(sizes.includes("original")?"original":(sizes[sizes.length-1]||preferred));
+  return base+size+path;
+}
+async function tmdbSearch(type:"movie"|"series",query:string){
+  const endpoint=type==="movie"?"/search/movie":"/search/tv";
+  const j:any=await tmdbApi(endpoint,{query,language:"ar-SA",include_adult:false,page:1});
+  return (Array.isArray(j.results)?j.results:[]).slice(0,8);
+}
+async function tmdbDetails(type:"movie"|"series",id:number){
+  const endpoint=type==="movie"?`/movie/${id}`:`/tv/${id}`;
+  const append=type==="movie"
+    ?"credits,images,videos,external_ids,translations,release_dates"
+    :"aggregate_credits,images,videos,external_ids,translations,content_ratings";
+  const [ar,en]=await Promise.all([
+    tmdbApi(endpoint,{language:"ar-SA",append_to_response:append,include_image_language:"ar,en,null"}),
+    tmdbApi(endpoint,{language:"en-US"}),
+  ]);
+  return {ar,en};
+}
+function safeIsoDate(v:any){
+  const s=String(v||"").trim();return /^\d{4}-\d{2}-\d{2}$/.test(s)?s:null;
+}
+function tmdbMap(type:"movie"|"series",bundle:any){
+  const ar=bundle?.ar||{},en=bundle?.en||{};
+  const isMovie=type==="movie";
+  const title=String((isMovie?ar.title:ar.name)||(isMovie?en.title:en.name)||(isMovie?ar.original_title:ar.original_name)||"").trim();
+  const original=String((isMovie?ar.original_title:ar.original_name)||(isMovie?en.original_title:en.original_name)||title).trim();
+  const date=safeIsoDate(isMovie?(ar.release_date||en.release_date):(ar.first_air_date||en.first_air_date));
+  const year=date?Number(date.slice(0,4)):null;
+  const genres=(Array.isArray(ar.genres)&&ar.genres.length?ar.genres:en.genres||[]).map((g:any)=>String(g.name||"").trim()).filter(Boolean).slice(0,12);
+  const spoken=Array.isArray(ar.spoken_languages)&&ar.spoken_languages.length?ar.spoken_languages:(en.spoken_languages||[]);
+  const lang=String(spoken.find((x:any)=>x.iso_639_1===ar.original_language)?.name||spoken[0]?.name||ar.original_language||en.original_language||"");
+  const countries=(Array.isArray(ar.production_countries)&&ar.production_countries.length?ar.production_countries:en.production_countries||[]).map((x:any)=>String(x.name||"").trim()).filter(Boolean).slice(0,3);
+  const overview=String(ar.overview||en.overview||"").trim();
+  return {
+    title,original_title:original,description:overview,release_year:year,genres,language:lang,country:countries.join(" • "),
+    duration_minutes:isMovie?(Number(ar.runtime||en.runtime)||null):null,quality:"",
+    external_source:"tmdb",external_id:Number(ar.id||en.id),external_metadata:{primary:ar,fallback:en},
+    rating:Number(ar.vote_average||en.vote_average)||null,rating_count:Number(ar.vote_count||en.vote_count)||null,
+    release_date:isMovie?date:null,first_air_date:isMovie?null:date,
+    poster_path:String(ar.poster_path||en.poster_path||""),backdrop_path:String(ar.backdrop_path||en.backdrop_path||""),
+  };
+}
+async function tmdbExisting(type:"movie"|"series",tmdbId:number){
+  const table=type==="movie"?"movies":"series";
+  const {data}=await db.from(table).select("id,public_id,title,status").eq("external_source","tmdb").eq("external_id",tmdbId).maybeSingle();
+  return data??null;
 }
 
 async function consumeRateLimit(key:string,action:string,limit:number,windowSeconds:number){
