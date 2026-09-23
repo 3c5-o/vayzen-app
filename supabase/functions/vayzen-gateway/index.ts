@@ -1097,8 +1097,8 @@ async function callback(q:any){
     if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
     const [,id]=a.split("|");
     const ep:any=await episodeByPublicId(id);if(!ep)return send(chatId,"الحلقة غير موجودة.");
-    const old:any=await currentAsset("episode",ep.id,"video");
-    if(old)await deleteCopiedMessage({channel_id:old.channel_id,message_id:old.channel_message_id});
+    const {data:assets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","episode").eq("entity_id",ep.id);
+    for(const x of assets??[])await deleteCopiedMessage({channel_id:x.channel_id,message_id:x.channel_message_id});
     await db.from("media_assets").delete().eq("entity_type","episode").eq("entity_id",ep.id);
     const {error}=await db.from("episodes").delete().eq("id",ep.id);if(error)throw error;
     await adminLog(userId,"episode_delete","episode",ep.id,ep.public_id,{});
