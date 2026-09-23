@@ -869,6 +869,36 @@ async function updateProfile(req:Request){
   return json({ok:true,display_name:name});
 }
 
+async function changePassword(req:Request){
+  const auth=await userFromRequest(req);
+  if(!auth)return json({error:"unauthorized"},401);
+  const body=await req.json().catch(()=>null);
+  const current=String(body?.current_password||"");
+  const next=String(body?.new_password||"");
+  if(current.length<8||next.length<8)return json({error:"كلمة المرور يجب أن تكون 8 أحرف على الأقل"},400);
+  if(current===next)return json({error:"اختر كلمة مرور جديدة مختلفة"},400);
+  const email=String(auth.user.email||"");
+  if(!email)return json({error:"لا يوجد بريد مرتبط بالحساب"},400);
+
+  const verifier=createClient(SUPABASE_URL,PUBLIC_KEY,{auth:{persistSession:false,autoRefreshToken:false}});
+  const {error:verifyError}=await verifier.auth.signInWithPassword({email,password:current});
+  if(verifyError)return json({error:"كلمة المرور الحالية غير صحيحة"},401);
+
+  const {error:updateError}=await db.auth.admin.updateUserById(auth.user.id,{password:next});
+  if(updateError)throw updateError;
+  return json({ok:true});
+}
+
+async function recordView(req:Request){
+  const body=await req.json().catch(()=>null);
+  const type=String(body?.entity_type||"");
+  const id=String(body?.entity_id||"");
+  if(!["movie","episode"].includes(type)||!/^[0-9a-f-]{36}$/i.test(id))return json({error:"invalid view"},400);
+  const {error}=await db.rpc("bump_view_count",{p_entity_type:type,p_entity_id:id});
+  if(error)throw error;
+  return json({ok:true});
+}
+
 async function catalog(){
   const [m,s]=await Promise.all([
     db.from("movies").select("id,public_id,title,original_title,description,release_year,genres,language,country,duration_minutes,quality,is_featured,view_count,created_at").eq("status","published").order("created_at",{ascending:false}),
@@ -1003,6 +1033,8 @@ Deno.serve(async(req:Request)=>{
     if(action==="refresh"&&req.method==="POST") return authRefresh(req);
     if(action==="me"&&req.method==="GET") return me(req);
     if(action==="profile"&&req.method==="POST") return updateProfile(req);
+    if(action==="change_password"&&req.method==="POST") return changePassword(req);
+    if(action==="view"&&req.method==="POST") return recordView(req);
     if(action==="favorites"&&(req.method==="GET"||req.method==="POST")) return favoritesApi(req);
     if(action==="progress"&&(req.method==="GET"||req.method==="POST")) return progressApi(req);
     if(req.method==="POST"&&action==="request_content") return publicRequest(req);
