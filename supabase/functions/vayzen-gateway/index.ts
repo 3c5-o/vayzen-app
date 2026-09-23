@@ -107,16 +107,14 @@ function defaultPermission(role:string,perm:AdminPermission){
 }
 function can(admin:Admin,perm:AdminPermission){
   if(admin.role==="owner")return true;
-  if(admin.role==="secondary_admin"){
-    if(perm==="admins")return true;
-    return true;
-  }
+  if(admin.role==="secondary_admin")return true;
+  if(perm==="admins")return false;
   const custom=admin.permissions?.[perm];
   return typeof custom==="boolean"?custom:defaultPermission(admin.role,perm);
 }
 function canManageAdmin(actor:Admin,target:Admin|null,newRole?:string){
   if(actor.role==="owner"){
-    if(target?.role==="owner"&&target.telegram_user_id!==actor.telegram_user_id)return false;
+    if(target?.role==="owner")return false;
     return true;
   }
   if(actor.role!=="secondary_admin")return false;
@@ -1071,12 +1069,12 @@ async function callback(q:any){
     return showMenu(chatId,"تم إلغاء العملية.");
   }
   if(a==="add_movie"){
-    if(!can(admin,"content")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
+    if(!can(admin,"content")||!can(admin,"publish")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
     await setSession(userId,"movie","title",{});
     return send(chatId,"أرسل اسم الفيلم.");
   }
   if(a==="add_series"){
-    if(!can(admin,"content")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
+    if(!can(admin,"content")||!can(admin,"publish")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
     await setSession(userId,"series","title",{});
     return send(chatId,"أرسل اسم المسلسل.");
   }
@@ -1145,7 +1143,7 @@ async function callback(q:any){
   }
 
   if(a==="add_episode"){
-    if(!can(admin,"content")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
+    if(!can(admin,"content")||!can(admin,"publish")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
     await clearSession(userId);
     return sendEpisodeSeriesPicker(chatId);
   }
@@ -1191,6 +1189,24 @@ async function callback(q:any){
       return send(chatId,`فشل نشر الفيلم.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"إعادة المحاولة",callback_data:"confirm_movie"},{text:"إلغاء",callback_data:"cancel"}]]});
     }
   }
+  if(a==="confirm_series_batch"){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
+    const session=await getSession(userId);
+    if(!session||session.flow!=="series")return showMenu(chatId,"انتهت جلسة المسلسل.");
+    if(session.step==="publishing")return send(chatId,"المسلسل قيد النشر الآن.");
+    if(session.step!=="confirm")return showMenu(chatId,"انتهت جلسة المسلسل.");
+    await setSession(userId,"series","publishing",session.draft);
+    try{
+      const id=await publishSeries(userId,chatId,session.draft);
+      await clearSession(userId);
+      await send(chatId,`تم نشر المسلسل بنجاح.\nSeries ID: ${id}`);
+      return sendBatchSeasonPicker(chatId,id);
+    }catch(err){
+      await setSession(userId,"series","confirm",session.draft);
+      return send(chatId,`فشل نشر المسلسل.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"إعادة المحاولة",callback_data:"confirm_series_batch"},{text:"إلغاء",callback_data:"cancel"}]]});
+    }
+  }
+
   if(a==="confirm_series"){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
     const session=await getSession(userId);
@@ -1920,7 +1936,10 @@ async function message(m:any){
       const f=photoFrom(m);if(!f)return send(chatId,"أرسل صورة البوستر.");
       d.poster=f;d.poster_source_message_id=m.message_id;
       await setSession(userId,"series","confirm",d);
-      return send(chatId,seriesSummary(d),{inline_keyboard:[[{text:"نشر المسلسل",callback_data:"confirm_series"},{text:"إلغاء",callback_data:"cancel"}]]});
+      return send(chatId,seriesSummary(d),{inline_keyboard:[
+        [{text:"نشر المسلسل",callback_data:"confirm_series"},{text:"نشر ثم إضافة حلقات",callback_data:"confirm_series_batch"}],
+        [{text:"إلغاء",callback_data:"cancel"}]
+      ]});
     }
   }
 
