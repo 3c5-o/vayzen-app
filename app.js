@@ -959,7 +959,7 @@ function applyPage(page){
   state.currentPage=page;
   Array.from(document.querySelectorAll(".page")).forEach(p=>p.classList.toggle("active",p.dataset.page===page));
   Array.from(document.querySelectorAll(".nav-item")).forEach(n=>n.classList.toggle("active",n.dataset.nav===page));
-  $("#searchPanel")?.classList.add("hidden");
+  if(page!=="search")$("#searchPanel")?.classList.add("hidden");
   window.scrollTo({top:0,behavior:"instant"});
   if(page==="mylist")renderMyList();
   if(page==="account")renderAccount();
