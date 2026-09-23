@@ -29,8 +29,15 @@ function showToast(msg){
   const t=$("#toast"); t.textContent=msg; t.classList.add("show");
   clearTimeout(showToast.timer); showToast.timer=setTimeout(()=>t.classList.remove("show"),2600);
 }
-function openModal(id){$("#"+id)?.classList.add("open")}
-function closeModal(id){$("#"+id)?.classList.remove("open")}
+function openModal(id){
+  $("#"+id)?.classList.add("open");
+  clearTimeout(heroAutoplayTimer);
+  $("#heroAutoplayProgress span")?.classList.remove("running");
+}
+function closeModal(id){
+  $("#"+id)?.classList.remove("open");
+  if(state.currentPage==="home")setTimeout(scheduleHeroAutoplay,60);
+}
 function savePrefs(){localStorage.setItem(PREFS_KEY,JSON.stringify(state.prefs))}
 function loadPrefs(){
   try{state.prefs={...state.prefs,...JSON.parse(localStorage.getItem(PREFS_KEY)||"{}")}}catch{}
@@ -836,6 +843,7 @@ async function closePlayer({fromHistory=false}={}){
   if(document.fullscreenElement===playerLayer){try{await document.exitFullscreen()}catch{}}
   try{screen.orientation?.unlock?.()}catch{}
   state.player=null;state.nextEpisode=null;
+  if(state.currentPage==="home")setTimeout(scheduleHeroAutoplay,80);
 }
 async function saveCurrentProgress(){
   const o=state.player;if(!o||!state.prefs.saveProgress||!video.duration||!isFinite(video.duration))return;
