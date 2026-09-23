@@ -31,6 +31,31 @@ function json(data:unknown,status=200){
   });
 }
 
+async function sha256Text(value:string){
+  const bytes=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(value));
+  return [...new Uint8Array(bytes)].map(b=>b.toString(16).padStart(2,"0")).join("");
+}
+
+async function consumeRateLimit(key:string,action:string,limit:number,windowSeconds:number){
+  const now=Math.floor(Date.now()/1000);
+  const windowStart=Math.floor(now/windowSeconds)*windowSeconds;
+  const keyHash=await sha256Text(key);
+  const {data}=await db.from("api_rate_limits")
+    .select("request_count")
+    .eq("key_hash",keyHash).eq("action",action).eq("window_start",windowStart).maybeSingle();
+  const count=Number(data?.request_count||0);
+  if(count>=limit)return false;
+  const {error}=await db.from("api_rate_limits").upsert({
+    key_hash:keyHash,action,window_start:windowStart,request_count:count+1,updated_at:new Date().toISOString()
+  },{onConflict:"key_hash,action,window_start"});
+  if(error)throw error;
+  if(Math.random()<0.02){
+    const cutoff=new Date(Date.now()-3*86400000).toISOString();
+    db.from("api_rate_limits").delete().lt("updated_at",cutoff).then(()=>{}).catch(()=>{});
+  }
+  return true;
+}
+
 async function tg(method:string,body:Record<string,unknown>){
   if(!BOT_TOKEN) throw new Error("Telegram bot token is not configured");
   const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`,{
@@ -893,10 +918,13 @@ async function recordView(req:Request){
   const body=await req.json().catch(()=>null);
   const type=String(body?.entity_type||"");
   const id=String(body?.entity_id||"");
-  if(!["movie","episode"].includes(type)||!/^[0-9a-f-]{36}$/i.test(id))return json({error:"invalid view"},400);
+  const viewer=String(body?.viewer_key||"").trim();
+  if(!["movie","episode"].includes(type)||!/^[0-9a-f-]{36}$/i.test(id)||!/^[A-Za-z0-9_-]{20,100}$/.test(viewer))return json({error:"invalid view"},400);
+  const allowed=await consumeRateLimit(viewer+":"+type+":"+id,"view",1,15*60);
+  if(!allowed)return json({ok:true,counted:false});
   const {error}=await db.rpc("bump_view_count",{p_entity_type:type,p_entity_id:id});
   if(error)throw error;
-  return json({ok:true});
+  return json({ok:true,counted:true});
 }
 
 async function catalog(){
@@ -985,9 +1013,8 @@ async function publicRequest(req:Request){
   const title=String(b.title||"").trim().slice(0,160);
   const note=String(b.note||"").trim().slice(0,500);
   if(!/^[A-Za-z0-9_-]{20,100}$/.test(requester)||!["movie","series"].includes(type)||title.length<2) return json({error:"invalid request"},400);
-  const since=new Date(Date.now()-86400000).toISOString();
-  const {count}=await db.from("content_requests").select("id",{head:true,count:"exact"}).eq("requester_key",requester).gte("created_at",since);
-  if((count||0)>=5) return json({error:"daily limit reached"},429);
+  const allowed=await consumeRateLimit(requester,"content_request",5,24*60*60);
+  if(!allowed) return json({error:"daily limit reached"},429);
   const {data,error}=await db.from("content_requests").insert({requester_key:requester,request_type:type,title,note})
     .select("request_code,status,title,request_type,created_at").single();
   if(error) throw error;
@@ -1001,9 +1028,22 @@ async function publicRequest(req:Request){
 async function requestStatus(url:URL){
   const k=String(url.searchParams.get("requester_key")||"");
   if(!/^[A-Za-z0-9_-]{20,100}$/.test(k)) return json({error:"invalid key"},400);
-  const {data}=await db.from("content_requests").select("request_code,request_type,title,status,created_at,updated_at")
+  const {data,error}=await db.from("content_requests")
+    .select("request_code,request_type,title,status,created_at,updated_at,linked_entity_type,linked_entity_id")
     .eq("requester_key",k).order("created_at",{ascending:false}).limit(20);
-  return json({ok:true,requests:data??[]});
+  if(error)throw error;
+  const rows:any[]=data??[];
+  const out=[];
+  for(const row of rows){
+    let linked:any=null;
+    if(row.status==="added"&&row.linked_entity_id&&["movie","series"].includes(row.linked_entity_type)){
+      const table=row.linked_entity_type==="movie"?"movies":"series";
+      const {data:item}=await db.from(table).select("id,public_id,title,status").eq("id",row.linked_entity_id).maybeSingle();
+      if(item?.status==="published")linked={type:row.linked_entity_type,id:item.id,public_id:item.public_id,title:item.title};
+    }
+    out.push({...row,linked});
+  }
+  return json({ok:true,requests:out});
 }
 
 async function publicReport(req:Request){
@@ -1015,6 +1055,8 @@ async function publicReport(req:Request){
   const reason=String(b.reason||"").trim().slice(0,160);
   const details=String(b.details||"").trim().slice(0,800);
   if(!/^[A-Za-z0-9_-]{20,100}$/.test(reporter)||!["movie","series","episode","other"].includes(type)||reason.length<2) return json({error:"invalid report"},400);
+  const allowed=await consumeRateLimit(reporter,"report",10,60*60);
+  if(!allowed)return json({error:"report limit reached"},429);
   const {data,error}=await db.from("reports").insert({
     reporter_key:reporter,entity_type:type,entity_public_id:publicId,reason,details,
   }).select("report_code,status,created_at").single();
@@ -1032,7 +1074,7 @@ Deno.serve(async(req:Request)=>{
     const url=new URL(req.url);
     if(req.method==="GET"&&url.searchParams.get("health")==="1"){
       return json({
-        ok:true,name:"VAYZEN",maxVideoMB:500,
+        ok:true,name:"VAYZEN",maxVideoMB:800,
         botConfigured:Boolean(BOT_TOKEN),
         webhookSecretConfigured:Boolean(BOT_SECRET),
         streamGatewayConfigured:Boolean(await streamGateway()),
