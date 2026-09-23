@@ -8,9 +8,16 @@ const GUEST_PROGRESS_KEY="vayzen.guest.progress";
 const state={
   movies:[],series:[],favorites:[],progress:[],user:null,session:null,
   query:"",movieGenre:"",seriesGenre:"",movieYear:"",seriesYear:"",currentPage:"home",detail:null,detailVariant:"",player:null,nextEpisode:null,searchReturnPage:"home",
+  heroItems:[],heroIndex:0,
   prefs:{autoplayNext:true,saveProgress:true}
 };
 const viewedThisSession=new Set();
+
+const HERO_AUTOPLAY_MS=6500;
+let heroAutoplayTimer=null;
+let heroPointerStartX=null;
+let heroPointerStartY=null;
+let heroPointerStartedAt=0;
 
 const $=s=>document.querySelector(s);
 const $$=s=>[...document.querySelectorAll(s)];
@@ -22,8 +29,15 @@ function showToast(msg){
   const t=$("#toast"); t.textContent=msg; t.classList.add("show");
   clearTimeout(showToast.timer); showToast.timer=setTimeout(()=>t.classList.remove("show"),2600);
 }
-function openModal(id){$("#"+id)?.classList.add("open")}
-function closeModal(id){$("#"+id)?.classList.remove("open")}
+function openModal(id){
+  $("#"+id)?.classList.add("open");
+  clearTimeout(heroAutoplayTimer);
+  $("#heroAutoplayProgress span")?.classList.remove("running");
+}
+function closeModal(id){
+  $("#"+id)?.classList.remove("open");
+  if(state.currentPage==="home")setTimeout(scheduleHeroAutoplay,60);
+}
 function savePrefs(){localStorage.setItem(PREFS_KEY,JSON.stringify(state.prefs))}
 function loadPrefs(){
   try{state.prefs={...state.prefs,...JSON.parse(localStorage.getItem(PREFS_KEY)||"{}")}}catch{}
@@ -246,31 +260,91 @@ function renderYearFilter(id,items,key){
   el.value=current;
   el.onchange=()=>{state[key]=el.value||"";renderCatalog()};
 }
+function buildHeroItems(){
+  return mixedCatalog()
+    .sort((a,b)=>createdValue(b.item)-createdValue(a.item)||ratingValue(b.item)-ratingValue(a.item))
+    .slice(0,4);
+}
+function heroCanAutoplay(){
+  return state.currentPage==="home"&&!document.hidden&&!document.querySelector(".modal.open")&&!$("#playerLayer")?.classList.contains("open")&&state.heroItems.length>1;
+}
+function resetHeroProgress(){
+  const bar=$("#heroAutoplayProgress span");if(!bar)return;
+  bar.classList.remove("running");
+  void bar.offsetWidth;
+  if(heroCanAutoplay())bar.classList.add("running");
+}
+function scheduleHeroAutoplay(){
+  clearTimeout(heroAutoplayTimer);
+  resetHeroProgress();
+  if(!heroCanAutoplay())return;
+  heroAutoplayTimer=setTimeout(()=>{
+    if(heroCanAutoplay())heroMove(1,false);
+    else scheduleHeroAutoplay();
+  },HERO_AUTOPLAY_MS);
+}
+function renderHeroSlide(index,{animate=false,restart=true}={}){
+  const items=state.heroItems;if(!items.length)return;
+  state.heroIndex=((index%items.length)+items.length)%items.length;
+  const pick=items[state.heroIndex],x=pick.item,type=pick.type;
+  const media=$("#heroMedia"),body=document.querySelector("#hero .hero-body");
+  if(animate){media?.classList.add("is-changing");body?.classList.add("is-changing")}
+  const apply=()=>{
+    $("#heroTitle").textContent=x.title;
+    const heroMeta=$("#heroMeta");
+    const bits=[];
+    if(ratingValue(x)>0)bits.push('<span class="hero-rating"><svg><use href="#i-star"/></svg>'+ratingValue(x).toFixed(1)+'</span>');
+    if(x.release_year)bits.push("<span>"+esc(x.release_year)+"</span>");
+    bits.push("<span>"+typeLabel(type)+"</span>");
+    if(genreList(x)[0])bits.push("<span>"+esc(genreList(x)[0])+"</span>");
+    if(x.quality)bits.push("<span>"+esc(x.quality)+"</span>");
+    heroMeta.innerHTML=bits.join("");
+    $("#heroText").textContent=x.description||"اكتشف التفاصيل وابدأ المشاهدة على VAYZEN.";
+    $("#heroEyebrow").textContent=type==="movie"?"فيلم مضاف حديثًا":"مسلسل مضاف حديثًا";
+    $("#heroCounterNow").textContent=String(state.heroIndex+1);
+    $("#heroCounterTotal").textContent=String(items.length);
+    if(media)media.style.backgroundImage=`url("${mediaUrl(type==="movie"?"movie_backdrop":"series_backdrop",x.id)}")`;
+    $("#heroDetails").onclick=()=>openDetails(type,x.id);
+    $("#heroPlay").onclick=()=>type==="movie"
+      ?openPlayer({type:"movie",id:x.id,title:x.title,publicId:x.public_id,quality:x.quality||"",src:mediaUrl("movie_video",x.id)})
+      :openDetails(type,x.id);
+    const fav=$("#heroFavorite");
+    if(fav){
+      fav.classList.toggle("active",isFav(type,x.id));
+      fav.innerHTML=`<svg><use href="#${isFav(type,x.id)?"i-check":"i-plus"}"/></svg>`;
+      fav.onclick=()=>toggleFavorite(type,x.id);
+    }
+    const dots=$("#heroDots");
+    if(dots){
+      dots.innerHTML=items.map((_,i)=>`<button class="hero-dot ${i===state.heroIndex?"active":""}" data-hero-index="${i}" aria-label="عرض ${i+1}"></button>`).join("");
+      dots.querySelectorAll("[data-hero-index]").forEach(btn=>btn.onclick=e=>{
+        e.stopPropagation();renderHeroSlide(Number(btn.dataset.heroIndex),{animate:true,restart:true});
+      });
+    }
+    $("#heroPrev")?.classList.toggle("hidden",items.length<=1);
+    $("#heroNext")?.classList.toggle("hidden",items.length<=1);
+  };
+  if(animate){
+    setTimeout(()=>{apply();requestAnimationFrame(()=>{media?.classList.remove("is-changing");body?.classList.remove("is-changing")})},150);
+  }else apply();
+  if(restart)scheduleHeroAutoplay();
+}
+function heroMove(delta,manual=true){
+  if(state.heroItems.length<=1)return;
+  renderHeroSlide(state.heroIndex+delta,{animate:true,restart:true});
+}
 function renderHero(){
-  const candidates=mixedCatalog().sort((a,b)=>(Number(Boolean(b.item.is_featured))-Number(Boolean(a.item.is_featured)))||ratingValue(b.item)-ratingValue(a.item)||createdValue(b.item)-createdValue(a.item));
-  const pick=candidates[0];if(!pick)return;
-  const {item:x,type}=pick;
-  $("#heroTitle").textContent=x.title;
-  const heroMeta=$("#heroMeta");
-  const bits=[];
-  if(ratingValue(x)>0)bits.push('<span class="hero-rating"><svg><use href="#i-star"/></svg>'+ratingValue(x).toFixed(1)+'</span>');
-  if(x.release_year)bits.push("<span>"+esc(x.release_year)+"</span>");
-  if(genreList(x)[0])bits.push("<span>"+esc(genreList(x)[0])+"</span>");
-  if(x.quality)bits.push("<span>"+esc(x.quality)+"</span>");
-  if(Number(x.view_count)>0)bits.push("<span>"+Number(x.view_count).toLocaleString("ar-IQ")+" مشاهدة</span>");
-  heroMeta.innerHTML=bits.join("");
-  $("#heroText").textContent=x.description||"اكتشف التفاصيل وابدأ المشاهدة على VAYZEN.";
-  $("#heroMedia").style.backgroundImage=`url("${mediaUrl(type==="movie"?"movie_backdrop":"series_backdrop",x.id)}")`;
-  $("#heroDetails").onclick=()=>openDetails(type,x.id);
-  $("#heroPlay").onclick=()=>type==="movie"
-    ?openPlayer({type:"movie",id:x.id,title:x.title,publicId:x.public_id,quality:x.quality||"",src:mediaUrl("movie_video",x.id)})
-    :openDetails(type,x.id);
-  const fav=$("#heroFavorite");
-  if(fav){
-    fav.classList.toggle("active",isFav(type,x.id));
-    fav.innerHTML=`<svg><use href="#${isFav(type,x.id)?"i-check":"i-plus"}"/></svg>`;
-    fav.onclick=()=>toggleFavorite(type,x.id);
+  const previous=state.heroItems[state.heroIndex];
+  const previousKey=previous?`${previous.type}:${previous.item.id}`:"";
+  state.heroItems=buildHeroItems();
+  if(!state.heroItems.length){
+    clearTimeout(heroAutoplayTimer);
+    $("#heroAutoplayProgress span")?.classList.remove("running");
+    return;
   }
+  const keep=state.heroItems.findIndex(x=>`${x.type}:${x.item.id}`===previousKey);
+  state.heroIndex=keep>=0?keep:Math.min(state.heroIndex,state.heroItems.length-1);
+  renderHeroSlide(state.heroIndex,{animate:false,restart:true});
 }
 
 function guestProgress(){
@@ -769,6 +843,7 @@ async function closePlayer({fromHistory=false}={}){
   if(document.fullscreenElement===playerLayer){try{await document.exitFullscreen()}catch{}}
   try{screen.orientation?.unlock?.()}catch{}
   state.player=null;state.nextEpisode=null;
+  if(state.currentPage==="home")setTimeout(scheduleHeroAutoplay,80);
 }
 async function saveCurrentProgress(){
   const o=state.player;if(!o||!state.prefs.saveProgress||!video.duration||!isFinite(video.duration))return;
@@ -972,6 +1047,7 @@ function applyPage(page){
   const valid=["home","movies","series","search","mylist","account"];
   if(!valid.includes(page))page="home";
   state.currentPage=page;
+  if(page==="home")setTimeout(scheduleHeroAutoplay,30);else{clearTimeout(heroAutoplayTimer);$("#heroAutoplayProgress span")?.classList.remove("running")}
   Array.from(document.querySelectorAll(".page")).forEach(p=>p.classList.toggle("active",p.dataset.page===page));
   Array.from(document.querySelectorAll(".nav-item")).forEach(n=>n.classList.toggle("active",n.dataset.nav===page));
   if(page!=="search")$("#searchPanel")?.classList.add("hidden");
@@ -1011,6 +1087,24 @@ Array.from(document.querySelectorAll(".modal")).forEach(m=>m.addEventListener("c
   else closeModal(m.id);
 }));
 
+$("#heroPrev").onclick=e=>{e.stopPropagation();heroMove(-1,true)};
+$("#heroNext").onclick=e=>{e.stopPropagation();heroMove(1,true)};
+const heroEl=$("#hero");
+heroEl?.addEventListener("pointerdown",e=>{
+  if(e.target.closest("button,input,select,a"))return;
+  heroPointerStartX=e.clientX;heroPointerStartY=e.clientY;heroPointerStartedAt=Date.now();
+});
+heroEl?.addEventListener("pointerup",e=>{
+  if(heroPointerStartX===null||heroPointerStartY===null)return;
+  const dx=e.clientX-heroPointerStartX,dy=e.clientY-heroPointerStartY,dt=Date.now()-heroPointerStartedAt;
+  heroPointerStartX=null;heroPointerStartY=null;
+  if(dt>900||Math.abs(dx)<45||Math.abs(dx)<Math.abs(dy)*1.15)return;
+  heroMove(dx<0?1:-1,true);
+});
+heroEl?.addEventListener("pointercancel",()=>{heroPointerStartX=null;heroPointerStartY=null});
+heroEl?.addEventListener("mouseenter",()=>{clearTimeout(heroAutoplayTimer);$("#heroAutoplayProgress span")?.classList.remove("running")});
+heroEl?.addEventListener("mouseleave",scheduleHeroAutoplay);
+
 $("#globalSearchBtn").onclick=()=>{
   const panel=$("#searchPanel"),opening=panel.classList.contains("hidden");
   panel.classList.toggle("hidden");
@@ -1035,18 +1129,28 @@ $("#autoplayNext").onchange=e=>{state.prefs.autoplayNext=e.target.checked;savePr
 $("#saveProgress").onchange=e=>{state.prefs.saveProgress=e.target.checked;savePrefs()};
 
 async function boot(){
-  const splashTimer=setTimeout(()=>$("#splash")?.classList.add("hide"),900);
+  const splash=$("#splash");
+  const started=performance.now();
+  const failSafe=setTimeout(()=>splash?.classList.add("hide"),4500);
   try{
     loadPrefs();loadSession();
     await loadCatalog();
     await loadUserState();
     applyPage(history.state?.page||"home");
   }finally{
-    clearTimeout(splashTimer);
-    setTimeout(()=>$("#splash")?.classList.add("hide"),250);
+    clearTimeout(failSafe);
+    const elapsed=performance.now()-started;
+    const wait=Math.max(0,1250-elapsed);
+    setTimeout(()=>{
+      splash?.classList.add("ready");
+      setTimeout(()=>splash?.classList.add("hide"),260);
+    },wait);
   }
 }
 window.addEventListener("online",()=>showToast("عاد الاتصال"));
 window.addEventListener("offline",()=>showToast("لا يوجد اتصال بالإنترنت"));
-document.addEventListener("visibilitychange",()=>{if(document.hidden)saveCurrentProgress()});
+document.addEventListener("visibilitychange",()=>{
+  if(document.hidden){saveCurrentProgress();clearTimeout(heroAutoplayTimer);$("#heroAutoplayProgress span")?.classList.remove("running")}
+  else scheduleHeroAutoplay();
+});
 boot();
