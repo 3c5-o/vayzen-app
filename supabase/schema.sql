@@ -21,6 +21,10 @@ create table if not exists public.movies (
   status text not null default 'published' check (status in ('draft','published','hidden','archived')),
   is_featured boolean not null default false,
   view_count bigint not null default 0,
+  external_source text,
+  external_id bigint,
+  external_metadata jsonb not null default '{}'::jsonb,
+  release_date date,
   created_by bigint,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -40,6 +44,10 @@ create table if not exists public.series (
   status text not null default 'published' check (status in ('draft','published','hidden','archived')),
   is_featured boolean not null default false,
   view_count bigint not null default 0,
+  external_source text,
+  external_id bigint,
+  external_metadata jsonb not null default '{}'::jsonb,
+  first_air_date date,
   created_by bigint,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -51,6 +59,10 @@ create table if not exists public.seasons (
   season_number integer not null check (season_number > 0),
   title text not null default '',
   status text not null default 'published' check (status in ('draft','published','hidden','archived')),
+  external_source text,
+  external_id bigint,
+  external_metadata jsonb not null default '{}'::jsonb,
+  air_date date,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique(series_id, season_number)
@@ -67,6 +79,10 @@ create table if not exists public.episodes (
   quality text not null default '',
   status text not null default 'published' check (status in ('draft','published','hidden','archived')),
   view_count bigint not null default 0,
+  external_source text,
+  external_id bigint,
+  external_metadata jsonb not null default '{}'::jsonb,
+  air_date date,
   created_by bigint,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
@@ -414,3 +430,20 @@ values('limits', jsonb_build_object(
   'view_window_minutes',15
 ))
 on conflict (key) do update set value=excluded.value,updated_at=now();
+
+
+create unique index if not exists movies_tmdb_unique_idx
+  on public.movies(external_source,external_id)
+  where external_source='tmdb' and external_id is not null;
+
+create unique index if not exists series_tmdb_unique_idx
+  on public.series(external_source,external_id)
+  where external_source='tmdb' and external_id is not null;
+
+create index if not exists seasons_external_idx
+  on public.seasons(external_source,external_id)
+  where external_id is not null;
+
+create index if not exists episodes_external_idx
+  on public.episodes(external_source,external_id)
+  where external_id is not null;
