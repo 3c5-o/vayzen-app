@@ -452,20 +452,51 @@ async function sendContentEditMenu(chatId:number,type:string,publicId:string){
 
 async function sendSeriesEpisodes(chatId:number,seriesPublicId:string){
   const series:any=await contentByPublicId("series",seriesPublicId);
-  if(!series)return sendContentManager(chatId);
-  const {data:seasons}=await db.from("seasons").select("id,season_number,title,status").eq("series_id",series.id).order("season_number",{ascending:true});
+  if(!series)return sendContentList(chatId,"series");
+  const {data:seasons,error}=await db.from("seasons").select("id,season_number,title,status").eq("series_id",series.id).order("season_number",{ascending:true});
+  if(error)throw error;
   const rows:any[]=[];
-  let text=`${series.public_id} | ${series.title}\n\n`;
+  let total=0;
   for(const season of seasons??[]){
-    const {data:eps}=await db.from("episodes").select("public_id,episode_number,title,status").eq("season_id",season.id).order("episode_number",{ascending:true});
-    text+=`الموسم ${season.season_number}: ${(eps??[]).length} حلقة\n`;
-    for(const ep of (eps??[]).slice(0,12)){
-      rows.push([{text:`${ep.status==="published"?"●":"○"} S${season.season_number} E${ep.episode_number} | ${String(ep.title||"").slice(0,24)}`,callback_data:`epi|${ep.public_id}`}]);
-    }
+    const {count}=await db.from("episodes").select("id",{head:true,count:"exact"}).eq("season_id",season.id);
+    total+=count||0;
+    rows.push([{text:`${season.status==="published"?"●":"○"} الموسم ${season.season_number} • ${count||0} حلقة`,callback_data:`season|${series.public_id}|${season.season_number}`}]);
   }
-  if(!rows.length)text+="لا توجد حلقات منشورة أو مخفية بعد.";
-  rows.push([{text:"إضافة حلقة",callback_data:"add_episode"},{text:"رجوع",callback_data:`cm|series|${series.public_id}`}]);
-  return send(chatId,text,{inline_keyboard:rows});
+  rows.push([{text:"إضافة حلقة",callback_data:`add_episode_for|${series.public_id}`}]);
+  rows.push([{text:"رجوع للمسلسل",callback_data:`cm|series|${series.public_id}`}]);
+  return send(chatId,`${series.title}\n\nالمواسم: ${(seasons??[]).length}\nالحلقات: ${total}\n\nاختر موسمًا:`,{inline_keyboard:rows});
+}
+
+async function sendSeasonEpisodes(chatId:number,seriesPublicId:string,seasonNumber:number){
+  const series:any=await contentByPublicId("series",seriesPublicId);
+  if(!series)return sendContentList(chatId,"series");
+  const {data:season}=await db.from("seasons").select("id,season_number,title,status").eq("series_id",series.id).eq("season_number",seasonNumber).maybeSingle();
+  if(!season)return sendSeriesEpisodes(chatId,seriesPublicId);
+  const {data:eps,error}=await db.from("episodes").select("public_id,episode_number,title,status,quality,view_count").eq("season_id",season.id).order("episode_number",{ascending:true});
+  if(error)throw error;
+  const rows:any[]=(eps??[]).map((ep:any)=>[{text:`${ep.status==="published"?"●":"○"} الحلقة ${ep.episode_number} • ${String(ep.title||"").slice(0,22)}`,callback_data:`epi|${ep.public_id}`}]);
+  const nextStatus=season.status==="published"?"hidden":"published";
+  rows.push([{text:"إضافة حلقة",callback_data:`ae_season|${series.public_id}|${seasonNumber}`}]);
+  rows.push([{text:nextStatus==="published"?"نشر الموسم":"إخفاء الموسم",callback_data:`ss|${series.public_id}|${seasonNumber}|${nextStatus}`},{text:"تعديل اسم الموسم",callback_data:`sedit|${series.public_id}|${seasonNumber}`}]);
+  rows.push([{text:"حذف الموسم",callback_data:`sd1|${series.public_id}|${seasonNumber}`}]);
+  rows.push([{text:"رجوع للمواسم",callback_data:`se|${series.public_id}`}]);
+  return send(chatId,`${series.title}\n${season.title||`الموسم ${seasonNumber}`}\n\nالحلقات: ${(eps??[]).length}\nالحالة: ${season.status}`,{inline_keyboard:rows});
+}
+
+async function deleteSeason(adminId:number,seriesPublicId:string,seasonNumber:number){
+  const series:any=await contentByPublicId("series",seriesPublicId);
+  if(!series)throw new Error("المسلسل غير موجود");
+  const {data:season}=await db.from("seasons").select("id").eq("series_id",series.id).eq("season_number",seasonNumber).maybeSingle();
+  if(!season)throw new Error("الموسم غير موجود");
+  const {data:eps}=await db.from("episodes").select("id,public_id").eq("season_id",season.id);
+  const ids=(eps??[]).map((x:any)=>x.id);
+  if(ids.length){
+    const {data:assets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","episode").in("entity_id",ids);
+    for(const a of assets??[])await deleteCopiedMessage({channel_id:a.channel_id,message_id:a.channel_message_id});
+    await db.from("media_assets").delete().eq("entity_type","episode").in("entity_id",ids);
+  }
+  const {error}=await db.from("seasons").delete().eq("id",season.id);if(error)throw error;
+  await adminLog(adminId,"season_delete","series",series.id,series.public_id,{season_number:seasonNumber});
 }
 
 async function sendEpisodeItem(chatId:number,publicId:string){
