@@ -739,6 +739,83 @@ async function callback(q:any){
     if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
     const [,type,id]=a.split("|");return sendContentItem(chatId,type,id);
   }
+  if(a.startsWith("ce|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,type,id]=a.split("|");return sendContentEditMenu(chatId,type,id);
+  }
+  if(a.startsWith("cef|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,type,id,field]=a.split("|");
+    const allowed=["title","description","release_year","genres","language","country","quality","duration_minutes"];
+    if(!allowed.includes(field)||(field==="duration_minutes"&&type!=="movie"))return sendContentEditMenu(chatId,type,id);
+    await setSession(userId,"edit_content","value",{type,public_id:id,field});
+    const labels:any={title:"الاسم",description:"الوصف",release_year:"السنة",genres:"التصنيفات مفصولة بفواصل",language:"اللغة",country:"الدولة",quality:"الجودة",duration_minutes:"المدة بالدقائق"};
+    return send(chatId,`أرسل القيمة الجديدة لـ ${labels[field]||field}.\nاستخدم - لمسح الحقل الاختياري.`);
+  }
+  if(a.startsWith("cp|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,type,id]=a.split("|");
+    if(!["movie","series"].includes(type))return sendContentManager(chatId);
+    await setSession(userId,"replace_poster","file",{type,public_id:id});
+    return send(chatId,"أرسل البوستر الجديد الآن.");
+  }
+  if(a.startsWith("cv|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,type,id]=a.split("|");
+    if(type!=="movie")return sendContentManager(chatId);
+    await setSession(userId,"replace_movie_video","file",{type,public_id:id});
+    return send(chatId,"أرسل فيديو الفيلم الجديد. الحد الأقصى 800MB.");
+  }
+  if(a.startsWith("se|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,id]=a.split("|");return sendSeriesEpisodes(chatId,id);
+  }
+  if(a.startsWith("epi|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,id]=a.split("|");return sendEpisodeItem(chatId,id);
+  }
+  if(a.startsWith("eps|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,id,status]=a.split("|");
+    if(!["published","hidden"].includes(status))return sendEpisodeItem(chatId,id);
+    const ep:any=await episodeByPublicId(id);if(!ep)return send(chatId,"الحلقة غير موجودة.");
+    const {error}=await db.from("episodes").update({status,updated_at:new Date().toISOString()}).eq("id",ep.id);
+    if(error)throw error;
+    await adminLog(userId,"episode_status","episode",ep.id,ep.public_id,{status});
+    return sendEpisodeItem(chatId,id);
+  }
+  if(a.startsWith("epe|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,id,field]=a.split("|");
+    if(!["title","description","quality"].includes(field))return sendEpisodeItem(chatId,id);
+    await setSession(userId,"edit_episode","value",{public_id:id,field});
+    return send(chatId,`أرسل ${field==="title"?"اسم الحلقة":field==="description"?"وصف الحلقة":"الجودة"} الجديد.`);
+  }
+  if(a.startsWith("epv|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,id]=a.split("|");
+    await setSession(userId,"replace_episode_video","file",{public_id:id});
+    return send(chatId,"أرسل فيديو الحلقة الجديد. الحد الأقصى 800MB.");
+  }
+  if(a.startsWith("epd1|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,id]=a.split("|");
+    return send(chatId,`تأكيد حذف الحلقة ${id}؟`,{inline_keyboard:[
+      [{text:"تأكيد الحذف",callback_data:`epd2|${id}`}],
+      [{text:"تراجع",callback_data:`epi|${id}`}],
+    ]});
+  }
+  if(a.startsWith("epd2|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    const [,id]=a.split("|");
+    const ep:any=await episodeByPublicId(id);if(!ep)return send(chatId,"الحلقة غير موجودة.");
+    const old:any=await currentAsset("episode",ep.id,"video");
+    if(old)await deleteCopiedMessage({channel_id:old.channel_id,message_id:old.channel_message_id});
+    await db.from("media_assets").delete().eq("entity_type","episode").eq("entity_id",ep.id);
+    const {error}=await db.from("episodes").delete().eq("id",ep.id);if(error)throw error;
+    await adminLog(userId,"episode_delete","episode",ep.id,ep.public_id,{});
+    return ep.series?.public_id?sendSeriesEpisodes(chatId,ep.series.public_id):sendContentManager(chatId);
+  }
   if(a.startsWith("cs|")){
     if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
     const [,type,id,status]=a.split("|");
