@@ -1136,7 +1136,7 @@ async function callback(q:any){
     return send(chatId,"أرسل الاسم الجديد للموسم.");
   }
   if(a.startsWith("sd1|")){
-    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,id,n]=a.split("|");
     return send(chatId,`تأكيد حذف الموسم ${n} بكل حلقاته؟`,{inline_keyboard:[
       [{text:"تأكيد الحذف",callback_data:`sd2|${id}|${n}`}],
@@ -1144,7 +1144,7 @@ async function callback(q:any){
     ]});
   }
   if(a.startsWith("sd2|")){
-    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,id,n]=a.split("|");
     await deleteSeason(userId,id,Number(n));
     return sendSeriesEpisodes(chatId,id);
@@ -1174,7 +1174,7 @@ async function callback(q:any){
     return send(chatId,`أرسل فيديو ${variantLabel(variant)} الجديد. الحد الأقصى 800MB.`);
   }
   if(a.startsWith("qd1|")){
-    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,type,id,variant]=a.split("|");
     return send(chatId,`تأكيد حذف جودة ${variantLabel(variant)}؟`,{inline_keyboard:[
       [{text:"تأكيد الحذف",callback_data:`qd2|${type}|${id}|${variant}`}],
@@ -1182,7 +1182,7 @@ async function callback(q:any){
     ]});
   }
   if(a.startsWith("qd2|")){
-    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,type,id,variant]=a.split("|");
     try{await deleteQuality(userId,type,id,variant);}
     catch(err){return send(chatId,adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:`q|${type}|${id}`}]]});}
@@ -1212,7 +1212,7 @@ async function callback(q:any){
     return send(chatId,"أرسل فيديو الحلقة الجديد. الحد الأقصى 800MB.");
   }
   if(a.startsWith("epd1|")){
-    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,id]=a.split("|");
     return send(chatId,`تأكيد حذف الحلقة ${id}؟`,{inline_keyboard:[
       [{text:"تأكيد الحذف",callback_data:`epd2|${id}`}],
@@ -1220,7 +1220,7 @@ async function callback(q:any){
     ]});
   }
   if(a.startsWith("epd2|")){
-    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,id]=a.split("|");
     const ep:any=await episodeByPublicId(id);if(!ep)return send(chatId,"الحلقة غير موجودة.");
     const {data:assets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","episode").eq("entity_id",ep.id);
@@ -1253,7 +1253,7 @@ async function callback(q:any){
     return sendContentItem(chatId,type,id);
   }
   if(a.startsWith("cd1|")){
-    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,type,id]=a.split("|");
     return send(chatId,`تأكيد حذف ${id}؟ الحذف يزيله من التطبيق ومن تخزين البوت قدر الإمكان.`,{inline_keyboard:[
       [{text:"تأكيد الحذف",callback_data:`cd2|${type}|${id}`}],
@@ -1261,13 +1261,106 @@ async function callback(q:any){
     ]});
   }
   if(a.startsWith("cd2|")){
-    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,type,id]=a.split("|");
     await deleteContent(userId,type,id);
     return sendContentManager(chatId);
   }
 
+  if(a==="admins"){
+    if(!can(admin,"admins"))return send(chatId,"لا تملك صلاحية إدارة المشرفين.");
+    return sendAdminsManager(chatId,admin);
+  }
+  if(a==="admin_logs"){
+    if(!can(admin,"logs")&&!can(admin,"admins"))return send(chatId,"لا تملك صلاحية مشاهدة السجلات.");
+    return sendAdminLogs(chatId);
+  }
+  if(a==="adm_add"){
+    if(!can(admin,"admins"))return send(chatId,"لا تملك صلاحية إدارة المشرفين.");
+    await setSession(userId,"add_admin","telegram_id",{});
+    return send(chatId,"أرسل Telegram User ID للمشرف الجديد.");
+  }
+  if(a.startsWith("adm|")){
+    if(!can(admin,"admins"))return send(chatId,"لا تملك صلاحية إدارة المشرفين.");
+    const [,id]=a.split("|");return sendAdminItem(chatId,admin,Number(id));
+  }
+  if(a.startsWith("adm_roles|")){
+    if(!can(admin,"admins"))return send(chatId,"لا تملك صلاحية إدارة المشرفين.");
+    const [,id]=a.split("|");return sendAdminRoles(chatId,admin,Number(id));
+  }
+  if(a.startsWith("adm_role|")){
+    if(!can(admin,"admins"))return send(chatId,"لا تملك صلاحية إدارة المشرفين.");
+    const [,id,role]=a.split("|");
+    const targetId=Number(id);
+    const {data:t}=await db.from("admin_users").select("telegram_user_id,display_name,role,permissions,is_active").eq("telegram_user_id",targetId).maybeSingle();
+    if(!t||!canManageAdmin(admin,t as Admin,role))return send(chatId,"غير مسموح بتغيير هذا الدور.");
+    if(role==="owner")return send(chatId,"لا يمكن تعيين Owner جديد.");
+    const allowed=["secondary_admin","content_manager","requests_manager","moderator","support"];
+    if(!allowed.includes(role))return send(chatId,"الدور غير صالح.");
+    if(role==="secondary_admin"&&admin.role!=="owner")return send(chatId,"فقط المالك يستطيع تعيين أدمن ثانوي.");
+    const {error}=await db.from("admin_users").update({role,permissions:{},updated_at:new Date().toISOString()}).eq("telegram_user_id",targetId);
+    if(error)throw error;
+    await adminLog(userId,"admin_role_change","admin",undefined,String(targetId),{from:t.role,to:role});
+    return sendAdminItem(chatId,admin,targetId);
+  }
+  if(a.startsWith("adm_perms|")){
+    if(!can(admin,"admins"))return send(chatId,"لا تملك صلاحية إدارة المشرفين.");
+    const [,id]=a.split("|");return sendAdminPermissions(chatId,admin,Number(id));
+  }
+  if(a.startsWith("admp_reset|")){
+    if(!can(admin,"admins"))return send(chatId,"لا تملك صلاحية إدارة المشرفين.");
+    const [,id]=a.split("|");const targetId=Number(id);
+    const {data:t}=await db.from("admin_users").select("telegram_user_id,display_name,role,permissions,is_active").eq("telegram_user_id",targetId).maybeSingle();
+    if(!t||!canManageAdmin(admin,t as Admin)||["owner","secondary_admin"].includes(t.role))return send(chatId,"غير مسموح.");
+    const {error}=await db.from("admin_users").update({permissions:{},updated_at:new Date().toISOString()}).eq("telegram_user_id",targetId);if(error)throw error;
+    await adminLog(userId,"admin_permissions_reset","admin",undefined,String(targetId),{});
+    return sendAdminPermissions(chatId,admin,targetId);
+  }
+  if(a.startsWith("admp|")){
+    if(!can(admin,"admins"))return send(chatId,"لا تملك صلاحية إدارة المشرفين.");
+    const [,id,perm,value]=a.split("|");const targetId=Number(id);
+    if(!(perm in permissionLabels))return send(chatId,"صلاحية غير معروفة.");
+    const {data:t}=await db.from("admin_users").select("telegram_user_id,display_name,role,permissions,is_active").eq("telegram_user_id",targetId).maybeSingle();
+    if(!t||!canManageAdmin(admin,t as Admin)||["owner","secondary_admin"].includes(t.role))return send(chatId,"غير مسموح.");
+    const permissions={...(t.permissions||{}),[perm]:value==="1"};
+    const {error}=await db.from("admin_users").update({permissions,updated_at:new Date().toISOString()}).eq("telegram_user_id",targetId);if(error)throw error;
+    await adminLog(userId,"admin_permission_change","admin",undefined,String(targetId),{permission:perm,value:value==="1"});
+    return sendAdminPermissions(chatId,admin,targetId);
+  }
+  if(a.startsWith("adm_active|")){
+    if(!can(admin,"admins"))return send(chatId,"لا تملك صلاحية إدارة المشرفين.");
+    const [,id,value]=a.split("|");const targetId=Number(id);
+    const {data:t}=await db.from("admin_users").select("telegram_user_id,display_name,role,permissions,is_active").eq("telegram_user_id",targetId).maybeSingle();
+    if(!t||targetId===userId||!canManageAdmin(admin,t as Admin)||t.role==="owner")return send(chatId,"لا يمكن تغيير حالة هذا الحساب.");
+    const active=value==="1";
+    const {error}=await db.from("admin_users").update({is_active:active,updated_at:new Date().toISOString()}).eq("telegram_user_id",targetId);if(error)throw error;
+    await db.from("bot_sessions").delete().eq("telegram_user_id",targetId);
+    await adminLog(userId,active?"admin_enable":"admin_disable","admin",undefined,String(targetId),{});
+    return sendAdminItem(chatId,admin,targetId);
+  }
+  if(a.startsWith("adm_del1|")){
+    if(!can(admin,"admins"))return send(chatId,"لا تملك صلاحية إدارة المشرفين.");
+    const [,id]=a.split("|");const targetId=Number(id);
+    const {data:t}=await db.from("admin_users").select("telegram_user_id,display_name,role,permissions,is_active").eq("telegram_user_id",targetId).maybeSingle();
+    if(!t||targetId===userId||!canManageAdmin(admin,t as Admin)||t.role==="owner")return send(chatId,"لا يمكن حذف هذا الحساب.");
+    return send(chatId,`تأكيد حذف المشرف ${t.display_name||targetId}؟`,{inline_keyboard:[
+      [{text:"تأكيد الحذف",callback_data:`adm_del2|${targetId}`}],
+      [{text:"تراجع",callback_data:`adm|${targetId}`}],
+    ]});
+  }
+  if(a.startsWith("adm_del2|")){
+    if(!can(admin,"admins"))return send(chatId,"لا تملك صلاحية إدارة المشرفين.");
+    const [,id]=a.split("|");const targetId=Number(id);
+    const {data:t}=await db.from("admin_users").select("telegram_user_id,display_name,role,permissions,is_active").eq("telegram_user_id",targetId).maybeSingle();
+    if(!t||targetId===userId||!canManageAdmin(admin,t as Admin)||t.role==="owner")return send(chatId,"لا يمكن حذف هذا الحساب.");
+    await db.from("bot_sessions").delete().eq("telegram_user_id",targetId);
+    const {error}=await db.from("admin_users").delete().eq("telegram_user_id",targetId);if(error)throw error;
+    await adminLog(userId,"admin_delete","admin",undefined,String(targetId),{role:t.role,display_name:t.display_name});
+    return sendAdminsManager(chatId,admin);
+  }
+
   if(a==="stats"){
+    if(!can(admin,"stats"))return send(chatId,"لا تملك صلاحية الإحصائيات.");
     const [m,sr,e,r,p,u,du,topM,topS]=await Promise.all([
       db.from("movies").select("id",{head:true,count:"exact"}),
       db.from("series").select("id",{head:true,count:"exact"}),
@@ -1284,24 +1377,24 @@ async function callback(q:any){
     return showMenu(chatId,`إحصائيات VAYZEN\n\nالأفلام: ${m.count||0}\nالمسلسلات: ${sr.count||0}\nالحلقات: ${e.count||0}\nالمستخدمون: ${u.count||0}\nالحسابات المعطلة: ${du.count||0}\nطلبات جديدة: ${r.count||0}\nبلاغات جديدة: ${p.count||0}\n\nأكثر الأفلام مشاهدة:\n${topMovies}\n\nأكثر المسلسلات مشاهدة:\n${topSeries}`);
   }
   if(a==="system_status"){
-    if(!can(admin,"logs")&&admin.role!=="owner"&&admin.role!=="secondary_admin")return send(chatId,"لا تملك صلاحية مراقبة النظام.");
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية مراقبة النظام.");
     return showMenu(chatId,await systemStatusText());
   }
   if(a==="users"){
-    if(!["owner","secondary_admin"].includes(admin.role))return send(chatId,"لا تملك صلاحية إدارة المستخدمين.");
+    if(!can(admin,"users"))return send(chatId,"لا تملك صلاحية إدارة المستخدمين.");
     return sendUsersManager(chatId);
   }
   if(a==="user_search"){
-    if(!["owner","secondary_admin"].includes(admin.role))return send(chatId,"لا تملك صلاحية إدارة المستخدمين.");
+    if(!can(admin,"users"))return send(chatId,"لا تملك صلاحية إدارة المستخدمين.");
     await setSession(userId,"search_user","query",{});
     return send(chatId,"أرسل الاسم أو البريد الإلكتروني للبحث.");
   }
   if(a.startsWith("usr|")){
-    if(!["owner","secondary_admin"].includes(admin.role))return send(chatId,"لا تملك صلاحية إدارة المستخدمين.");
+    if(!can(admin,"users"))return send(chatId,"لا تملك صلاحية إدارة المستخدمين.");
     const [,id]=a.split("|");return sendUserItem(chatId,id);
   }
   if(a.startsWith("usb|")){
-    if(!["owner","secondary_admin"].includes(admin.role))return send(chatId,"لا تملك صلاحية إدارة المستخدمين.");
+    if(!can(admin,"users"))return send(chatId,"لا تملك صلاحية إدارة المستخدمين.");
     const [,id,value]=a.split("|");
     const disabled=value==="1";
     const {error}=await db.from("profiles").update({is_disabled:disabled,updated_at:new Date().toISOString()}).eq("id",id);
