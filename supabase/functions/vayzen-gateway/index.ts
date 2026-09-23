@@ -592,10 +592,8 @@ async function publishEpisode(userId:number,chatId:number,d:any){
     }).select("id").single();
     if(se||!createdSeason)throw se??new Error("Season failed");
     season={...createdSeason,status:"published"};
-  }else if(season.status==="draft"){
-    await db.from("seasons").update({status:"published",updated_at:new Date().toISOString()}).eq("id",season.id);
-    season={...season,status:"published"};
   }
+  const seasonWasDraft=season.status==="draft";
 
   const {data:existing}=await db.from("episodes").select("id,public_id,status,title,description,duration_minutes,external_source")
     .eq("season_id",season.id).eq("episode_number",d.episode_number).maybeSingle();
@@ -622,21 +620,41 @@ async function publishEpisode(userId:number,chatId:number,d:any){
   }
 
   let place:any=null;
+  const variant=normalizeVariant(d.variant||d.quality||"default");
+  const oldAsset:any=await currentAsset("episode",ep.id,"video",variant);
+  let assetWritten=false,seasonPromoted=false;
   try{
-    const variant=normalizeVariant(d.variant||d.quality||"default");
-    const oldAsset:any=await currentAsset("episode",ep.id,"video",variant);
     place=await copyTo("series_storage",chatId,d.video_source_message_id,
       `${ep.public_id} | ${series.title} | موسم ${d.season_number} | حلقة ${d.episode_number} | ${variantLabel(variant)}`);
     await saveAsset("episode",ep.id,"video",d.video,place,variant);
-    if(oldAsset?.channel_id&&oldAsset?.channel_message_id)await deleteCopiedMessage({channel_id:oldAsset.channel_id,message_id:oldAsset.channel_message_id});
+    assetWritten=true;
     const {error:publishError}=await db.from("episodes").update({status:"published",quality:d.quality||variantLabel(variant),updated_at:new Date().toISOString()}).eq("id",ep.id);
     if(publishError)throw publishError;
+    if(seasonWasDraft){
+      const {error:seasonError}=await db.from("seasons").update({status:"published",updated_at:new Date().toISOString()}).eq("id",season.id);
+      if(seasonError)throw seasonError;
+      seasonPromoted=true;
+    }
+    if(oldAsset?.channel_id&&oldAsset?.channel_message_id)await deleteCopiedMessage({channel_id:oldAsset.channel_id,message_id:oldAsset.channel_message_id});
     await adminLog(userId,existing?"episode_replace":"episode_publish","episode",ep.id,ep.public_id,{series:series.title});
     return ep.public_id;
   }catch(err){
     await deleteCopiedMessage(place);
+    if(assetWritten){
+      if(oldAsset){
+        await db.from("media_assets").update({
+          channel_id:oldAsset.channel_id,channel_message_id:oldAsset.channel_message_id,
+          telegram_file_id:oldAsset.telegram_file_id??null,telegram_unique_id:oldAsset.telegram_unique_id??null,
+          mime_type:oldAsset.mime_type??null,file_name:oldAsset.file_name??null,file_size:oldAsset.file_size??null,
+          updated_at:new Date().toISOString()
+        }).eq("entity_type","episode").eq("entity_id",ep.id).eq("kind","video").eq("variant",variant);
+      }else{
+        await db.from("media_assets").delete().eq("entity_type","episode").eq("entity_id",ep.id).eq("kind","video").eq("variant",variant);
+      }
+    }
     if(created)await cleanupEntity("episode",ep.id);
     else await db.from("episodes").update({status:existing.status,updated_at:new Date().toISOString()}).eq("id",ep.id);
+    if(seasonWasDraft&&seasonPromoted)await db.from("seasons").update({status:"draft",updated_at:new Date().toISOString()}).eq("id",season.id);
     await systemLog("error","episode publish failed",{public_id:ep.public_id});
     throw err;
   }
@@ -672,7 +690,7 @@ async function episodeByPublicId(publicId:string){
 
 async function currentAsset(entityType:string,entityId:string,kind:string,variant="default"){
   const {data}=await db.from("media_assets")
-    .select("channel_id,channel_message_id,telegram_file_id,file_size,mime_type,variant")
+    .select("channel_id,channel_message_id,telegram_file_id,telegram_unique_id,file_size,mime_type,file_name,variant")
     .eq("entity_type",entityType).eq("entity_id",entityId).eq("kind",kind).eq("variant",normalizeVariant(variant)).maybeSingle();
   return data??null;
 }
