@@ -180,9 +180,21 @@ async function copyTo(key:string,fromChatId:number,messageId:number,caption:stri
   return {channel_id:Number(ch.telegram_channel_id),message_id:Number(r.message_id)};
 }
 
-async function saveAsset(entity_type:string,entity_id:string,kind:string,file:any,place:any){
+function normalizeVariant(value:any){
+  const v=String(value||"default").trim().toLowerCase().replace(/\s+/g,"");
+  return /^[a-z0-9_-]{1,20}$/.test(v)?v:"default";
+}
+function variantLabel(value:string){
+  const v=normalizeVariant(value);
+  if(v==="default")return "افتراضي";
+  if(/^\d{3,4}p$/.test(v))return v;
+  if(v==="4k")return "4K";
+  return v.toUpperCase();
+}
+async function saveAsset(entity_type:string,entity_id:string,kind:string,file:any,place:any,variant="default"){
+  variant=normalizeVariant(variant);
   const {error}=await db.from("media_assets").upsert({
-    entity_type,entity_id,kind,variant:"default",
+    entity_type,entity_id,kind,variant,
     channel_id:place.channel_id,
     channel_message_id:place.message_id,
     telegram_file_id:file.file_id??null,
@@ -398,21 +410,22 @@ async function episodeByPublicId(publicId:string){
   return {...ep,season,series};
 }
 
-async function currentAsset(entityType:string,entityId:string,kind:string){
+async function currentAsset(entityType:string,entityId:string,kind:string,variant="default"){
   const {data}=await db.from("media_assets")
-    .select("channel_id,channel_message_id,telegram_file_id,file_size,mime_type")
-    .eq("entity_type",entityType).eq("entity_id",entityId).eq("kind",kind).eq("variant","default").maybeSingle();
+    .select("channel_id,channel_message_id,telegram_file_id,file_size,mime_type,variant")
+    .eq("entity_type",entityType).eq("entity_id",entityId).eq("kind",kind).eq("variant",normalizeVariant(variant)).maybeSingle();
   return data??null;
 }
 
 async function replaceStoredAsset(opts:{
   adminId:number;chatId:number;entityType:"movie"|"series"|"episode";entityId:string;publicId:string;
-  kind:"poster"|"video";channelKey:string;sourceMessageId:number;file:any;caption:string;
+  kind:"poster"|"video";channelKey:string;sourceMessageId:number;file:any;caption:string;variant?:string;
 }){
-  const oldAsset:any=await currentAsset(opts.entityType,opts.entityId,opts.kind);
+  const variant=normalizeVariant(opts.variant||"default");
+  const oldAsset:any=await currentAsset(opts.entityType,opts.entityId,opts.kind,variant);
   const place=await copyTo(opts.channelKey,opts.chatId,opts.sourceMessageId,opts.caption);
   try{
-    await saveAsset(opts.entityType,opts.entityId,opts.kind,opts.file,place);
+    await saveAsset(opts.entityType,opts.entityId,opts.kind,opts.file,place,variant);
   }catch(err){
     await deleteCopiedMessage(place);
     throw err;
@@ -420,7 +433,7 @@ async function replaceStoredAsset(opts:{
   if(oldAsset?.channel_id&&oldAsset?.channel_message_id){
     await deleteCopiedMessage({channel_id:oldAsset.channel_id,message_id:oldAsset.channel_message_id});
   }
-  await adminLog(opts.adminId,"asset_replace",opts.entityType,opts.entityId,opts.publicId,{kind:opts.kind});
+  await adminLog(opts.adminId,"asset_replace",opts.entityType,opts.entityId,opts.publicId,{kind:opts.kind,variant});
 }
 
 async function sendContentEditMenu(chatId:number,type:string,publicId:string){
