@@ -6,7 +6,7 @@ const DEVICE_KEY="vayzen.device";
 const GUEST_PROGRESS_KEY="vayzen.guest.progress";
 
 const state={
-  movies:[],series:[],favorites:[],progress:[],user:null,session:null,
+  movies:[],series:[],favorites:[],progress:[],watchHistory:[],user:null,session:null,
   query:"",movieGenre:"",seriesGenre:"",movieYear:"",seriesYear:"",currentPage:"home",detail:null,detailVariant:"",player:null,nextEpisode:null,searchReturnPage:"home",
   heroItems:[],heroIndex:0,
   prefs:{autoplayNext:true,saveProgress:true}
@@ -116,6 +116,20 @@ function percent(type,id){
   return Math.max(0,Math.min(100,Number(p.position_seconds)/Number(p.duration_seconds)*100));
 }
 function itemBy(type,id){return (type==="movie"?state.movies:state.series).find(x=>x.id===id)}
+
+function watchHistoryFor(type,id){return state.watchHistory.find(x=>x.entity_type===type&&x.entity_id===id)}
+function episodeWatchState(id){
+  const h=watchHistoryFor("episode",id);
+  if(h?.completed_at)return "completed";
+  const p=progressFor("episode",id);
+  if(p&&Number(p.duration_seconds)>0&&Number(p.position_seconds)/Number(p.duration_seconds)>=.92)return "completed";
+  if(p&&Number(p.position_seconds)>5)return "progress";
+  return "new";
+}
+function episodeWatchLabel(id){
+  const s=episodeWatchState(id);
+  return s==="completed"?"تمت المشاهدة":s==="progress"?"قيد المشاهدة":"جديدة";
+}
 
 function ratingValue(x){return Number(x?.rating)||0}
 function createdValue(x){const n=Date.parse(x?.created_at||"");return Number.isFinite(n)?n:0}
@@ -401,15 +415,53 @@ function renderContinue(){
     if(o)removeContinueEntry(o.type,o.id);
   });
 }
+function renderWatchHistory(){
+  const section=$("#historySection"),list=$("#watchHistoryList");
+  if(!section||!list)return;
+  if(!state.user){section.classList.add("hidden");list.innerHTML="";return}
+  section.classList.remove("hidden");
+  const rows=(state.watchHistory||[]).slice(0,30);
+  list.innerHTML=rows.length?rows.map((h,i)=>{
+    const m=h.meta||{};
+    const completed=Boolean(h.completed_at);
+    const pct=Number(h.duration_seconds)>0?Math.max(0,Math.min(100,Math.round(Number(h.last_position_seconds)/Number(h.duration_seconds)*100))):0;
+    if(h.entity_type==="movie"){
+      return `<article class="history-row" data-history-index="${i}">
+        <div class="history-thumb"><img src="${mediaUrl("movie_poster",h.entity_id)}" alt="" loading="lazy"><span class="history-play"><svg><use href="#i-play"/></svg></span></div>
+        <div class="history-copy"><b>${esc(m.title||"فيلم")}</b><small>${completed?"تمت المشاهدة":"تابع من "+formatClock(h.last_position_seconds)}</small><div class="history-progress"><i style="width:${completed?100:pct}%"></i></div></div>
+        <span class="history-state ${completed?"done":""}">${completed?"مكتمل":"متابعة"}</span>
+      </article>`;
+    }
+    return `<article class="history-row" data-history-index="${i}">
+      <div class="history-thumb episode" style="background-image:url('${m.series_id?mediaUrl("series_backdrop",m.series_id):""}')"><span class="history-play"><svg><use href="#i-play"/></svg></span></div>
+      <div class="history-copy"><b>${esc(m.series_title||"مسلسل")} • ${esc(m.title||("الحلقة "+(m.episode_number||"")))}</b><small>الموسم ${m.season_number||"—"} • ${completed?"تمت المشاهدة":"تابع من "+formatClock(h.last_position_seconds)}</small><div class="history-progress"><i style="width:${completed?100:pct}%"></i></div></div>
+      <span class="history-state ${completed?"done":""}">${completed?"مكتمل":"متابعة"}</span>
+    </article>`;
+  }).join(""):'<div class="empty-state">سجل المشاهدة فارغ.</div>';
+  list.querySelectorAll("[data-history-index]").forEach(el=>el.onclick=()=>{
+    const h=rows[Number(el.dataset.historyIndex)],m=h?.meta||{};if(!h)return;
+    if(h.entity_type==="movie"){
+      const item=state.movies.find(x=>x.id===h.entity_id);
+      if(item)openPlayer({type:"movie",id:item.id,title:item.title,publicId:item.public_id,quality:item.quality||"",src:mediaUrl("movie_video",item.id)});
+      return;
+    }
+    openPlayer({
+      type:"episode",id:h.entity_id,title:(m.series_title||"مسلسل")+" • "+(m.title||("الحلقة "+(m.episode_number||""))),
+      publicId:m.public_id||"",src:mediaUrl("episode_video",h.entity_id),
+      seriesId:m.series_id||null,seriesTitle:m.series_title||"",seasonNumber:m.season_number||null,
+      episodeNumber:m.episode_number||null,episodeTitle:m.title||""
+    });
+  });
+}
 function renderMyList(){
   const guest=$("#myListGuest"),grid=$("#myListGrid");
   if(!state.user){
-    guest.classList.remove("hidden");grid.innerHTML="";return;
+    guest.classList.remove("hidden");grid.innerHTML="";renderWatchHistory();return;
   }
   guest.classList.add("hidden");
   const items=state.favorites.map(f=>({type:f.entity_type,item:itemBy(f.entity_type,f.entity_id)})).filter(x=>x.item);
   grid.innerHTML=items.length?items.map(x=>card(x.item,x.type)).join(""):'<div class="empty-state">قائمتك فارغة. احفظ أي فيلم أو مسلسل ليظهر هنا.</div>';
-  bindCards(grid);
+  bindCards(grid);renderWatchHistory();
 }
 
 async function loadCatalog(){
@@ -427,16 +479,17 @@ async function loadCatalog(){
   }
 }
 async function loadUserState(){
-  if(!state.session?.access_token){state.user=null;state.favorites=[];state.progress=[];renderAccount();renderCatalog();return}
+  if(!state.session?.access_token){state.user=null;state.favorites=[];state.progress=[];state.watchHistory=[];renderAccount();renderCatalog();return}
   try{
-    const [me,fav,prog]=await Promise.all([
+    const [me,fav,prog,hist]=await Promise.all([
       rawApi("me",{auth:true}),
       rawApi("favorites",{auth:true}),
-      rawApi("progress",{auth:true})
+      rawApi("progress",{auth:true}),
+      rawApi("watch_history",{auth:true})
     ]);
-    state.user=me.user;state.favorites=fav.favorites||[];state.progress=prog.progress||[];
+    state.user=me.user;state.favorites=fav.favorites||[];state.progress=prog.progress||[];state.watchHistory=hist.history||[];
   }catch{
-    state.user=null;state.favorites=[];state.progress=[];setSession(null);
+    state.user=null;state.favorites=[];state.progress=[];state.watchHistory=[];setSession(null);
   }
   renderAccount();renderCatalog();
 }
@@ -561,11 +614,15 @@ async function loadSeriesContent(series){
     const show=i=>{
       tabs.querySelectorAll(".season-tab").forEach((b,n)=>b.classList.toggle("active",n===i));
       const season=seasons[i],eps=season.episodes||[];
-      list.innerHTML=eps.length?eps.map((e,n)=>`<article class="episode-row">
+      list.innerHTML=eps.length?eps.map((e,n)=>{
+        const stateName=episodeWatchState(e.id),watchLabel=episodeWatchLabel(e.id);
+        return `<article class="episode-row ${stateName==="completed"?"watched":stateName==="progress"?"watching":""}">
         <div class="episode-thumb" style="background-image:url('${mediaUrl("series_backdrop",series.id)}')"><span class="episode-index">${String(e.episode_number).padStart(2,"0")}</span><span class="episode-thumb-play"><svg><use href="#i-play"/></svg></span></div>
         <div class="episode-copy"><b>${esc(e.title||("الحلقة "+e.episode_number))}</b><small>${e.duration_minutes?e.duration_minutes+" دقيقة":""}${e.quality?" • "+esc(e.quality):""}${Number(e.rating)>0?" • ★ "+Number(e.rating).toFixed(1):""}</small><p>${esc(e.description||"")}</p></div>
+        <span class="episode-watch-state ${stateName}">${watchLabel}</span>
         <button class="episode-play" data-e="${n}" aria-label="تشغيل الحلقة"><svg><use href="#i-play"/></svg></button>
-      </article>`).join(""):'<div class="empty-state">لا توجد حلقات منشورة في هذا الموسم.</div>';
+      </article>`;
+      }).join(""):'<div class="empty-state">لا توجد حلقات منشورة في هذا الموسم.</div>';
       list.querySelectorAll("[data-e]").forEach(btn=>{
         const n=Number(btn.dataset.e),ep=eps[n],next=eps[n+1];
         btn.onclick=()=>openPlayer({
@@ -797,6 +854,41 @@ async function loadPlayerQualities(o){
     select.classList.add("hidden");
   }
 }
+function clearPlayerTracks(){
+  video.querySelectorAll("track[data-vayzen-track]").forEach(t=>t.remove());
+  try{for(const t of video.textTracks)t.mode="disabled"}catch{}
+  const select=$("#subtitleSelect");
+  if(select){select.innerHTML='<option value="">بدون ترجمة</option>';select.classList.add("hidden")}
+}
+async function loadPlayerSubtitles(o){
+  clearPlayerTracks();
+  const select=$("#subtitleSelect");if(!select)return;
+  try{
+    const j=await rawApi("subtitles",{params:{type:o.type,id:o.id}});
+    const tracks=Array.isArray(j.tracks)?j.tracks:[];
+    if(!tracks.length)return;
+    tracks.forEach((t,i)=>{
+      const track=document.createElement("track");
+      track.dataset.vayzenTrack="1";track.kind="subtitles";track.label=String(t.label||t.language_code||"Subtitle");
+      track.srclang=String(t.language_code||"");track.src=mediaUrl(o.type==="movie"?"movie_subtitle":"episode_subtitle",o.id,"sub_"+String(t.language_code||"").replace(/-/g,"_"));
+      if(t.is_default)track.default=true;
+      video.appendChild(track);
+    });
+    select.innerHTML='<option value="">بدون ترجمة</option>'+tracks.map((t,i)=>`<option value="${i}" ${t.is_default?"selected":""}>${esc(t.label||t.language_code)}</option>`).join("");
+    select.classList.remove("hidden");
+    const defaultIndex=tracks.findIndex(t=>t.is_default);
+    if(defaultIndex>=0)setTimeout(()=>setSubtitleMode(String(defaultIndex)),80);
+  }catch{clearPlayerTracks()}
+}
+function setSubtitleMode(value){
+  const idx=value===""?-1:Number(value);
+  try{for(let i=0;i<video.textTracks.length;i++)video.textTracks[i].mode=i===idx?"showing":"disabled"}catch{}
+}
+function freshSourceForPlayer(o,variant=""){
+  const base=sourceForPlayer(o,variant);
+  try{const u=new URL(base,location.href);u.searchParams.set("_r",Date.now().toString());return u.toString()}catch{return base}
+}
+
 function sourceForPlayer(o,variant=""){
   return mediaUrl(o.type==="movie"?"movie_video":"episode_video",o.id,variant);
 }
@@ -814,7 +906,7 @@ async function openPlayer(o,{pushHistory=true}={}){
   seekInput.value="0";seekInput.style.setProperty("--progress","0%");
   $("#playerCurrentTime").textContent="0:00";$("#playerDuration").textContent="0:00";$("#playerRemaining").textContent="−0:00";
   video.playbackRate=1;$("#speedSelect").value="1";
-  await loadPlayerQualities(o);
+  await Promise.all([loadPlayerQualities(o),loadPlayerSubtitles(o)]);
   const qv=$("#qualitySelect")?.value||"default";
   o.qualityVariant=qv;o.src=sourceForPlayer(o,qv);
   video.src=o.src;video.load();
@@ -835,6 +927,7 @@ async function closePlayer({fromHistory=false}={}){
   $("#nextCountdown")?.classList.add("hidden");
   await saveCurrentProgress();
   video.pause();
+  clearPlayerTracks();
   video.removeAttribute("src");video.load();
   playerLayer.classList.remove("open","controls-hidden","idle");
   playerLayer.setAttribute("aria-hidden","true");
@@ -856,6 +949,10 @@ async function saveCurrentProgress(){
   };
   if(state.user){
     const i=state.progress.findIndex(x=>x.entity_type===o.type&&x.entity_id===o.id);if(i>=0)state.progress[i]=entry;else state.progress.unshift(entry);
+    const hIndex=state.watchHistory.findIndex(x=>x.entity_type===o.type&&x.entity_id===o.id);
+    const completed=Number(entry.duration_seconds)>0&&Number(entry.position_seconds)/Number(entry.duration_seconds)>=.92;
+    const h={entity_type:o.type,entity_id:o.id,last_position_seconds:entry.position_seconds,duration_seconds:entry.duration_seconds,last_watched_at:new Date().toISOString(),completed_at:completed?new Date().toISOString():(hIndex>=0?state.watchHistory[hIndex].completed_at:null),meta:o.type==="episode"?{id:o.id,public_id:o.publicId,title:o.episodeTitle||o.title,episode_number:o.episodeNumber,season_number:o.seasonNumber,series_id:o.seriesId,series_title:o.seriesTitle}:itemBy("movie",o.id)};
+    if(hIndex>=0)state.watchHistory[hIndex]={...state.watchHistory[hIndex],...h};else state.watchHistory.unshift(h);
     try{await rawApi("progress",{method:"POST",auth:true,body:entry})}catch{}
   }else{
     const list=guestProgress(),i=list.findIndex(x=>x.entity_type===o.type&&x.entity_id===o.id);if(i>=0)list[i]=entry;else list.unshift(entry);setGuestProgress(list);
@@ -874,12 +971,13 @@ video.addEventListener("play",()=>{updatePlayIcon();scheduleControlsHide()});
 video.addEventListener("pause",()=>{updatePlayIcon();showPlayerControls(true);saveCurrentProgress()});
 function retryCurrentPlayer(auto=false){
   const o=state.player;if(!o)return;
-  const t=video.currentTime||0;
+  const t=video.currentTime||0,paused=video.paused;
   $("#playerError").classList.add("hidden");$("#playerLoader").classList.remove("hidden");
+  o.src=freshSourceForPlayer(o,o.qualityVariant||"default");
   video.src=o.src;video.load();
   video.addEventListener("loadedmetadata",()=>{
     if(t>0&&t<video.duration)video.currentTime=t;
-    video.play().catch(()=>{});
+    if(!paused||auto)video.play().catch(()=>{});
   },{once:true});
   if(!auto)playerRetryCount=0;
 }
@@ -902,12 +1000,12 @@ function startNextEpisodeCountdown(){
 }
 video.addEventListener("error",()=>{
   const code=video.error?.code||0;
-  if(code===2&&navigator.onLine&&playerRetryCount<2&&state.player){
+  if(code===2&&navigator.onLine&&playerRetryCount<3&&state.player){
     playerRetryCount+=1;
     $("#playerError").classList.add("hidden");$("#playerLoader").classList.remove("hidden");
     $("#playerErrorText").textContent="إعادة الاتصال بمصدر الفيديو...";
     clearTimeout(playerRetryTimer);
-    playerRetryTimer=setTimeout(()=>retryCurrentPlayer(true),1200*playerRetryCount);
+    playerRetryTimer=setTimeout(()=>retryCurrentPlayer(true),[800,1800,3500][playerRetryCount-1]||3500);
     return;
   }
   $("#playerLoader").classList.add("hidden");
@@ -991,7 +1089,7 @@ $("#qualitySelect").onchange=()=>{
   const o=state.player;if(!o)return;
   const t=video.currentTime||0,paused=video.paused;
   o.qualityVariant=$("#qualitySelect").value||"default";
-  o.src=sourceForPlayer(o,o.qualityVariant);
+  o.src=freshSourceForPlayer(o,o.qualityVariant);
   $("#playerLoader").classList.remove("hidden");
   video.src=o.src;video.load();
   video.addEventListener("loadedmetadata",()=>{
@@ -999,6 +1097,7 @@ $("#qualitySelect").onchange=()=>{
     if(!paused)video.play().catch(()=>{});
   },{once:true});
 };
+$("#subtitleSelect").onchange=e=>{setSubtitleMode(e.target.value);showPlayerControls(true)};
 $("#speedSelect").onchange=e=>{
   video.playbackRate=Number(e.target.value)||1;
   flashSeek((Number(e.target.value)||1)+"×");showPlayerControls();

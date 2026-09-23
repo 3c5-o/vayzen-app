@@ -211,7 +211,7 @@ async function consumeRateLimit(key:string,action:string,limit:number,windowSeco
   if(error)throw error;
   if(Math.random()<0.02){
     const cutoff=new Date(Date.now()-3*86400000).toISOString();
-    db.from("api_rate_limits").delete().lt("updated_at",cutoff).then(()=>{}).catch(()=>{});
+    void db.from("api_rate_limits").delete().lt("updated_at",cutoff).then(()=>{},()=>{});
   }
   return true;
 }
@@ -261,7 +261,10 @@ function botUiIconKey(button:TelegramInlineButton):BotUiIconKey|undefined{
   if(a==="stats")return "stats";
   if(a==="admins"||a.startsWith("adm"))return "admin";
   if(a==="admin_logs")return "content";
-  if(a==="system_status"||a==="bot_ui_settings"||a==="bot_ui_setup")return "settings";
+  if(a==="system_status"||a==="bot_ui_settings"||a==="bot_ui_setup"||a==="backups"||a==="backup_create")return "settings";
+  if(a==="jobs"||a.startsWith("job|")||a.startsWith("job_retry|"))return "content";
+  if(a==="trash"||a.startsWith("trash_"))return "delete";
+  if(a==="health"||a==="health_run"||a==="alerts"||a==="ops_run")return "report";
   if(a==="tmdb_settings"||a.startsWith("tmdb_")||a.startsWith("content_search")||a==="user_search"||t.includes("بحث"))return "search";
   if(a==="content"||a==="content_movies"||a==="content_series"||a.startsWith("cm|"))return "content";
   if(a.startsWith("q|")||a.startsWith("qa|")||a.startsWith("qv|")||a.startsWith("qr|")||t.includes("الجودات")||t.includes("الجودة"))return "quality";
@@ -277,7 +280,7 @@ function botUiButtonStyle(button:TelegramInlineButton):"primary"|"success"|"dang
   const t=String(button.text||"");
   if(a==="cancel"||a.includes("del")||a.startsWith("cd")||a.startsWith("sd")||a.startsWith("qd")||a.startsWith("epd")||a.includes("|rejected")||t.includes("حذف")||t.includes("رفض")||t.includes("تعطيل"))return "danger";
   if(a.startsWith("confirm")||a.includes("|published")||a.includes("|resolved")||a==="tmdb_token_test"||t.includes("نشر")||t.includes("استخدام هذه النتيجة")||t.includes("تم الحل")||t.includes("إعادة التفعيل"))return "success";
-  if(a==="add_movie"||a==="add_series"||a==="batch_episode"||a==="add_episode"||a==="content"||a==="requests"||a==="reports"||a==="users"||a==="stats"||a==="admins"||a==="system_status"||a==="tmdb_settings"||a==="bot_ui_settings"||a.startsWith("content_")||a==="user_search")return "primary";
+  if(a==="add_movie"||a==="add_series"||a==="batch_episode"||a==="add_episode"||a==="content"||a==="requests"||a==="reports"||a==="users"||a==="stats"||a==="admins"||a==="system_status"||a==="tmdb_settings"||a==="bot_ui_settings"||a==="jobs"||a==="health"||a==="alerts"||a==="backups"||a.startsWith("content_")||a==="user_search")return "primary";
   return undefined;
 }
 async function decorateInlineKeyboard(markup?:unknown){
@@ -508,8 +511,19 @@ function menuFor(admin:Admin){
     if(can(admin,"system"))row.push({text:"حالة النظام",callback_data:"system_status"});
     if(row.length)rows.push(row);
   }
+  if(can(admin,"system")||can(admin,"delete_content")){
+    const row:any[]=[];
+    if(can(admin,"system"))row.push({text:"عمليات الوسائط",callback_data:"jobs"});
+    if(can(admin,"delete_content"))row.push({text:"سلة المحذوفات",callback_data:"trash"});
+    if(row.length)rows.push(row);
+  }
+  if(can(admin,"system")){
+    rows.push([{text:"فحص الوسائط",callback_data:"health"},{text:"تنبيهات التشغيل",callback_data:"alerts"}]);
+  }
   if(can(admin,"logs"))rows.push([{text:"سجل الإدارة",callback_data:"admin_logs"}]);
-  if(admin.role==="owner")rows.push([{text:"هوية أزرار VAYZEN",callback_data:"bot_ui_settings"}]);
+  if(admin.role==="owner"){
+    rows.push([{text:"Backup البيانات",callback_data:"backups"},{text:"هوية أزرار VAYZEN",callback_data:"bot_ui_settings"}]);
+  }
   rows.push([{text:"إلغاء العملية",callback_data:"cancel"}]);
   return {inline_keyboard:rows};
 }
@@ -557,6 +571,30 @@ function videoFrom(m:any){
   }
   return null;
 }
+function subtitleFileFrom(m:any){
+  const d=m.document;
+  if(!d?.file_id)return null;
+  const name=String(d.file_name||"").trim();
+  const ext=(name.split(".").pop()||"").toLowerCase();
+  const mime=String(d.mime_type||"").toLowerCase();
+  if(!["vtt","srt"].includes(ext)&&!["text/vtt","application/x-subrip","text/plain"].includes(mime))return null;
+  const format=ext==="srt"?"srt":"vtt";
+  return {
+    file_id:d.file_id,file_unique_id:d.file_unique_id??null,
+    mime_type:format==="vtt"?"text/vtt":"application/x-subrip",
+    file_name:name||`subtitle.${format}`,file_size:d.file_size??null,format
+  };
+}
+function normalizeLanguageCode(v:any){
+  const s=String(v||"").trim().toLowerCase().replace(/_/g,"-");
+  return /^[a-z]{2,3}(?:-[a-z]{2})?$/.test(s)?s:"";
+}
+function subtitleVariant(lang:string){return normalizeVariant("sub_"+normalizeLanguageCode(lang).replace(/-/g,"_"))}
+function subtitleLabel(code:string){
+  const map:Record<string,string>={ar:"العربية",en:"English",tr:"Türkçe",ku:"Kurdî",fa:"فارسی",fr:"Français",es:"Español"};
+  return map[code]||code.toUpperCase();
+}
+
 function yearOf(v:string){
   const n=Number(v.trim());
   return Number.isInteger(n)&&n>=1888&&n<=2100?n:null;
@@ -605,7 +643,15 @@ async function markTransferRolledBack(place:any){
   }catch{}
 }
 
-async function copyTo(key:string,fromChatId:number,messageId:number,caption:string,fileSize?:number|null){
+type TransferContext={
+  entityType?:"movie"|"series"|"episode";
+  entityId?:string;
+  entityPublicId?:string;
+  kind?:"poster"|"video"|"backdrop"|"subtitle"|"trailer";
+  variant?:string;
+  file?:any;
+};
+async function copyTo(key:string,fromChatId:number,messageId:number,caption:string,fileSize?:number|null,ctx:TransferContext={}){
   const ch=await channel(key);
   const jobKey=await sha256Text(["copy",key,String(fromChatId),String(messageId),caption].join("|"));
   const existing:any=await transferJob(jobKey);
@@ -618,6 +664,19 @@ async function copyTo(key:string,fromChatId:number,messageId:number,caption:stri
     from_chat_id:fromChatId,source_message_id:messageId,
     file_size:fileSize??null,max_attempts:COPY_RETRY_DELAYS_MS.length,
     attempts:["failed","rolled_back"].includes(String(existing?.status||""))?0:Number(existing?.attempts||0),
+    caption,
+    entity_type:ctx.entityType??null,
+    entity_id:ctx.entityId??null,
+    entity_public_id:ctx.entityPublicId??null,
+    kind:ctx.kind??null,
+    variant:ctx.variant?normalizeVariant(ctx.variant):null,
+    file_metadata:ctx.file?{
+      file_id:ctx.file.file_id??null,
+      file_unique_id:ctx.file.file_unique_id??null,
+      mime_type:ctx.file.mime_type??null,
+      file_name:ctx.file.file_name??null,
+      file_size:ctx.file.file_size??null
+    }:{},
     last_error:null
   },{onConflict:"job_key"}).select("id,status,attempts,max_attempts").single();
   if(jobError||!job)throw jobError??new Error("تعذر تجهيز عملية نقل الوسائط.");
@@ -785,7 +844,7 @@ async function publishMovie(userId:number,chatId:number,d:any){
       `المدة: ${d.duration_minutes?d.duration_minutes+" دقيقة":"—"}`,
       `الجودات: ${videos.map(v=>variantLabel(v.variant)).join(" • ")}`,"",d.description||"","",`Movie ID: ${movie.public_id}`,
     ].filter(Boolean).join("\n");
-    posterPlace=await copyTo("movies_info",chatId,d.poster_source_message_id,infoCaption);
+    posterPlace=await copyTo("movies_info",chatId,d.poster_source_message_id,infoCaption,d.poster?.file_size,{entityType:"movie",entityId:movie.id,entityPublicId:movie.public_id,kind:"poster",variant:"default",file:d.poster});
     await saveAsset("movie",movie.id,"poster",d.poster,posterPlace);
     if(d.backdrop_url){
       const existingBackdrop=await currentAsset("movie",movie.id,"backdrop");
@@ -796,7 +855,7 @@ async function publishMovie(userId:number,chatId:number,d:any){
       }
     }
     for(const v of videos){
-      const place=await copyTo("movies_storage",chatId,v.source_message_id,`${movie.public_id} | ${d.title} | ${variantLabel(v.variant)} | ${sizeLabel(v.file?.file_size)}`,v.file?.file_size);
+      const place=await copyTo("movies_storage",chatId,v.source_message_id,`${movie.public_id} | ${d.title} | ${variantLabel(v.variant)} | ${sizeLabel(v.file?.file_size)}`,v.file?.file_size,{entityType:"movie",entityId:movie.id,entityPublicId:movie.public_id,kind:"video",variant:v.variant,file:v.file});
       videoPlaces.push(place);
       await saveAsset("movie",movie.id,"video",v.file,place,v.variant);
     }
@@ -831,7 +890,7 @@ async function publishSeries(userId:number,chatId:number,d:any){
       `اللغة: ${d.language||"—"}`,`الدولة: ${d.country||"—"}`,
       `الجودة: ${d.quality||"—"}`,"",d.description||"","",`Series ID: ${series.public_id}`,
     ].filter(Boolean).join("\n");
-    posterPlace=await copyTo("series_info",chatId,d.poster_source_message_id,infoCaption);
+    posterPlace=await copyTo("series_info",chatId,d.poster_source_message_id,infoCaption,d.poster?.file_size,{entityType:"series",entityId:series.id,entityPublicId:series.public_id,kind:"poster",variant:"default",file:d.poster});
     await saveAsset("series",series.id,"poster",d.poster,posterPlace);
     if(d.backdrop_url){
       const remote=await sendRemotePhotoTo("series_info",d.backdrop_url,`${series.public_id} | ${d.title} | backdrop`);
@@ -895,7 +954,8 @@ async function publishEpisode(userId:number,chatId:number,d:any){
   let assetWritten=false,seasonPromoted=false;
   try{
     place=await copyTo("series_storage",chatId,d.video_source_message_id,
-      `${ep.public_id} | ${series.title} | موسم ${d.season_number} | حلقة ${d.episode_number} | ${variantLabel(variant)}`,d.video?.file_size);
+      `${ep.public_id} | ${series.title} | موسم ${d.season_number} | حلقة ${d.episode_number} | ${variantLabel(variant)}`,d.video?.file_size,
+      {entityType:"episode",entityId:ep.id,entityPublicId:ep.public_id,kind:"video",variant,file:d.video});
     await saveAsset("episode",ep.id,"video",d.video,place,variant);
     assetWritten=true;
     const {error:publishError}=await db.from("episodes").update({status:"published",quality:d.quality||variantLabel(variant),updated_at:new Date().toISOString()}).eq("id",ep.id);
@@ -924,7 +984,7 @@ async function publishEpisode(userId:number,chatId:number,d:any){
       }
     }
     if(created)await cleanupEntity("episode",ep.id);
-    else await db.from("episodes").update({status:existing.status,updated_at:new Date().toISOString()}).eq("id",ep.id);
+    else await db.from("episodes").update({status:existing?.status??"draft",updated_at:new Date().toISOString()}).eq("id",ep.id);
     if(seasonWasDraft&&seasonPromoted)await db.from("seasons").update({status:"draft",updated_at:new Date().toISOString()}).eq("id",season.id);
     await systemLog("error","episode publish failed",{public_id:ep.public_id});
     throw err;
@@ -954,15 +1014,16 @@ async function contentByPublicId(type:string,publicId:string){
   const table=type==="movie"?"movies":type==="series"?"series":null;
   if(!table)return null;
   const fields=type==="movie"
-    ?"id,public_id,title,original_title,description,release_year,genres,language,country,duration_minutes,quality,status,is_featured,view_count,external_source,external_id,rating,rating_count,release_date,created_at,updated_at"
-    :"id,public_id,title,original_title,description,release_year,genres,language,country,quality,status,is_featured,view_count,external_source,external_id,rating,rating_count,first_air_date,created_at,updated_at";
-  const {data}=await db.from(table).select(fields).eq("public_id",publicId.toUpperCase()).maybeSingle();
+    ?"id,public_id,title,original_title,description,release_year,genres,language,country,duration_minutes,quality,status,is_featured,view_count,external_source,external_id,rating,rating_count,release_date,deleted_at,deleted_by,deleted_previous_status,created_at,updated_at"
+    :"id,public_id,title,original_title,description,release_year,genres,language,country,quality,status,is_featured,view_count,external_source,external_id,rating,rating_count,first_air_date,deleted_at,deleted_by,deleted_previous_status,created_at,updated_at";
+  const client:any=db;
+  const {data}=await client.from(table).select(fields).eq("public_id",publicId.toUpperCase()).maybeSingle();
   return data??null;
 }
 
 async function episodeByPublicId(publicId:string){
   const {data:ep}=await db.from("episodes")
-    .select("id,public_id,season_id,episode_number,title,description,duration_minutes,quality,status,view_count,created_at,updated_at")
+    .select("id,public_id,season_id,episode_number,title,description,duration_minutes,quality,status,view_count,deleted_at,deleted_by,deleted_previous_status,created_at,updated_at")
     .eq("public_id",publicId.toUpperCase()).maybeSingle();
   if(!ep)return null;
   const {data:season}=await db.from("seasons").select("id,series_id,season_number,title,status").eq("id",ep.season_id).maybeSingle();
@@ -984,7 +1045,7 @@ async function replaceStoredAsset(opts:{
   const variant=normalizeVariant(opts.variant||"default");
   if(opts.kind==="video")validateVideoFile(opts.file);
   const oldAsset:any=await currentAsset(opts.entityType,opts.entityId,opts.kind,variant);
-  const place=await copyTo(opts.channelKey,opts.chatId,opts.sourceMessageId,opts.caption,opts.file?.file_size);
+  const place=await copyTo(opts.channelKey,opts.chatId,opts.sourceMessageId,opts.caption,opts.file?.file_size,{entityType:opts.entityType,entityId:opts.entityId,entityPublicId:opts.publicId,kind:opts.kind,variant,file:opts.file});
   try{
     await saveAsset(opts.entityType,opts.entityId,opts.kind,opts.file,place,variant);
   }catch(err){
@@ -1071,6 +1132,7 @@ async function sendEpisodeItem(chatId:number,publicId:string){
     [{text:nextStatus==="published"?"نشر الحلقة":"إخفاء الحلقة",callback_data:`eps|${ep.public_id}|${nextStatus}`}],
     [{text:"تعديل الاسم",callback_data:`epe|${ep.public_id}|title`},{text:"تعديل الوصف",callback_data:`epe|${ep.public_id}|description`}],
     [{text:"تعديل الجودة",callback_data:`epe|${ep.public_id}|quality`},{text:"إدارة الجودات",callback_data:`q|episode|${ep.public_id}`}],
+    [{text:"الترجمات",callback_data:`sub|episode|${ep.public_id}`}],
     [{text:"حذف الحلقة",callback_data:`epd1|${ep.public_id}`}],
     [{text:"رجوع للحلقات",callback_data:`se|${ep.series?.public_id||""}`}],
   ];
@@ -1128,6 +1190,87 @@ async function deleteQuality(adminId:number,type:string,publicId:string,variant:
   const {error}=await db.from("media_assets").delete().eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("kind","video").eq("variant",v);
   if(error)throw error;
   await adminLog(adminId,"quality_delete",target.entityType,target.item.id,publicId,{variant:v});
+}
+
+async function subtitleTarget(type:string,publicId:string){
+  if(type==="movie"){
+    const item:any=await contentByPublicId("movie",publicId);
+    return item?{entityType:"movie",item,channelKey:"movies_storage"}:null;
+  }
+  if(type==="episode"){
+    const item:any=await episodeByPublicId(publicId);
+    return item?{entityType:"episode",item,channelKey:"series_storage"}:null;
+  }
+  return null;
+}
+
+async function sendSubtitleManager(chatId:number,type:string,publicId:string){
+  const target:any=await subtitleTarget(type,publicId);
+  if(!target)return send(chatId,"المحتوى غير موجود.");
+  const {data,error}=await db.from("subtitle_tracks")
+    .select("id,language_code,label,source_format,is_default,created_at")
+    .eq("entity_type",target.entityType).eq("entity_id",target.item.id)
+    .order("is_default",{ascending:false}).order("created_at",{ascending:true});
+  if(error)throw error;
+  const rows:any[]=(data??[]).map((x:any)=>[{
+    text:`${x.is_default?"●":"○"} ${x.label} • ${String(x.source_format).toUpperCase()}`,
+    callback_data:`sub_item|${type}|${publicId}|${x.language_code}`
+  }]);
+  rows.push([{text:"إضافة ترجمة",callback_data:`sub_add|${type}|${publicId}`}]);
+  rows.push([{text:"رجوع",callback_data:type==="movie"?`cm|movie|${publicId}`:`epi|${publicId}`}]);
+  return send(chatId,`ترجمات ${target.item.title||target.item.public_id}\n\nالمسارات: ${(data??[]).length}`,{inline_keyboard:rows});
+}
+
+async function storeSubtitleTrack(adminId:number,chatId:number,type:string,publicId:string,lang:string,label:string,file:any,sourceMessageId:number){
+  const target:any=await subtitleTarget(type,publicId);
+  if(!target)throw new Error("المحتوى غير موجود");
+  const code=normalizeLanguageCode(lang);if(!code)throw new Error("رمز اللغة غير صالح");
+  if(Number(file.file_size||0)>8*1024*1024)throw new Error("ملف الترجمة أكبر من 8MB.");
+  const variant=subtitleVariant(code);
+  const old:any=await currentAsset(target.entityType,target.item.id,"subtitle",variant);
+  const place=await copyTo(target.channelKey,chatId,sourceMessageId,
+    `${publicId} | Subtitle | ${label} | ${String(file.format||"vtt").toUpperCase()}`,
+    file.file_size,{entityType:target.entityType,entityId:target.item.id,entityPublicId:publicId,kind:"subtitle",variant,file});
+  try{
+    await saveAsset(target.entityType,target.item.id,"subtitle",file,place,variant);
+    const {data:asset}=await db.from("media_assets").select("id").eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("kind","subtitle").eq("variant",variant).single();
+    if(!asset?.id)throw new Error("تعذر تثبيت ملف الترجمة.");
+    await db.from("media_assets").update({metadata:{language_code:code,label,source_format:file.format||"vtt"},updated_at:new Date().toISOString()}).eq("id",asset.id);
+    const {count}=await db.from("subtitle_tracks").select("id",{head:true,count:"exact"}).eq("entity_type",target.entityType).eq("entity_id",target.item.id);
+    const {error}=await db.from("subtitle_tracks").upsert({
+      entity_type:target.entityType,entity_id:target.item.id,language_code:code,label,
+      source_format:file.format||"vtt",is_default:Number(count||0)===0,media_asset_id:asset.id,created_by:adminId,updated_at:new Date().toISOString()
+    },{onConflict:"entity_type,entity_id,language_code"});
+    if(error)throw error;
+  }catch(err){
+    await deleteCopiedMessage(place);throw err;
+  }
+  const sameTarget=old?.channel_id===place.channel_id&&old?.channel_message_id===place.message_id;
+  if(old?.channel_id&&old?.channel_message_id&&!sameTarget)await deleteCopiedMessage({channel_id:old.channel_id,message_id:old.channel_message_id});
+  await adminLog(adminId,"subtitle_upsert",target.entityType,target.item.id,publicId,{language_code:code,label,format:file.format||"vtt"});
+}
+
+async function deleteSubtitleTrack(adminId:number,type:string,publicId:string,lang:string){
+  const target:any=await subtitleTarget(type,publicId);
+  if(!target)throw new Error("المحتوى غير موجود");
+  const code=normalizeLanguageCode(lang);if(!code)throw new Error("رمز لغة غير صالح");
+  const variant=subtitleVariant(code);
+  const old:any=await currentAsset(target.entityType,target.item.id,"subtitle",variant);
+  if(old)await deleteCopiedMessage({channel_id:old.channel_id,message_id:old.channel_message_id});
+  const {error}=await db.from("subtitle_tracks").delete().eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("language_code",code);
+  if(error)throw error;
+  await db.from("media_assets").delete().eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("kind","subtitle").eq("variant",variant);
+  await adminLog(adminId,"subtitle_delete",target.entityType,target.item.id,publicId,{language_code:code});
+}
+
+async function setDefaultSubtitle(adminId:number,type:string,publicId:string,lang:string){
+  const target:any=await subtitleTarget(type,publicId);
+  if(!target)throw new Error("المحتوى غير موجود");
+  const code=normalizeLanguageCode(lang);if(!code)throw new Error("رمز لغة غير صالح");
+  await db.from("subtitle_tracks").update({is_default:false,updated_at:new Date().toISOString()}).eq("entity_type",target.entityType).eq("entity_id",target.item.id);
+  const {error}=await db.from("subtitle_tracks").update({is_default:true,updated_at:new Date().toISOString()}).eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("language_code",code);
+  if(error)throw error;
+  await adminLog(adminId,"subtitle_default",target.entityType,target.item.id,publicId,{language_code:code});
 }
 
 async function sendAdminsManager(chatId:number,actor:Admin){
@@ -1267,8 +1410,8 @@ async function sendUserItem(chatId:number,userId:string){
 
 async function sendContentManager(chatId:number){
   const [m,s]=await Promise.all([
-    db.from("movies").select("id",{head:true,count:"exact"}),
-    db.from("series").select("id",{head:true,count:"exact"}),
+    db.from("movies").select("id",{head:true,count:"exact"}).is("deleted_at",null),
+    db.from("series").select("id",{head:true,count:"exact"}).is("deleted_at",null),
   ]);
   return send(chatId,
     `إدارة المحتوى\n\nالأفلام: ${m.count||0}\nالمسلسلات: ${s.count||0}\n\nاختر القسم:`,
@@ -1282,7 +1425,7 @@ async function sendContentManager(chatId:number){
 
 async function sendContentList(chatId:number,type:"movie"|"series"){
   const table=type==="movie"?"movies":"series";
-  const {data,error}=await db.from(table).select("public_id,title,status,is_featured,created_at").order("created_at",{ascending:false}).limit(20);
+  const {data,error}=await db.from(table).select("public_id,title,status,is_featured,created_at").is("deleted_at",null).order("created_at",{ascending:false}).limit(20);
   if(error)throw error;
   const rows:any[]=(data??[]).map((x:any)=>[{
     text:`${x.status==="published"?"●":"○"} ${String(x.title).slice(0,30)}${x.is_featured?" ★":""}`,
@@ -1299,7 +1442,7 @@ async function searchContent(chatId:number,query:string,type?:string){
   const rows:any[]=[];
   for(const t of types){
     const table=t==="movie"?"movies":"series";
-    const {data}=await db.from(table).select("public_id,title,status,is_featured").or(`title.ilike.%${q}%,public_id.ilike.%${q}%`).limit(10);
+    const {data}=await db.from(table).select("public_id,title,status,is_featured").is("deleted_at",null).or(`title.ilike.%${q}%,public_id.ilike.%${q}%`).limit(10);
     for(const x of data??[])rows.push([{text:`${t==="movie"?"فيلم":"مسلسل"} • ${String(x.title).slice(0,28)}`,callback_data:`cm|${t}|${x.public_id}`}]);
   }
   rows.push([{text:"بحث جديد",callback_data:type?`content_search_type|${type}`:"content_search"},{text:"رجوع",callback_data:type==="movie"?"content_movies":type==="series"?"content_series":"content"}]);
@@ -1307,7 +1450,7 @@ async function searchContent(chatId:number,query:string,type?:string){
 }
 
 async function sendBatchSeriesPicker(chatId:number){
-  const {data,error}=await db.from("series").select("public_id,title,status").eq("status","published").order("updated_at",{ascending:false}).limit(20);
+  const {data,error}=await db.from("series").select("public_id,title,status").eq("status","published").is("deleted_at",null).order("updated_at",{ascending:false}).limit(20);
   if(error)throw error;
   const rows:any[]=(data??[]).map((x:any)=>[{text:String(x.title).slice(0,34),callback_data:`batch_for|${x.public_id}`}]);
   rows.push([{text:"رجوع",callback_data:"menu"}]);
@@ -1528,6 +1671,7 @@ async function sendContentItem(chatId:number,type:string,publicId:string){
     [type==="movie"
       ?{text:"إدارة الجودات",callback_data:`q|movie|${item.public_id}`}
       :{text:"المواسم والحلقات",callback_data:`se|${item.public_id}`}],
+    ...(type==="movie"?[[{text:"الترجمات",callback_data:`sub|movie|${item.public_id}`}]]:[]),
     ...(type==="series"&&item.external_source==="tmdb"&&item.external_id
       ?[[{text:"تحديث مواسم وحلقات TMDb",callback_data:`tmdb_sync|${item.public_id}`}]]
       :[]),
@@ -1545,26 +1689,76 @@ async function sendContentItem(chatId:number,type:string,publicId:string){
   );
 }
 
-async function deleteContent(adminId:number,type:string,publicId:string){
+async function softDeleteContent(adminId:number,type:string,publicId:string){
   const item:any=await contentByPublicId(type,publicId);
   if(!item)throw new Error("المحتوى غير موجود");
-  const places:any[]=[];
+  if(item.deleted_at)return;
+  const table=type==="movie"?"movies":"series";
+  const {error}=await db.from(table).update({
+    deleted_at:new Date().toISOString(),
+    deleted_by:adminId,
+    deleted_previous_status:item.status||"published",
+    status:"archived",
+    is_featured:false,
+    updated_at:new Date().toISOString()
+  }).eq("id",item.id);
+  if(error)throw error;
+  await adminLog(adminId,"content_trash",type,item.id,item.public_id,{title:item.title,previous_status:item.status});
+}
 
-  if(type==="movie"){
-    const {data:assets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","movie").eq("entity_id",item.id);
+async function softDeleteEpisode(adminId:number,publicId:string){
+  const ep:any=await episodeByPublicId(publicId);
+  if(!ep)throw new Error("الحلقة غير موجودة");
+  const {error}=await db.from("episodes").update({
+    deleted_at:new Date().toISOString(),
+    deleted_by:adminId,
+    deleted_previous_status:ep.status||"published",
+    status:"archived",
+    updated_at:new Date().toISOString()
+  }).eq("id",ep.id);
+  if(error)throw error;
+  await adminLog(adminId,"episode_trash","episode",ep.id,ep.public_id,{previous_status:ep.status});
+}
+
+async function restoreTrashItem(adminId:number,type:string,id:string){
+  const table=type==="movie"?"movies":type==="series"?"series":type==="episode"?"episodes":null;
+  if(!table)throw new Error("نوع غير صالح");
+  const {data:item,error:readError}=await db.from(table)
+    .select("id,public_id,status,deleted_at,deleted_previous_status")
+    .eq("id",id).maybeSingle();
+  if(readError)throw readError;
+  if(!item?.deleted_at)throw new Error("العنصر غير موجود في السلة");
+  const restoreStatus=["published","hidden","draft"].includes(String(item.deleted_previous_status||""))
+    ?item.deleted_previous_status:"hidden";
+  const {error}=await db.from(table).update({
+    deleted_at:null,deleted_by:null,deleted_previous_status:null,
+    status:restoreStatus,updated_at:new Date().toISOString()
+  }).eq("id",id);
+  if(error)throw error;
+  await adminLog(adminId,"trash_restore",type,id,item.public_id,{status:restoreStatus});
+}
+
+async function purgeContentPermanent(adminId:number,type:string,id:string){
+  const table=type==="movie"?"movies":type==="series"?"series":type==="episode"?"episodes":null;
+  if(!table)throw new Error("نوع غير صالح");
+  const {data:item}=await db.from(table).select("id,public_id,deleted_at").eq("id",id).maybeSingle();
+  if(!item?.deleted_at)throw new Error("الحذف النهائي متاح فقط للعناصر الموجودة في السلة");
+  const places:any[]=[];
+  if(type==="movie"||type==="episode"){
+    const {data:assets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type",type).eq("entity_id",id);
     places.push(...(assets??[]).map((x:any)=>({channel_id:x.channel_id,message_id:x.channel_message_id})));
     for(const p of places)await deleteCopiedMessage(p);
-    await db.from("media_assets").delete().eq("entity_type","movie").eq("entity_id",item.id);
-    const {error}=await db.from("movies").delete().eq("id",item.id);if(error)throw error;
+    await db.from("media_assets").delete().eq("entity_type",type).eq("entity_id",id);
+    const {error}=await db.from(table).delete().eq("id",id);if(error)throw error;
   }else{
-    const {data:seasons}=await db.from("seasons").select("id").eq("series_id",item.id);
+    const {data:seasons}=await db.from("seasons").select("id").eq("series_id",id);
     const seasonIds=(seasons??[]).map((x:any)=>x.id);
     let episodeIds:string[]=[];
     if(seasonIds.length){
       const {data:eps}=await db.from("episodes").select("id").in("season_id",seasonIds);
       episodeIds=(eps??[]).map((x:any)=>x.id);
     }
-    const {data:seriesAssets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","series").eq("entity_id",item.id);
+    const {data:seriesAssets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","series").eq("entity_id",id);
     places.push(...(seriesAssets??[]).map((x:any)=>({channel_id:x.channel_id,message_id:x.channel_message_id})));
     if(episodeIds.length){
       const {data:episodeAssets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","episode").in("entity_id",episodeIds);
@@ -1572,10 +1766,104 @@ async function deleteContent(adminId:number,type:string,publicId:string){
       await db.from("media_assets").delete().eq("entity_type","episode").in("entity_id",episodeIds);
     }
     for(const p of places)await deleteCopiedMessage(p);
-    await db.from("media_assets").delete().eq("entity_type","series").eq("entity_id",item.id);
-    const {error}=await db.from("series").delete().eq("id",item.id);if(error)throw error;
+    await db.from("media_assets").delete().eq("entity_type","series").eq("entity_id",id);
+    const {error}=await db.from("series").delete().eq("id",id);if(error)throw error;
   }
-  await adminLog(adminId,"content_delete",type,item.id,item.public_id,{title:item.title});
+  await adminLog(adminId,"trash_purge",type,id,item.public_id,{});
+}
+
+async function purgeExpiredTrash(adminId:number){
+  const cutoff=new Date(Date.now()-14*24*60*60_000).toISOString();
+  const tasks:Array<{type:string,id:string}>=[];
+  for(const [table,type] of [["movies","movie"],["series","series"],["episodes","episode"]] as const){
+    const {data}=await db.from(table).select("id").not("deleted_at","is",null).lt("deleted_at",cutoff).limit(50);
+    for(const row of data??[])tasks.push({type,id:row.id});
+  }
+  for(const t of tasks){
+    try{await purgeContentPermanent(adminId,t.type,t.id)}catch{}
+  }
+  return tasks.length;
+}
+
+async function sendTrashManager(chatId:number,admin:Admin){
+  if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية سلة المحذوفات.");
+  await purgeExpiredTrash(Number(admin.telegram_user_id));
+  const [movies,series,episodes]=await Promise.all([
+    db.from("movies").select("id,public_id,title,deleted_at").not("deleted_at","is",null).order("deleted_at",{ascending:false}).limit(6),
+    db.from("series").select("id,public_id,title,deleted_at").not("deleted_at","is",null).order("deleted_at",{ascending:false}).limit(6),
+    db.from("episodes").select("id,public_id,title,deleted_at").not("deleted_at","is",null).order("deleted_at",{ascending:false}).limit(6)
+  ]);
+  const items=[
+    ...(movies.data??[]).map((x:any)=>({...x,type:"movie",label:"فيلم"})),
+    ...(series.data??[]).map((x:any)=>({...x,type:"series",label:"مسلسل"})),
+    ...(episodes.data??[]).map((x:any)=>({...x,type:"episode",label:"حلقة"}))
+  ].sort((a:any,b:any)=>Date.parse(b.deleted_at)-Date.parse(a.deleted_at)).slice(0,12);
+  const rows:any[]=items.map((x:any)=>[
+    {text:`استرجاع ${x.public_id}`,callback_data:`trash_restore|${x.type}|${x.id}`},
+    ...(admin.role==="owner"?[{text:"حذف نهائي",callback_data:`trash_purge1|${x.type}|${x.id}`}]:[])
+  ]);
+  rows.push([{text:"رجوع",callback_data:"menu"}]);
+  const lines=items.map((x:any)=>`• ${x.label} • ${x.public_id} • ${x.title||"—"}`).join("\n");
+  return send(chatId,`سلة المحذوفات\nالاحتفاظ: 14 يومًا\n\n${lines||"السلة فارغة."}`,{inline_keyboard:rows});
+}
+
+async function sendJobCenter(chatId:number){
+  const {data,error}=await db.from("media_transfer_jobs")
+    .select("id,status,entity_type,entity_public_id,kind,variant,file_size,attempts,max_attempts,last_error,updated_at")
+    .order("updated_at",{ascending:false}).limit(20);
+  if(error)throw error;
+  const jobs:any[]=data??[];
+  const counts=jobs.reduce((m:any,j:any)=>(m[j.status]=(m[j.status]||0)+1,m),{});
+  const rows:any[]=jobs.slice(0,10).map((j:any)=>[{text:
+    `${j.status==="completed"?"✓":j.status==="failed"?"!":j.status==="processing"?"…":"○"} ${j.entity_public_id||j.kind||"Job"} • ${sizeLabel(j.file_size)}`,
+    callback_data:`job|${j.id}`
+  }]);
+  rows.push([{text:"تحديث",callback_data:"jobs"},{text:"رجوع",callback_data:"menu"}]);
+  return send(chatId,
+    `مركز عمليات الوسائط\n\nمكتمل: ${counts.completed||0}\nقيد التنفيذ: ${counts.processing||0}\nبانتظار: ${counts.pending||0}\nفشل: ${counts.failed||0}\n\nآخر العمليات:`,
+    {inline_keyboard:rows}
+  );
+}
+
+async function sendJobItem(chatId:number,id:string){
+  const {data:j}=await db.from("media_transfer_jobs")
+    .select("id,status,channel_key,from_chat_id,source_message_id,target_channel_id,target_message_id,file_size,attempts,max_attempts,last_error,entity_type,entity_id,entity_public_id,kind,variant,caption,file_metadata,updated_at")
+    .eq("id",id).maybeSingle();
+  if(!j)return sendJobCenter(chatId);
+  const rows:any[]=[];
+  if(["failed","rolled_back"].includes(j.status)&&j.entity_type&&j.entity_id&&j.kind&&j.kind!=="subtitle"){
+    rows.push([{text:"إعادة المحاولة",callback_data:`job_retry|${j.id}`}]);
+  }
+  rows.push([{text:"رجوع للعمليات",callback_data:"jobs"}]);
+  return send(chatId,
+    `عملية وسائط\n\nالحالة: ${j.status}\nالمحتوى: ${j.entity_public_id||"—"}\nالنوع: ${j.kind||"—"}\nالجودة: ${j.variant||"—"}\nالحجم: ${sizeLabel(j.file_size)}\nالمحاولات: ${j.attempts}/${j.max_attempts}\nآخر خطأ: ${j.last_error?String(j.last_error).slice(0,220):"—"}`,
+    {inline_keyboard:rows}
+  );
+}
+
+async function retryMediaTransferJob(adminId:number,id:string){
+  const {data:j,error}=await db.from("media_transfer_jobs")
+    .select("*").eq("id",id).maybeSingle();
+  if(error||!j)throw error??new Error("العملية غير موجودة");
+  if(!["failed","rolled_back"].includes(j.status))throw new Error("العملية لا تحتاج إعادة محاولة");
+  if(j.kind==="subtitle")throw new Error("أعد رفع ملف الترجمة من مدير الترجمات للحفاظ على بيانات اللغة.");
+  if(!j.entity_type||!j.entity_id||!j.kind)throw new Error("هذه عملية قديمة ولا تحتوي سياقًا كافيًا لإعادة المحاولة التلقائية");
+  const file:any=j.file_metadata||{};
+  if(!file.file_id)throw new Error("بيانات الملف غير مكتملة");
+  const existsTable=j.entity_type==="movie"?"movies":j.entity_type==="series"?"series":"episodes";
+  const {data:entity}=await db.from(existsTable).select("id").eq("id",j.entity_id).maybeSingle();
+  if(!entity)throw new Error("المحتوى المرتبط لم يعد موجودًا");
+  const variant=normalizeVariant(j.variant||"default");
+  await db.from("media_transfer_jobs").update({status:"pending",attempts:0,last_error:null,updated_at:new Date().toISOString()}).eq("id",id);
+  const place=await copyTo(j.channel_key,Number(j.from_chat_id),Number(j.source_message_id),String(j.caption||j.entity_public_id||"VAYZEN"),Number(j.file_size||file.file_size||0),{
+    entityType:j.entity_type,entityId:j.entity_id,entityPublicId:j.entity_public_id||undefined,kind:j.kind,variant,file
+  });
+  await saveAsset(j.entity_type,j.entity_id,j.kind,file,place,variant);
+  if(j.kind==="video"&&["movie","episode"].includes(j.entity_type)){
+    const table=j.entity_type==="movie"?"movies":"episodes";
+    await db.from(table).update({quality:variantLabel(variant),updated_at:new Date().toISOString()}).eq("id",j.entity_id);
+  }
+  await adminLog(adminId,"media_job_retry",j.entity_type,j.entity_id,j.entity_public_id,{job_id:id,kind:j.kind,variant});
 }
 
 async function sendRequestsManager(chatId:number){
@@ -1623,16 +1911,21 @@ async function sendReportsManager(chatId:number){
 }
 
 async function systemStatusText(){
-  const [mp,md,sp,ep,rq,rp,lastError]=await Promise.all([
-    db.from("movies").select("id",{head:true,count:"exact"}).eq("status","published"),
-    db.from("movies").select("id",{head:true,count:"exact"}).eq("status","draft"),
-    db.from("series").select("id",{head:true,count:"exact"}).eq("status","published"),
-    db.from("episodes").select("id",{head:true,count:"exact"}).eq("status","published"),
+  const [mp,md,sp,ep,rq,rp,failedJobs,processingJobs,openAlerts,healthIssues,lastHealth,lastError]=await Promise.all([
+    db.from("movies").select("id",{head:true,count:"exact"}).eq("status","published").is("deleted_at",null),
+    db.from("movies").select("id",{head:true,count:"exact"}).eq("status","draft").is("deleted_at",null),
+    db.from("series").select("id",{head:true,count:"exact"}).eq("status","published").is("deleted_at",null),
+    db.from("episodes").select("id",{head:true,count:"exact"}).eq("status","published").is("deleted_at",null),
     db.from("content_requests").select("id",{head:true,count:"exact"}).eq("status","new"),
     db.from("reports").select("id",{head:true,count:"exact"}).eq("status","new"),
-    db.from("system_logs").select("message,created_at").eq("level","error").order("created_at",{ascending:false}).limit(1),
+    db.from("media_transfer_jobs").select("id",{head:true,count:"exact"}).eq("status","failed"),
+    db.from("media_transfer_jobs").select("id",{head:true,count:"exact"}).eq("status","processing"),
+    db.from("operational_alerts").select("id",{head:true,count:"exact"}).eq("status","open"),
+    db.from("media_health_issues").select("id",{head:true,count:"exact"}).eq("status","open"),
+    db.from("media_health_runs").select("status,checked_assets,healthy_assets,warning_assets,broken_assets,completed_at").order("started_at",{ascending:false}).limit(1),
+    db.from("system_logs").select("message,created_at").in("level",["error","critical"]).order("created_at",{ascending:false}).limit(1),
   ]);
-  let gateway="غير متصل",telegram="غير معروف",activeStreams=0,rangeWindow=0;
+  let gateway="غير متصل",telegram="غير معروف",activeStreams=0,maxStreams=0,rangeWindow=0,retries=0,rejections=0,failures=0,bytesServed=0;
   try{
     const base=await streamGateway();
     if(base){
@@ -1644,31 +1937,350 @@ async function systemStatusText(){
         gateway=res.ok&&j?.ok?"يعمل":`HTTP ${res.status}`;
         telegram=j?.ok?"متصل":"غير متصل";
         activeStreams=Number(j?.active_streams||0);
+        maxStreams=Number(j?.max_concurrent_streams||0);
         rangeWindow=Number(j?.range_window_mb||0);
+        retries=Number(j?.stream_retries||0);
+        rejections=Number(j?.stream_rejections||0);
+        failures=Number(j?.stream_failures||0);
+        bytesServed=Number(j?.bytes_served||0);
       }finally{clearTimeout(timer)}
     }
   }catch{gateway="غير متصل"}
   const le=(lastError.data??[])[0];
+  const lh=(lastHealth.data??[])[0];
   return [
-    "حالة VAYZEN",
+    "حالة VAYZEN • Production",
     "",
     `البوت: ${BOT_TOKEN?"مهيأ":"غير مهيأ"}`,
     `بوابة البث: ${gateway}`,
     `Telegram Streaming: ${telegram}`,
-    `عمليات البث الحالية: ${activeStreams}`,
+    `البث الحالي: ${activeStreams}/${maxStreams||"—"}`,
     `نافذة Range: ${rangeWindow||"—"} MB`,
     `حد الفيديو: ${videoLimitLabel()}`,
-    `أفلام منشورة: ${mp.count||0}`,
-    `مسودات أفلام: ${md.count||0}`,
-    `مسلسلات منشورة: ${sp.count||0}`,
-    `حلقات منشورة: ${ep.count||0}`,
-    `طلبات جديدة: ${rq.count||0}`,
-    `بلاغات جديدة: ${rp.count||0}`,
+    `Gateway retries: ${retries} • failures: ${failures} • rejected: ${rejections}`,
+    `بيانات مرسلة: ${bytesServed?sizeLabel(bytesServed):"—"}`,
+    "",
+    `Jobs قيد التنفيذ: ${processingJobs.count||0} • فاشلة: ${failedJobs.count||0}`,
+    `تنبيهات مفتوحة: ${openAlerts.count||0}`,
+    `مشاكل وسائط مفتوحة: ${healthIssues.count||0}`,
+    `آخر Media Check: ${lh?.completed_at||"لم يُنفذ"} • سليم ${lh?.healthy_assets||0} / مشاكل ${lh?.broken_assets||0}`,
+    "",
+    `أفلام منشورة: ${mp.count||0} • مسودات: ${md.count||0}`,
+    `مسلسلات منشورة: ${sp.count||0} • حلقات: ${ep.count||0}`,
+    `طلبات جديدة: ${rq.count||0} • بلاغات: ${rp.count||0}`,
     "",
     `آخر خطأ: ${le?.message?String(le.message).slice(0,140):"لا يوجد"}`,
   ].join("\n");
 }
 
+async function healthIssue(runId:string,severity:"warning"|"error"|"critical",parts:string[],data:any){
+  const fingerprint=await sha256Text(parts.join("|"));
+  const now=new Date().toISOString();
+  const {error}=await db.from("media_health_issues").upsert({
+    fingerprint,run_id:runId,severity,status:"open",
+    entity_type:data.entity_type??null,entity_id:data.entity_id??null,entity_public_id:data.entity_public_id??null,
+    kind:data.kind??null,variant:data.variant??null,message:data.message,details:data.details??{},
+    last_seen_at:now,resolved_at:null
+  },{onConflict:"fingerprint"});
+  if(error)throw error;
+  return fingerprint;
+}
+
+async function resolveHealthFingerprint(fingerprint:string){
+  await db.from("media_health_issues").update({
+    status:"resolved",resolved_at:new Date().toISOString(),last_seen_at:new Date().toISOString()
+  }).eq("fingerprint",fingerprint).eq("status","open");
+}
+
+async function probeVideoAsset(a:any){
+  const gatewayBase=await streamGateway();
+  const signingSecret=await streamSigningSecret();
+  if(!gatewayBase||!signingSecret)throw new Error("Streaming gateway not configured");
+  const exp=Math.floor(Date.now()/1000)+60;
+  const payload=`${a.channel_id}:${a.channel_message_id}:${exp}`;
+  const sig=await hmacHex(payload,signingSecret);
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),8000);
+  try{
+    const r=await fetch(`${gatewayBase}/stream/${a.channel_id}/${a.channel_message_id}?exp=${exp}&sig=${sig}`,{
+      method:"HEAD",headers:{Range:"bytes=0-0"},signal:controller.signal
+    });
+    if(!r.ok&&r.status!==206)throw new Error(`HTTP ${r.status}`);
+    return true;
+  }finally{clearTimeout(timer)}
+}
+
+async function runMediaHealthCheck(adminId:number){
+  const {data:run,error:runError}=await db.from("media_health_runs").insert({
+    status:"running",started_by:adminId
+  }).select("id").single();
+  if(runError||!run)throw runError??new Error("تعذر بدء فحص الوسائط");
+
+  let checked=0,healthy=0,warnings=0,broken=0;
+  try{
+    const {data:assets,error}=await db.from("media_assets")
+      .select("id,entity_type,entity_id,kind,variant,channel_id,channel_message_id,telegram_file_id,file_size,mime_type,updated_at")
+      .order("updated_at",{ascending:false}).limit(120);
+    if(error)throw error;
+    const rows:any[]=assets??[];
+
+    const entityMaps:any={movie:new Map(),series:new Map(),episode:new Map()};
+    for(const type of ["movie","series","episode"]){
+      const ids=[...new Set(rows.filter((x:any)=>x.entity_type===type).map((x:any)=>x.entity_id))];
+      if(!ids.length)continue;
+      const table=type==="movie"?"movies":type==="series"?"series":"episodes";
+      const {data}=await db.from(table).select("id,public_id,status,deleted_at").in("id",ids);
+      for(const x of data??[])entityMaps[type].set(x.id,x);
+    }
+
+    let networkBudget=24;
+    for(const a of rows){
+      checked++;
+      const entity=entityMaps[a.entity_type]?.get(a.entity_id);
+      const base=[a.entity_type,a.entity_id,a.kind,String(a.variant||"default")];
+      const issueTypes=["orphan","missing_size","missing_file","stream_probe"];
+      const fingerprints:any={};
+      for(const t of issueTypes)fingerprints[t]=await sha256Text([...base,t].join("|"));
+      const seen=new Set<string>();
+
+      if(!entity){
+        await healthIssue(run.id,"critical",[...base,"orphan"],{
+          entity_type:a.entity_type,entity_id:a.entity_id,kind:a.kind,variant:a.variant,
+          message:"Media asset مرتبط بمحتوى غير موجود",details:{asset_id:a.id}
+        });seen.add("orphan");broken++;
+      }else if(entity.deleted_at){
+        healthy++;
+      }else{
+        let localIssue=false;
+        if(a.kind==="video"&&(!a.file_size||Number(a.file_size)<=0)){
+          await healthIssue(run.id,"warning",[...base,"missing_size"],{
+            entity_type:a.entity_type,entity_id:a.entity_id,entity_public_id:entity.public_id,kind:a.kind,variant:a.variant,
+            message:"حجم ملف الفيديو غير معروف",details:{asset_id:a.id}
+          });seen.add("missing_size");warnings++;localIssue=true;
+        }
+        if(a.kind!=="video"&&!a.telegram_file_id){
+          await healthIssue(run.id,"warning",[...base,"missing_file"],{
+            entity_type:a.entity_type,entity_id:a.entity_id,entity_public_id:entity.public_id,kind:a.kind,variant:a.variant,
+            message:"Telegram file_id مفقود",details:{asset_id:a.id}
+          });seen.add("missing_file");warnings++;localIssue=true;
+        }
+        if(a.kind==="video"&&networkBudget>0){
+          networkBudget--;
+          try{await probeVideoAsset(a)}
+          catch(err){
+            await healthIssue(run.id,"error",[...base,"stream_probe"],{
+              entity_type:a.entity_type,entity_id:a.entity_id,entity_public_id:entity.public_id,kind:a.kind,variant:a.variant,
+              message:"فشل الوصول إلى فيديو Telegram عبر Gateway",
+              details:{asset_id:a.id,error:adminErrorText(err)}
+            });seen.add("stream_probe");broken++;localIssue=true;
+          }
+        }
+        if(!localIssue)healthy++;
+      }
+      for(const t of issueTypes)if(!seen.has(t))await resolveHealthFingerprint(fingerprints[t]);
+    }
+
+    for(const [table,type] of [["movies","movie"],["episodes","episode"]] as const){
+      const {data:published}=await db.from(table).select("id,public_id").eq("status","published").is("deleted_at",null).limit(150);
+      for(const item of published??[]){
+        const {count}=await db.from("media_assets").select("id",{head:true,count:"exact"}).eq("entity_type",type).eq("entity_id",item.id).eq("kind","video");
+        const fp=await sha256Text([type,item.id,"published_without_video"].join("|"));
+        if(!count){
+          await healthIssue(run.id,"critical",[type,item.id,"published_without_video"],{
+            entity_type:type,entity_id:item.id,entity_public_id:item.public_id,kind:"video",variant:null,
+            message:"محتوى منشور بدون ملف فيديو",details:{}
+          });broken++;
+        }else await resolveHealthFingerprint(fp);
+      }
+    }
+
+    const status=broken>0?"partial":"completed";
+    await db.from("media_health_runs").update({
+      status,checked_assets:checked,healthy_assets:healthy,warning_assets:warnings,broken_assets:broken,
+      completed_at:new Date().toISOString(),details:{network_probes:Math.min(24,checked)}
+    }).eq("id",run.id);
+    await adminLog(adminId,"media_health_check","system",undefined,undefined,{run_id:run.id,checked,healthy,warnings,broken});
+    return {id:run.id,status,checked,healthy,warnings,broken};
+  }catch(err){
+    await db.from("media_health_runs").update({
+      status:"failed",completed_at:new Date().toISOString(),details:{error:adminErrorText(err)}
+    }).eq("id",run.id);
+    throw err;
+  }
+}
+
+async function sendMediaHealthManager(chatId:number){
+  const [run,issues]=await Promise.all([
+    db.from("media_health_runs").select("id,status,checked_assets,healthy_assets,warning_assets,broken_assets,completed_at").order("started_at",{ascending:false}).limit(1),
+    db.from("media_health_issues").select("severity,entity_public_id,kind,variant,message,last_seen_at").eq("status","open").order("last_seen_at",{ascending:false}).limit(8)
+  ]);
+  const last:any=(run.data??[])[0];
+  const lines=(issues.data??[]).map((x:any)=>`• ${x.severity.toUpperCase()} • ${x.entity_public_id||"—"} • ${x.kind||"—"} • ${x.message}`).join("\n");
+  return send(chatId,`فحص مكتبة الوسائط\n\nآخر فحص: ${last?.completed_at||"لم يُنفذ"}\nتم فحصه: ${last?.checked_assets||0}\nسليم: ${last?.healthy_assets||0}\nتحذير: ${last?.warning_assets||0}\nمشاكل: ${last?.broken_assets||0}\n\nالمشاكل المفتوحة:\n${lines||"لا توجد مشاكل مفتوحة."}`,{
+    inline_keyboard:[
+      [{text:"بدء فحص جديد",callback_data:"health_run"}],
+      [{text:"رجوع",callback_data:"menu"}]
+    ]
+  });
+}
+
+async function upsertOperationalCondition(fingerprint:string,active:boolean,severity:"info"|"warning"|"error"|"critical",source:string,title:string,message:string,details:any={}){
+  const {data:existing}=await db.from("operational_alerts").select("id,status,notified_at").eq("fingerprint",fingerprint).maybeSingle();
+  if(!active){
+    if(existing?.status==="open")await db.from("operational_alerts").update({status:"resolved",resolved_at:new Date().toISOString(),last_seen_at:new Date().toISOString()}).eq("id",existing.id);
+    return;
+  }
+  const now=new Date().toISOString();
+  const shouldNotify=!existing||existing.status!=="open"||!existing.notified_at||Date.now()-Date.parse(existing.notified_at)>60*60_000;
+  const {data:row,error}=await db.from("operational_alerts").upsert({
+    fingerprint,severity,status:"open",source,title,message,details,last_seen_at:now,resolved_at:null,
+    ...(shouldNotify?{notified_at:now}:{})
+  },{onConflict:"fingerprint"}).select("id").single();
+  if(error)throw error;
+  if(shouldNotify){
+    const {data:owner}=await db.from("admin_users").select("telegram_user_id").eq("role","owner").eq("is_active",true).maybeSingle();
+    if(owner?.telegram_user_id){
+      try{await tg("sendMessage",{chat_id:Number(owner.telegram_user_id),text:`VAYZEN ALERT • ${severity.toUpperCase()}\n\n${title}\n${message}`})}catch{}
+    }
+  }
+  return row;
+}
+
+async function runOperationalCheck(){
+  let gatewayOk=false,gatewayDetail="غير متصل";
+  try{
+    const base=await streamGateway();
+    const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),6000);
+    try{
+      const r=await fetch(base+"/health",{signal:controller.signal});
+      const j=await r.json().catch(()=>null);
+      gatewayOk=Boolean(r.ok&&j?.ok);
+      gatewayDetail=gatewayOk?`active=${Number(j?.active_streams||0)}`:`HTTP ${r.status}`;
+    }finally{clearTimeout(timer)}
+  }catch(err){gatewayDetail=adminErrorText(err)}
+
+  const staleCutoff=new Date(Date.now()-5*60_000).toISOString();
+  const [failedJobs,staleJobs,criticalHealth,ownerCount]=await Promise.all([
+    db.from("media_transfer_jobs").select("id",{head:true,count:"exact"}).eq("status","failed"),
+    db.from("media_transfer_jobs").select("id",{head:true,count:"exact"}).eq("status","processing").lt("updated_at",staleCutoff),
+    db.from("media_health_issues").select("id",{head:true,count:"exact"}).eq("status","open").eq("severity","critical"),
+    db.from("admin_users").select("telegram_user_id",{head:true,count:"exact"}).eq("role","owner").eq("is_active",true)
+  ]);
+  if(Number(staleJobs.count||0)>0){
+    try{
+      await db.from("media_transfer_jobs").update({
+        status:"failed",
+        last_error:"Interrupted transfer detected by production monitor; safe retry is available.",
+        updated_at:new Date().toISOString()
+      }).eq("status","processing").lt("updated_at",staleCutoff);
+    }catch{}
+  }
+  try{
+    const {data:owner}=await db.from("admin_users").select("telegram_user_id").eq("role","owner").eq("is_active",true).maybeSingle();
+    if(owner?.telegram_user_id)await purgeExpiredTrash(Number(owner.telegram_user_id));
+  }catch{}
+
+  await Promise.all([
+    upsertOperationalCondition("gateway_down",!gatewayOk,"critical","gateway","بوابة البث غير متاحة",gatewayDetail),
+    upsertOperationalCondition("failed_media_jobs",Number(failedJobs.count||0)>0,"error","media_jobs","عمليات وسائط فاشلة",`عدد العمليات الفاشلة: ${failedJobs.count||0}`,{count:failedJobs.count||0}),
+    upsertOperationalCondition("stale_media_jobs",Number(staleJobs.count||0)>0,"warning","media_jobs","عمليات وسائط معلقة",`عمليات processing أقدم من 5 دقائق: ${staleJobs.count||0}`,{count:staleJobs.count||0}),
+    upsertOperationalCondition("critical_media_health",Number(criticalHealth.count||0)>0,"critical","media_health","مشاكل حرجة في مكتبة الوسائط",`المشاكل الحرجة المفتوحة: ${criticalHealth.count||0}`,{count:criticalHealth.count||0}),
+    upsertOperationalCondition("owner_missing",Number(ownerCount.count||0)!==1,"critical","security","حساب المالك غير سليم",`عدد حسابات Owner الفعالة: ${ownerCount.count||0}`)
+  ]);
+  return {gateway_ok:gatewayOk,failed_jobs:failedJobs.count||0,stale_jobs:staleJobs.count||0,critical_health:criticalHealth.count||0};
+}
+
+async function maybeOperationalCheck(){
+  try{
+    const {data}=await db.from("app_settings").select("value").eq("key","monitor_runtime").maybeSingle();
+    const last=Date.parse(String((data as any)?.value?.last_checked_at||""));
+    if(Number.isFinite(last)&&Date.now()-last<5*60_000)return;
+    await db.from("app_settings").upsert({key:"monitor_runtime",value:{last_checked_at:new Date().toISOString()},updated_at:new Date().toISOString()});
+    await runOperationalCheck();
+  }catch{}
+}
+
+async function sendAlertsManager(chatId:number){
+  const {data}=await db.from("operational_alerts").select("severity,source,title,message,last_seen_at").eq("status","open").order("last_seen_at",{ascending:false}).limit(10);
+  const lines=(data??[]).map((x:any)=>`• ${x.severity.toUpperCase()} • ${x.title}\n  ${x.message}`).join("\n");
+  return send(chatId,`تنبيهات التشغيل\n\n${lines||"لا توجد تنبيهات مفتوحة."}`,{inline_keyboard:[
+    [{text:"فحص الآن",callback_data:"ops_run"},{text:"فحص الوسائط",callback_data:"health"}],
+    [{text:"رجوع",callback_data:"menu"}]
+  ]});
+}
+
+async function tgUploadDocument(chatId:number|string,bytes:Uint8Array,fileName:string,caption:string){
+  const form=new FormData();
+  form.append("chat_id",String(chatId));
+  form.append("caption",caption.slice(0,1000));
+  form.append("document",new Blob([new Uint8Array(bytes).buffer],{type:"application/json"}),fileName);
+  const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`,{method:"POST",body:form});
+  const j=await r.json().catch(()=>null);
+  if(!r.ok||!j?.ok)throw new Error(String(j?.description||`Telegram HTTP ${r.status}`));
+  return j.result;
+}
+
+async function createMetadataBackup(adminId:number,chatId:number){
+  const now=new Date();
+  const code=`BKP-${now.toISOString().replace(/[-:TZ.]/g,"").slice(0,14)}`;
+  const {data:snapshot,error:snapshotError}=await db.from("backup_snapshots").insert({
+    backup_code:code,status:"creating",scope:"metadata",created_by:adminId
+  }).select("id").single();
+  if(snapshotError||!snapshot)throw snapshotError??new Error("تعذر إنشاء سجل النسخة الاحتياطية");
+
+  try{
+    const [movies,series,seasons,episodes,assets,subs,channels,admins,settings]=await Promise.all([
+      db.from("movies").select("*").limit(10000),
+      db.from("series").select("*").limit(10000),
+      db.from("seasons").select("*").limit(10000),
+      db.from("episodes").select("*").limit(20000),
+      db.from("media_assets").select("*").limit(30000),
+      db.from("subtitle_tracks").select("*").limit(10000),
+      db.from("telegram_channels").select("channel_key,telegram_channel_id,title,purpose,is_active,created_at,updated_at"),
+      db.from("admin_users").select("telegram_user_id,display_name,role,permissions,is_active,added_by,created_at,updated_at"),
+      db.from("app_settings").select("key,value,updated_at").in("key",["app","features","limits","media_pipeline","stream_gateway","release"])
+    ]);
+    const all=[movies,series,seasons,episodes,assets,subs,channels,admins,settings];
+    const err=all.find((x:any)=>x.error)?.error;if(err)throw err;
+    const payload={
+      format:"vayzen-metadata-backup-v1",backup_code:code,created_at:now.toISOString(),release:"1.0.0",
+      movies:movies.data??[],series:series.data??[],seasons:seasons.data??[],episodes:episodes.data??[],
+      media_assets:assets.data??[],subtitle_tracks:subs.data??[],telegram_channels:channels.data??[],
+      admin_users:admins.data??[],app_settings:settings.data??[]
+    };
+    const jsonText=JSON.stringify(payload,null,2);
+    const bytes=new TextEncoder().encode(jsonText);
+    const checksum=await sha256Text(jsonText);
+    const rowCounts={
+      movies:(movies.data??[]).length,series:(series.data??[]).length,seasons:(seasons.data??[]).length,
+      episodes:(episodes.data??[]).length,media_assets:(assets.data??[]).length,subtitle_tracks:(subs.data??[]).length
+    };
+    const msg=await tgUploadDocument(chatId,bytes,`vayzen-${code}.json`,`VAYZEN Metadata Backup\n${code}\nSHA256: ${checksum.slice(0,16)}…`);
+    try{
+      const ch=await channel("admin_logs");
+      if(Number(ch.telegram_channel_id)!==Number(chatId))await tgUploadDocument(Number(ch.telegram_channel_id),bytes,`vayzen-${code}.json`,`VAYZEN Backup • ${code}`);
+    }catch{}
+    await db.from("backup_snapshots").update({
+      status:"completed",row_counts:rowCounts,checksum,
+      telegram_channel_id:Number(chatId),telegram_message_id:Number(msg.message_id),
+      completed_at:new Date().toISOString()
+    }).eq("id",snapshot.id);
+    await adminLog(adminId,"backup_export","system",undefined,code,{row_counts:rowCounts,checksum});
+    return {code,rowCounts,checksum,size:bytes.length};
+  }catch(err){
+    await db.from("backup_snapshots").update({status:"failed",error:adminErrorText(err),completed_at:new Date().toISOString()}).eq("id",snapshot.id);
+    throw err;
+  }
+}
+
+async function sendBackupManager(chatId:number){
+  const {data}=await db.from("backup_snapshots").select("backup_code,status,row_counts,created_at,completed_at,error").order("created_at",{ascending:false}).limit(6);
+  const lines=(data??[]).map((x:any)=>`• ${x.backup_code} • ${x.status} • ${x.completed_at||x.created_at}`).join("\n");
+  return send(chatId,`النسخ الاحتياطية للبيانات\n\n${lines||"لا توجد نسخ بعد."}\n\nالنسخة تستبعد كلمات المرور والتوكنات والأسرار.`,{inline_keyboard:[
+    [{text:"إنشاء Backup الآن",callback_data:"backup_create"}],
+    [{text:"رجوع",callback_data:"menu"}]
+  ]});
+}
 
 async function sendTmdbSettings(chatId:number){
   const status=await tmdbStatus();
@@ -1699,7 +2311,7 @@ async function sendTmdbSearchResults(chatId:number,type:"movie"|"series",query:s
 
 async function tmdbMappedDetails(type:"movie"|"series",tmdbId:number){
   const bundle=await tmdbDetails(type,tmdbId);
-  const mapped=tmdbMap(type,bundle);
+  const mapped:any=tmdbMap(type,bundle);
   mapped.poster_url=await tmdbImageUrl(mapped.poster_path,"poster");
   mapped.backdrop_url=await tmdbImageUrl(mapped.backdrop_path,"backdrop");
   return {bundle,mapped};
@@ -2241,8 +2853,8 @@ async function callback(q:any){
   if(a.startsWith("epd1|")){
     if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,id]=a.split("|");
-    return send(chatId,`تأكيد حذف الحلقة ${id}؟`,{inline_keyboard:[
-      [{text:"تأكيد الحذف",callback_data:`epd2|${id}`}],
+    return send(chatId,`نقل الحلقة ${id} إلى سلة المحذوفات؟`,{inline_keyboard:[
+      [{text:"نقل إلى السلة",callback_data:`epd2|${id}`}],
       [{text:"تراجع",callback_data:`epi|${id}`}],
     ]});
   }
@@ -2250,11 +2862,7 @@ async function callback(q:any){
     if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,id]=a.split("|");
     const ep:any=await episodeByPublicId(id);if(!ep)return send(chatId,"الحلقة غير موجودة.");
-    const {data:assets}=await db.from("media_assets").select("channel_id,channel_message_id").eq("entity_type","episode").eq("entity_id",ep.id);
-    for(const x of assets??[])await deleteCopiedMessage({channel_id:x.channel_id,message_id:x.channel_message_id});
-    await db.from("media_assets").delete().eq("entity_type","episode").eq("entity_id",ep.id);
-    const {error}=await db.from("episodes").delete().eq("id",ep.id);if(error)throw error;
-    await adminLog(userId,"episode_delete","episode",ep.id,ep.public_id,{});
+    await softDeleteEpisode(userId,id);
     return ep.series?.public_id?sendSeriesEpisodes(chatId,ep.series.public_id):sendContentManager(chatId);
   }
   if(a.startsWith("cs|")){
@@ -2282,15 +2890,15 @@ async function callback(q:any){
   if(a.startsWith("cd1|")){
     if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,type,id]=a.split("|");
-    return send(chatId,`تأكيد حذف ${id}؟ الحذف يزيله من التطبيق ومن تخزين البوت قدر الإمكان.`,{inline_keyboard:[
-      [{text:"تأكيد الحذف",callback_data:`cd2|${type}|${id}`}],
+    return send(chatId,`نقل ${id} إلى سلة المحذوفات؟ يمكن استرجاعه لمدة 14 يومًا.`,{inline_keyboard:[
+      [{text:"نقل إلى السلة",callback_data:`cd2|${type}|${id}`}],
       [{text:"تراجع",callback_data:`cm|${type}|${id}`}],
     ]});
   }
   if(a.startsWith("cd2|")){
     if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
     const [,type,id]=a.split("|");
-    await deleteContent(userId,type,id);
+    await softDeleteContent(userId,type,id);
     return sendContentManager(chatId);
   }
 
@@ -2307,6 +2915,137 @@ async function callback(q:any){
     }catch(err){
       return send(chatId,adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:"admins"}]]});
     }
+  }
+
+  if(a.startsWith("sub|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة الترجمات.");
+    const [,type,id]=a.split("|");return sendSubtitleManager(chatId,type,id);
+  }
+  if(a.startsWith("sub_add|")){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة الترجمات.");
+    const [,type,id]=a.split("|");
+    return send(chatId,"اختر لغة الترجمة:",{inline_keyboard:[
+      [{text:"العربية",callback_data:`sub_lang|${type}|${id}|ar`},{text:"English",callback_data:`sub_lang|${type}|${id}|en`}],
+      [{text:"Kurdî",callback_data:`sub_lang|${type}|${id}|ku`},{text:"Türkçe",callback_data:`sub_lang|${type}|${id}|tr`}],
+      [{text:"لغة أخرى",callback_data:`sub_custom|${type}|${id}`}],
+      [{text:"رجوع",callback_data:`sub|${type}|${id}`}]
+    ]});
+  }
+  if(a.startsWith("sub_lang|")){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة الترجمات.");
+    const [,type,id,lang]=a.split("|");
+    const code=normalizeLanguageCode(lang);if(!code)return send(chatId,"رمز اللغة غير صالح.");
+    await setSession(userId,"subtitle","file",{type,public_id:id,language_code:code,label:subtitleLabel(code)});
+    return send(chatId,`أرسل ملف الترجمة ${subtitleLabel(code)} بصيغة VTT أو SRT. الحد 8MB.`);
+  }
+  if(a.startsWith("sub_custom|")){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة الترجمات.");
+    const [,type,id]=a.split("|");
+    await setSession(userId,"subtitle","language",{type,public_id:id});
+    return send(chatId,"أرسل رمز اللغة، مثال: fr أو es أو fa أو ar-iq.");
+  }
+  if(a.startsWith("sub_item|")){
+    if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة الترجمات.");
+    const [,type,id,lang]=a.split("|");
+    const target:any=await subtitleTarget(type,id);if(!target)return send(chatId,"المحتوى غير موجود.");
+    const {data:t}=await db.from("subtitle_tracks").select("language_code,label,source_format,is_default").eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("language_code",lang).maybeSingle();
+    if(!t)return sendSubtitleManager(chatId,type,id);
+    return send(chatId,`${t.label}\nالصيغة: ${String(t.source_format).toUpperCase()}\nافتراضية: ${t.is_default?"نعم":"لا"}`,{inline_keyboard:[
+      ...(!t.is_default?[[{text:"تعيين كافتراضية",callback_data:`sub_default|${type}|${id}|${lang}`}]]:[]),
+      [{text:"حذف الترجمة",callback_data:`sub_del1|${type}|${id}|${lang}`}],
+      [{text:"رجوع",callback_data:`sub|${type}|${id}`}]
+    ]});
+  }
+  if(a.startsWith("sub_default|")){
+    if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية تعديل الترجمات.");
+    const [,type,id,lang]=a.split("|");
+    await setDefaultSubtitle(userId,type,id,lang);return sendSubtitleManager(chatId,type,id);
+  }
+  if(a.startsWith("sub_del1|")){
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف الترجمات.");
+    const [,type,id,lang]=a.split("|");
+    return send(chatId,"تأكيد حذف مسار الترجمة؟",{inline_keyboard:[
+      [{text:"تأكيد الحذف",callback_data:`sub_del2|${type}|${id}|${lang}`}],
+      [{text:"تراجع",callback_data:`sub_item|${type}|${id}|${lang}`}]
+    ]});
+  }
+  if(a.startsWith("sub_del2|")){
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف الترجمات.");
+    const [,type,id,lang]=a.split("|");
+    await deleteSubtitleTrack(userId,type,id,lang);return sendSubtitleManager(chatId,type,id);
+  }
+
+  if(a==="jobs"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة عمليات الوسائط.");
+    return sendJobCenter(chatId);
+  }
+  if(a.startsWith("job|")){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة عمليات الوسائط.");
+    const [,id]=a.split("|");return sendJobItem(chatId,id);
+  }
+  if(a.startsWith("job_retry|")){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية إعادة المحاولة.");
+    const [,id]=a.split("|");
+    try{await retryMediaTransferJob(userId,id);return sendJobItem(chatId,id)}
+    catch(err){return send(chatId,`تعذر إعادة العملية.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"رجوع",callback_data:"jobs"}]]})}
+  }
+  if(a==="trash"){
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية سلة المحذوفات.");
+    return sendTrashManager(chatId,admin);
+  }
+  if(a.startsWith("trash_restore|")){
+    if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية الاسترجاع.");
+    const [,type,id]=a.split("|");
+    try{await restoreTrashItem(userId,type,id);return sendTrashManager(chatId,admin)}
+    catch(err){return send(chatId,adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:"trash"}]]})}
+  }
+  if(a.startsWith("trash_purge1|")){
+    if(admin.role!=="owner")return send(chatId,"الحذف النهائي متاح للمالك فقط.");
+    const [,type,id]=a.split("|");
+    return send(chatId,"هذا الحذف نهائي وسيزيل الملفات من Telegram قدر الإمكان. تأكيد؟",{inline_keyboard:[
+      [{text:"حذف نهائي",callback_data:`trash_purge2|${type}|${id}`}],
+      [{text:"تراجع",callback_data:"trash"}]
+    ]});
+  }
+  if(a.startsWith("trash_purge2|")){
+    if(admin.role!=="owner")return send(chatId,"الحذف النهائي متاح للمالك فقط.");
+    const [,type,id]=a.split("|");
+    try{await purgeContentPermanent(userId,type,id);return sendTrashManager(chatId,admin)}
+    catch(err){return send(chatId,adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:"trash"}]]})}
+  }
+  if(a==="health"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية فحص الوسائط.");
+    return sendMediaHealthManager(chatId);
+  }
+  if(a==="health_run"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية فحص الوسائط.");
+    await send(chatId,"جاري فحص مكتبة الوسائط وTelegram Gateway...");
+    try{
+      const r=await runMediaHealthCheck(userId);
+      await runOperationalCheck();
+      await send(chatId,`اكتمل الفحص.\n\nتم فحصه: ${r.checked}\nسليم: ${r.healthy}\nتحذير: ${r.warnings}\nمشاكل: ${r.broken}`);
+      return sendMediaHealthManager(chatId);
+    }catch(err){return send(chatId,`فشل الفحص.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"رجوع",callback_data:"health"}]]})}
+  }
+  if(a==="alerts"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية التنبيهات.");
+    return sendAlertsManager(chatId);
+  }
+  if(a==="ops_run"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية الفحص التشغيلي.");
+    await runOperationalCheck();return sendAlertsManager(chatId);
+  }
+  if(a==="backups"){
+    if(admin.role!=="owner")return send(chatId,"النسخ الاحتياطية متاحة للمالك فقط.");
+    return sendBackupManager(chatId);
+  }
+  if(a==="backup_create"){
+    if(admin.role!=="owner")return send(chatId,"النسخ الاحتياطية متاحة للمالك فقط.");
+    await send(chatId,"جاري إنشاء Backup للبيانات وإرساله كملف JSON...");
+    try{
+      const b=await createMetadataBackup(userId,chatId);
+      return send(chatId,`تم إنشاء النسخة الاحتياطية.\n${b.code}\nالحجم: ${sizeLabel(b.size)}\nSHA256: ${b.checksum.slice(0,20)}…`,{inline_keyboard:[[{text:"رجوع للنسخ",callback_data:"backups"}]]});
+    }catch(err){return send(chatId,`فشل إنشاء النسخة.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"رجوع",callback_data:"backups"}]]})}
   }
 
   if(a==="admins"){
@@ -2528,6 +3267,25 @@ async function message(m:any){
       return sendTmdbSearchResults(chatId,type,q);
     }catch(err){
       return send(chatId,`فشل البحث في TMDb.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"بحث جديد",callback_data:`tmdb_again|${type==="movie"?"m":"s"}`},{text:"إلغاء",callback_data:"cancel"}]]});
+    }
+  }
+
+  if(s.flow==="subtitle"){
+    if(!can(admin,"content")||!can(admin,"publish")){await clearSession(userId);return send(chatId,"لا تملك صلاحية إدارة الترجمات.");}
+    if(s.step==="language"){
+      const code=normalizeLanguageCode(text);
+      if(!code)return send(chatId,"رمز اللغة غير صالح. مثال: fr أو es أو ar-iq.");
+      d.language_code=code;d.label=subtitleLabel(code);
+      await setSession(userId,"subtitle","file",d);
+      return send(chatId,`أرسل ملف الترجمة ${d.label} بصيغة VTT أو SRT. الحد 8MB.`);
+    }
+    if(s.step==="file"){
+      const file=subtitleFileFrom(m);if(!file)return send(chatId,"أرسل ملف ترجمة بصيغة .vtt أو .srt.");
+      try{
+        await storeSubtitleTrack(userId,chatId,String(d.type||""),String(d.public_id||""),String(d.language_code||""),String(d.label||subtitleLabel(String(d.language_code||""))),file,m.message_id);
+        await clearSession(userId);
+        return sendSubtitleManager(chatId,String(d.type),String(d.public_id));
+      }catch(err){return send(chatId,`تعذر حفظ الترجمة.\n${adminErrorText(err)}`)}
     }
   }
 
@@ -2850,38 +3608,40 @@ function qualityRank(v:string){
 async function asset(type:string,id:string,variant="default"){
   if(!/^[0-9a-f-]{36}$/i.test(id)) return null;
   let entity_type="",kind="";
-  if(type==="movie_poster"||type==="movie_video"||type==="movie_backdrop"){
-    const {data}=await db.from("movies").select("status").eq("id",id).maybeSingle();
-    if(data?.status!=="published") return null;
-    entity_type="movie";kind=type==="movie_poster"?"poster":type==="movie_backdrop"?"backdrop":"video";
+  if(type==="movie_poster"||type==="movie_video"||type==="movie_backdrop"||type==="movie_subtitle"){
+    const {data}=await db.from("movies").select("status,deleted_at").eq("id",id).maybeSingle();
+    if(data?.status!=="published"||data?.deleted_at) return null;
+    entity_type="movie";
+    kind=type==="movie_poster"?"poster":type==="movie_backdrop"?"backdrop":type==="movie_subtitle"?"subtitle":"video";
   }else if(type==="series_poster"||type==="series_backdrop"){
     const {data}=await db.from("series").select("status").eq("id",id).maybeSingle();
     if(data?.status!=="published") return null;
     entity_type="series";kind=type==="series_backdrop"?"backdrop":"poster";
-  }else if(type==="episode_video"){
-    const {data:e}=await db.from("episodes").select("season_id,status").eq("id",id).maybeSingle();
-    if(e?.status!=="published") return null;
+  }else if(type==="episode_video"||type==="episode_subtitle"){
+    const {data:e}=await db.from("episodes").select("season_id,status,deleted_at").eq("id",id).maybeSingle();
+    if(e?.status!=="published"||e?.deleted_at) return null;
     const {data:se}=await db.from("seasons").select("series_id,status").eq("id",e.season_id).maybeSingle();
     if(se?.status!=="published") return null;
     const {data:sr}=await db.from("series").select("status").eq("id",se.series_id).maybeSingle();
     if(sr?.status!=="published") return null;
-    entity_type="episode";kind="video";
+    entity_type="episode";kind=type==="episode_subtitle"?"subtitle":"video";
   }else return null;
 
-  const requested=kind==="video"?normalizeVariant(variant):"default";
+  const requested=(kind==="video"||kind==="subtitle")?normalizeVariant(variant):"default";
   const {data:direct}=await db.from("media_assets")
-    .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_size,variant")
+    .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_name,file_size,variant,metadata")
     .eq("entity_type",entity_type).eq("entity_id",id).eq("kind",kind).eq("variant",requested).maybeSingle();
   if(direct)return direct;
   if(kind==="backdrop"){
     const {data:fallback}=await db.from("media_assets")
-      .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_size,variant")
+      .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_name,file_size,variant,metadata")
       .eq("entity_type",entity_type).eq("entity_id",id).eq("kind","poster").eq("variant","default").maybeSingle();
     return fallback??null;
   }
+  if(kind==="subtitle")return null;
   if(kind!=="video"||requested!=="default")return null;
   const {data:list}=await db.from("media_assets")
-    .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_size,variant")
+    .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_name,file_size,variant,metadata")
     .eq("entity_type",entity_type).eq("entity_id",id).eq("kind","video");
   const sorted=(list??[]).sort((a:any,b:any)=>qualityRank(String(b.variant))-qualityRank(String(a.variant)));
   return sorted[0]??null;
@@ -2901,6 +3661,31 @@ async function publicMediaVariants(url:URL){
     .map((x:any)=>({variant:String(x.variant||"default"),label:variantLabel(String(x.variant||"default")),file_size:x.file_size||null,mime_type:x.mime_type||null}))
     .sort((a:any,b:any)=>qualityRank(b.variant)-qualityRank(a.variant));
   return json({ok:true,variants});
+}
+
+async function publicSubtitles(url:URL){
+  const type=String(url.searchParams.get("type")||"");
+  const id=String(url.searchParams.get("id")||"");
+  if(!["movie","episode"].includes(type)||!/^[0-9a-f-]{36}$/i.test(id))return json({error:"invalid subtitle target"},400);
+  const mediaType=type==="movie"?"movie_subtitle":"episode_subtitle";
+  const contentProbe=type==="movie"?await asset("movie_video",id,"default"):await asset("episode_video",id,"default");
+  if(!contentProbe)return json({error:"not found"},404);
+  const {data,error}=await db.from("subtitle_tracks")
+    .select("language_code,label,source_format,is_default")
+    .eq("entity_type",type).eq("entity_id",id)
+    .order("is_default",{ascending:false}).order("created_at",{ascending:true});
+  if(error)throw error;
+  const tracks=(data??[]).map((x:any)=>({
+    language_code:x.language_code,label:x.label,format:x.source_format,is_default:x.is_default,
+    src:`?media=${mediaType}&id=${encodeURIComponent(id)}&quality=${encodeURIComponent(subtitleVariant(x.language_code))}`
+  }));
+  return json({ok:true,tracks});
+}
+
+function srtToVtt(text:string){
+  let body=String(text||"").replace(/^\uFEFF/,"").replace(/\r\n?/g,"\n");
+  body=body.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2}),(\d{3})/g,"$1.$2 --> $3.$4");
+  return "WEBVTT\n\n"+body;
 }
 
 async function streamSigningSecret(){
@@ -2935,10 +3720,21 @@ async function media(type:string,id:string,req?:Request){
     const sig=await hmacHex(payload,signingSecret);
     return Response.redirect(`${gatewayBase}/stream/${a.channel_id}/${a.channel_message_id}?exp=${exp}&sig=${sig}`,307);
   }
-  if(!a.telegram_file_id) return json({error:"poster file id missing"},409);
+  if(!a.telegram_file_id) return json({error:"telegram file id missing"},409);
   const file=await tg("getFile",{file_id:a.telegram_file_id});
   const upstream=await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
   const headers=new Headers(cors);
+  const isSubtitle=type==="movie_subtitle"||type==="episode_subtitle";
+  if(isSubtitle){
+    if(!upstream.ok)return new Response("subtitle unavailable",{status:upstream.status,headers});
+    const raw=await upstream.text();
+    const storedFormat=String(a.metadata?.source_format||"").toLowerCase();
+    const format=storedFormat|| (String(a.file_name||"").toLowerCase().endsWith(".srt")?"srt":"vtt");
+    const body=format==="srt"?srtToVtt(raw):(/^WEBVTT/.test(raw.trim())?raw:"WEBVTT\n\n"+raw);
+    headers.set("Content-Type","text/vtt; charset=utf-8");
+    headers.set("Cache-Control","public, max-age=1800");
+    return new Response(body,{status:200,headers});
+  }
   headers.set("Content-Type",upstream.headers.get("content-type")||a.mime_type||"image/jpeg");
   headers.set("Cache-Control","public, max-age=3600");
   return new Response(upstream.body,{status:upstream.status,headers});
@@ -3125,7 +3921,64 @@ async function progressApi(req:Request){
   }
   const position=Math.max(0,Number(body?.position_seconds||0)),duration=Math.max(0,Number(body?.duration_seconds||0));
   const {error}=await db.from("watch_progress").upsert({user_id:auth.user.id,entity_type:type,entity_id:id,position_seconds:position,duration_seconds:duration,updated_at:new Date().toISOString()});
-  if(error)throw error;return json({ok:true});
+  if(error)throw error;
+  try{await updateWatchHistory(auth.user.id,type,id,position,duration)}catch{}
+  return json({ok:true,completed:duration>0&&position/duration>=0.92});
+}
+
+async function updateWatchHistory(userId:string,type:string,id:string,position:number,duration:number){
+  const now=new Date().toISOString();
+  const completed=duration>0&&position/duration>=0.92;
+  const {data:existing}=await db.from("watch_history")
+    .select("play_count,last_watched_at,completed_at").eq("user_id",userId).eq("entity_type",type).eq("entity_id",id).maybeSingle();
+  if(existing){
+    const last=Date.parse(String(existing.last_watched_at||""));
+    const restart=position<20&&(!Number.isFinite(last)||Date.now()-last>20*60_000);
+    await db.from("watch_history").update({
+      last_watched_at:now,last_position_seconds:position,duration_seconds:duration,
+      play_count:Number(existing.play_count||1)+(restart?1:0),
+      completed_at:completed?(existing.completed_at||now):existing.completed_at
+    }).eq("user_id",userId).eq("entity_type",type).eq("entity_id",id);
+  }else{
+    await db.from("watch_history").insert({
+      user_id:userId,entity_type:type,entity_id:id,first_watched_at:now,last_watched_at:now,
+      last_position_seconds:position,duration_seconds:duration,play_count:1,completed_at:completed?now:null
+    });
+  }
+}
+
+async function watchHistoryApi(req:Request){
+  const auth=await userFromRequest(req);if(!auth)return json({error:"unauthorized"},401);
+  const {data,error}=await db.from("watch_history")
+    .select("entity_type,entity_id,first_watched_at,last_watched_at,completed_at,play_count,last_position_seconds,duration_seconds")
+    .eq("user_id",auth.user.id).order("last_watched_at",{ascending:false}).limit(100);
+  if(error)throw error;
+  const rows:any[]=data??[];
+  const movieIds=rows.filter(x=>x.entity_type==="movie").map(x=>x.entity_id);
+  const episodeIds=rows.filter(x=>x.entity_type==="episode").map(x=>x.entity_id);
+  const movieMap=new Map<string,any>();
+  const episodeMap=new Map<string,any>();
+  if(movieIds.length){
+    const {data:m}=await db.from("movies").select("id,public_id,title,status,deleted_at").in("id",movieIds);
+    for(const x of m??[])if(x.status==="published"&&!x.deleted_at)movieMap.set(x.id,x);
+  }
+  if(episodeIds.length){
+    const {data:eps}=await db.from("episodes").select("id,public_id,title,episode_number,season_id,status,deleted_at").in("id",episodeIds);
+    const seasonIds=[...new Set((eps??[]).map((x:any)=>x.season_id))];
+    const {data:ses}=seasonIds.length?await db.from("seasons").select("id,series_id,season_number").in("id",seasonIds):{data:[] as any[]};
+    const seriesIds=[...new Set((ses??[]).map((x:any)=>x.series_id))];
+    const {data:srs}=seriesIds.length?await db.from("series").select("id,public_id,title,status,deleted_at").in("id",seriesIds):{data:[] as any[]};
+    const seMap=new Map((ses??[]).map((x:any)=>[x.id,x]));
+    const srMap=new Map((srs??[]).map((x:any)=>[x.id,x]));
+    for(const ep of eps??[]){
+      const se:any=seMap.get(ep.season_id),sr:any=se?srMap.get(se.series_id):null;
+      if(ep.status==="published"&&!ep.deleted_at&&sr?.status==="published"&&!sr?.deleted_at){
+        episodeMap.set(ep.id,{...ep,season_number:se.season_number,series_id:sr.id,series_public_id:sr.public_id,series_title:sr.title});
+      }
+    }
+  }
+  const out=rows.map(x=>({...x,meta:x.entity_type==="movie"?movieMap.get(x.entity_id):episodeMap.get(x.entity_id)})).filter(x=>x.meta);
+  return json({ok:true,history:out});
 }
 
 async function publicRequest(req:Request){
@@ -3195,6 +4048,8 @@ Deno.serve(async(req:Request)=>{
   if(req.method==="OPTIONS") return new Response("ok",{headers:cors});
   try{
     const url=new URL(req.url);
+    const runtime=(globalThis as any).EdgeRuntime;
+    if(runtime?.waitUntil)runtime.waitUntil(maybeOperationalCheck());
     if(req.method==="GET"&&url.searchParams.get("health")==="1"){
       return json({
         ok:true,name:"VAYZEN",maxVideoMB:MAX_VIDEO_MB,
@@ -3222,6 +4077,7 @@ Deno.serve(async(req:Request)=>{
     if(action==="catalog"&&req.method==="GET") return catalog();
     if(action==="series_content"&&req.method==="GET") return seriesContent(url);
     if(action==="media_variants"&&req.method==="GET") return publicMediaVariants(url);
+    if(action==="subtitles"&&req.method==="GET") return publicSubtitles(url);
     if(action==="signup"&&req.method==="POST") return authSignup(req);
     if(action==="login"&&req.method==="POST") return authLogin(req);
     if(action==="refresh"&&req.method==="POST") return authRefresh(req);
@@ -3231,6 +4087,7 @@ Deno.serve(async(req:Request)=>{
     if(action==="view"&&req.method==="POST") return recordView(req);
     if(action==="favorites"&&(req.method==="GET"||req.method==="POST")) return favoritesApi(req);
     if(action==="progress"&&(req.method==="GET"||req.method==="POST")) return progressApi(req);
+    if(action==="watch_history"&&req.method==="GET") return watchHistoryApi(req);
     if(req.method==="POST"&&action==="request_content") return publicRequest(req);
     if(req.method==="GET"&&action==="request_status") return requestStatus(url);
     if(req.method==="POST"&&action==="report") return publicReport(req);
