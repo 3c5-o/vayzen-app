@@ -7,7 +7,7 @@
   <meta name="color-scheme" content="dark">
   <meta name="application-name" content="VAYZEN">
   <title>VAYZEN</title>
-  <link rel="stylesheet" href="./styles.css?v=20260923-2">
+  <link rel="stylesheet" href="./styles.css?v=20260923-3">
 </head>
 <body>
 <svg class="svg-sprite" aria-hidden="true">
@@ -29,6 +29,8 @@
   <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
   <symbol id="i-back" viewBox="0 0 24 24"><path d="m15 5-7 7 7 7"/></symbol>
   <symbol id="i-full" viewBox="0 0 24 24"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5h3v14H8zM13 5h3v14h-3z"/></symbol>
+<symbol id="i-pip" viewBox="0 0 24 24"><path d="M3 5h18v14H3zM12 11h7v6h-7z"/></symbol>
 </svg>
 
 <div id="splash" class="splash">
@@ -241,25 +243,64 @@
   </div>
 </div>
 
-<div class="player-layer" id="playerLayer">
-  <div class="player-head">
-    <button class="icon-btn dark" id="playerBack"><svg><use href="#i-back"/></svg></button>
-    <div class="player-title-wrap"><b id="playerTitle">VAYZEN</b><small id="playerMeta"></small></div>
-  </div>
-  <div class="player-stage">
-    <video id="videoPlayer" controls playsinline preload="metadata"></video>
+<div class="player-layer" id="playerLayer" aria-hidden="true">
+  <div class="player-stage" id="playerStage">
+    <video id="videoPlayer" playsinline preload="metadata"></video>
+
+    <div class="player-shade player-shade-top"></div>
+    <div class="player-shade player-shade-bottom"></div>
+
+    <div class="player-head player-chrome">
+      <button class="player-icon" id="playerBack" aria-label="رجوع"><svg><use href="#i-back"/></svg></button>
+      <div class="player-title-wrap"><b id="playerTitle">VAYZEN</b><small id="playerMeta"></small></div>
+    </div>
+
+    <div class="player-center player-chrome">
+      <button class="player-skip" id="rewindBtn" aria-label="رجوع 10 ثوان">−10</button>
+      <button class="player-main-play" id="playPauseBtn" aria-label="تشغيل أو إيقاف">
+        <svg id="playPauseIcon"><use href="#i-play"/></svg>
+      </button>
+      <button class="player-skip" id="forwardBtn" aria-label="تقديم 10 ثوان">+10</button>
+    </div>
+
+    <div class="player-speed-badge hidden" id="holdSpeedBadge">2×</div>
+    <div class="player-seek-feedback hidden" id="seekFeedback"></div>
+
     <div class="player-loader hidden" id="playerLoader"><span></span></div>
-    <div class="player-error hidden" id="playerError"><h3>تعذر تشغيل الفيديو</h3><p>تحقق من الاتصال وحاول مرة أخرى.</p><button class="btn secondary" id="retryPlayer">إعادة المحاولة</button></div>
-  </div>
-  <div class="player-tools">
-    <button id="rewindBtn">−10 ث</button>
-    <select id="speedSelect"><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select>
-    <button id="forwardBtn">+10 ث</button>
-    <button id="fullscreenBtn"><svg><use href="#i-full"/></svg></button>
-    <button id="nextEpisodeBtn" class="hidden">الحلقة التالية</button>
+    <div class="player-error hidden" id="playerError">
+      <div>
+        <h3>تعذر تشغيل الفيديو</h3>
+        <p id="playerErrorText">تحقق من الاتصال وحاول مرة أخرى.</p>
+        <button class="btn secondary" id="retryPlayer">إعادة المحاولة</button>
+      </div>
+    </div>
+
+    <div class="player-controls player-chrome">
+      <input id="playerSeek" class="player-seek" type="range" min="0" max="1000" value="0" step="1" aria-label="موضع الفيديو">
+      <div class="player-time-row">
+        <span id="playerCurrentTime">0:00</span>
+        <span class="player-time-divider">/</span>
+        <span id="playerDuration">0:00</span>
+        <span class="player-spacer"></span>
+        <span id="playerRemaining">−0:00</span>
+      </div>
+      <div class="player-tools">
+        <select id="speedSelect" aria-label="سرعة التشغيل">
+          <option value="0.5">0.5×</option>
+          <option value="0.75">0.75×</option>
+          <option value="1" selected>1×</option>
+          <option value="1.25">1.25×</option>
+          <option value="1.5">1.5×</option>
+          <option value="2">2×</option>
+        </select>
+        <button class="player-tool" id="pipBtn" aria-label="صورة داخل صورة"><svg><use href="#i-pip"/></svg></button>
+        <button class="player-tool" id="fullscreenBtn" aria-label="ملء الشاشة"><svg><use href="#i-full"/></svg></button>
+        <button class="player-next hidden" id="nextEpisodeBtn">الحلقة التالية</button>
+      </div>
+    </div>
   </div>
 </div>
 
-<script src="./app.js?v=20260923-2" defer></script>
+<script src="./app.js?v=20260923-3" defer></script>
 </body>
 </html>
