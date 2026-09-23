@@ -616,6 +616,7 @@ async function copyTo(key:string,fromChatId:number,messageId:number,caption:stri
     job_key:jobKey,operation:"copy_message",status:"pending",channel_key:key,
     from_chat_id:fromChatId,source_message_id:messageId,
     file_size:fileSize??null,max_attempts:COPY_RETRY_DELAYS_MS.length,
+    attempts:["failed","rolled_back"].includes(String(existing?.status||""))?0:Number(existing?.attempts||0),
     last_error:null
   },{onConflict:"job_key"}).select("id,status,attempts,max_attempts").single();
   if(jobError||!job)throw jobError??new Error("تعذر تجهيز عملية نقل الوسائط.");
@@ -1359,9 +1360,14 @@ async function publishBatchEpisodes(userId:number,chatId:number,d:any){
   const items:any[]=Array.isArray(d.items)?d.items:[];
   const grouped=new Map<number,any[]>();
   for(const x of items){const n=Number(x.episode_number);if(!grouped.has(n))grouped.set(n,[]);grouped.get(n)!.push(x);}
-  const results:any[]=[];
+  const results:any[]=Array.isArray(d.batch_results)?[...d.batch_results]:[];
   for(const [episodeNumber,files] of [...grouped.entries()].sort((a,b)=>a[0]-b[0])){
-    if(await episodeHasVideo(d.series_public_id,Number(d.season_number),episodeNumber)){
+    const previous=results.find((x:any)=>Number(x.episode)===episodeNumber);
+    if(previous?.ok&&!(previous.failedVariants?.length))continue;
+    for(let i=results.length-1;i>=0;i--)if(Number(results[i]?.episode)===episodeNumber)results.splice(i,1);
+    const hasVideo=await episodeHasVideo(d.series_public_id,Number(d.season_number),episodeNumber);
+    const isResume=Boolean(d.batch_retry||previous);
+    if(hasVideo&&!isResume){
       results.push({episode:episodeNumber,ok:false,error:"الحلقة تحتوي فيديو مسبقًا"});continue;
     }
     const sorted=[...files].sort((a,b)=>qualityRank(String(b.variant))-qualityRank(String(a.variant)));
@@ -1385,6 +1391,10 @@ async function publishBatchEpisodes(userId:number,chatId:number,d:any){
       }
       results.push({episode:episodeNumber,ok:true,public_id:epPublicId,failedVariants});
     }catch(err){results.push({episode:episodeNumber,ok:false,error:adminErrorText(err)});}
+    d.batch_results=results;
+    d.batch_retry=true;
+    d.batch_last_episode=episodeNumber;
+    await setSession(userId,"batch_episode","publishing",d);
   }
   await adminLog(userId,"batch_episode_publish","series",undefined,d.series_public_id,{season_number:d.season_number,results});
   return results;
