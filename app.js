@@ -10,6 +10,7 @@ const state={
   query:"",movieGenre:"",seriesGenre:"",detail:null,player:null,nextEpisode:null,
   prefs:{autoplayNext:true,saveProgress:true}
 };
+const viewedThisSession=new Set();
 
 const $=s=>document.querySelector(s);
 const $$=s=>[...document.querySelectorAll(s)];
@@ -327,6 +328,21 @@ $("#profileForm").addEventListener("submit",async e=>{
     state.user.display_name=j.display_name;renderAccount();closeModal("editProfileModal");showToast("تم حفظ الاسم");
   }catch(err){showToast(err.message)}finally{btn.disabled=false}
 });
+
+$("#changePasswordForm").addEventListener("submit",async e=>{
+  e.preventDefault();
+  const current=$("#currentPassword").value;
+  const next=$("#newPassword").value;
+  const confirm=$("#confirmNewPassword").value;
+  if(next.length<8){showToast("كلمة المرور الجديدة يجب أن تكون 8 أحرف على الأقل");return}
+  if(next!==confirm){showToast("تأكيد كلمة المرور غير مطابق");return}
+  if(current===next){showToast("اختر كلمة مرور جديدة مختلفة");return}
+  const btn=e.submitter;btn.disabled=true;
+  try{
+    await rawApi("change_password",{method:"POST",auth:true,body:{current_password:current,new_password:next}});
+    e.target.reset();closeModal("changePasswordModal");showToast("تم تحديث كلمة المرور");
+  }catch(err){showToast(err.message)}finally{btn.disabled=false}
+});
 $("#logoutBtn").onclick=()=>{setSession(null);state.user=null;state.favorites=[];state.progress=[];renderAccount();renderCatalog();go("home");showToast("تم تسجيل الخروج")};
 
 $("#requestForm").addEventListener("submit",async e=>{
@@ -420,6 +436,13 @@ function playerProgress(){
   if(!o)return null;
   return state.user?progressFor(o.type,o.id):guestProgress().find(x=>x.entity_type===o.type&&x.entity_id===o.id);
 }
+async function recordPlaybackView(o){
+  if(!o?.id||!["movie","episode"].includes(o.type))return;
+  const key=o.type+":"+o.id;
+  if(viewedThisSession.has(key))return;
+  viewedThisSession.add(key);
+  try{await rawApi("view",{method:"POST",body:{entity_type:o.type,entity_id:o.id}})}catch{}
+}
 function openPlayer(o){
   state.player=o;state.nextEpisode=o.next||null;
   $("#playerTitle").textContent=o.title;$("#playerMeta").textContent=o.publicId||"";
@@ -439,6 +462,7 @@ function openPlayer(o){
       video.currentTime=Number(p.position_seconds);
     }
     syncPlayerUI();
+    video.addEventListener("playing",()=>recordPlaybackView(o),{once:true});
     video.play().catch(()=>{showPlayerControls(true)});
   },{once:true});
   showPlayerControls();
@@ -614,6 +638,7 @@ $("#globalSearchBtn").onclick=()=>{$("#searchPanel").classList.toggle("hidden");
 $("#clearSearch").onclick=()=>{$("#searchInput").value="";state.query="";renderCatalog()};
 $("#searchInput").oninput=e=>{state.query=e.target.value;renderCatalog()};
 $("#editProfileBtn").onclick=()=>openModal("editProfileModal");
+$("#openPasswordBtn").onclick=()=>openModal("changePasswordModal");
 $("#openRequestBtn").onclick=()=>openModal("requestModal");
 $("#openRequestsHistory").onclick=openRequests;
 $("#openReportGeneral").onclick=()=>openReport("other","");
