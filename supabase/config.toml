@@ -1,0 +1,2 @@
+[functions.vayzen-gateway]
+verify_jwt = false
