@@ -3577,38 +3577,40 @@ function qualityRank(v:string){
 async function asset(type:string,id:string,variant="default"){
   if(!/^[0-9a-f-]{36}$/i.test(id)) return null;
   let entity_type="",kind="";
-  if(type==="movie_poster"||type==="movie_video"||type==="movie_backdrop"){
-    const {data}=await db.from("movies").select("status").eq("id",id).maybeSingle();
-    if(data?.status!=="published") return null;
-    entity_type="movie";kind=type==="movie_poster"?"poster":type==="movie_backdrop"?"backdrop":"video";
+  if(type==="movie_poster"||type==="movie_video"||type==="movie_backdrop"||type==="movie_subtitle"){
+    const {data}=await db.from("movies").select("status,deleted_at").eq("id",id).maybeSingle();
+    if(data?.status!=="published"||data?.deleted_at) return null;
+    entity_type="movie";
+    kind=type==="movie_poster"?"poster":type==="movie_backdrop"?"backdrop":type==="movie_subtitle"?"subtitle":"video";
   }else if(type==="series_poster"||type==="series_backdrop"){
     const {data}=await db.from("series").select("status").eq("id",id).maybeSingle();
     if(data?.status!=="published") return null;
     entity_type="series";kind=type==="series_backdrop"?"backdrop":"poster";
-  }else if(type==="episode_video"){
-    const {data:e}=await db.from("episodes").select("season_id,status").eq("id",id).maybeSingle();
-    if(e?.status!=="published") return null;
+  }else if(type==="episode_video"||type==="episode_subtitle"){
+    const {data:e}=await db.from("episodes").select("season_id,status,deleted_at").eq("id",id).maybeSingle();
+    if(e?.status!=="published"||e?.deleted_at) return null;
     const {data:se}=await db.from("seasons").select("series_id,status").eq("id",e.season_id).maybeSingle();
     if(se?.status!=="published") return null;
     const {data:sr}=await db.from("series").select("status").eq("id",se.series_id).maybeSingle();
     if(sr?.status!=="published") return null;
-    entity_type="episode";kind="video";
+    entity_type="episode";kind=type==="episode_subtitle"?"subtitle":"video";
   }else return null;
 
-  const requested=kind==="video"?normalizeVariant(variant):"default";
+  const requested=(kind==="video"||kind==="subtitle")?normalizeVariant(variant):"default";
   const {data:direct}=await db.from("media_assets")
-    .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_size,variant")
+    .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_name,file_size,variant,metadata")
     .eq("entity_type",entity_type).eq("entity_id",id).eq("kind",kind).eq("variant",requested).maybeSingle();
   if(direct)return direct;
   if(kind==="backdrop"){
     const {data:fallback}=await db.from("media_assets")
-      .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_size,variant")
+      .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_name,file_size,variant,metadata")
       .eq("entity_type",entity_type).eq("entity_id",id).eq("kind","poster").eq("variant","default").maybeSingle();
     return fallback??null;
   }
+  if(kind==="subtitle")return null;
   if(kind!=="video"||requested!=="default")return null;
   const {data:list}=await db.from("media_assets")
-    .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_size,variant")
+    .select("channel_id,channel_message_id,telegram_file_id,mime_type,file_name,file_size,variant,metadata")
     .eq("entity_type",entity_type).eq("entity_id",id).eq("kind","video");
   const sorted=(list??[]).sort((a:any,b:any)=>qualityRank(String(b.variant))-qualityRank(String(a.variant)));
   return sorted[0]??null;
@@ -3628,6 +3630,31 @@ async function publicMediaVariants(url:URL){
     .map((x:any)=>({variant:String(x.variant||"default"),label:variantLabel(String(x.variant||"default")),file_size:x.file_size||null,mime_type:x.mime_type||null}))
     .sort((a:any,b:any)=>qualityRank(b.variant)-qualityRank(a.variant));
   return json({ok:true,variants});
+}
+
+async function publicSubtitles(url:URL){
+  const type=String(url.searchParams.get("type")||"");
+  const id=String(url.searchParams.get("id")||"");
+  if(!["movie","episode"].includes(type)||!/^[0-9a-f-]{36}$/i.test(id))return json({error:"invalid subtitle target"},400);
+  const mediaType=type==="movie"?"movie_subtitle":"episode_subtitle";
+  const contentProbe=type==="movie"?await asset("movie_video",id,"default"):await asset("episode_video",id,"default");
+  if(!contentProbe)return json({error:"not found"},404);
+  const {data,error}=await db.from("subtitle_tracks")
+    .select("language_code,label,source_format,is_default")
+    .eq("entity_type",type).eq("entity_id",id)
+    .order("is_default",{ascending:false}).order("created_at",{ascending:true});
+  if(error)throw error;
+  const tracks=(data??[]).map((x:any)=>({
+    language_code:x.language_code,label:x.label,format:x.source_format,is_default:x.is_default,
+    src:`?media=${mediaType}&id=${encodeURIComponent(id)}&quality=${encodeURIComponent(subtitleVariant(x.language_code))}`
+  }));
+  return json({ok:true,tracks});
+}
+
+function srtToVtt(text:string){
+  let body=String(text||"").replace(/^\uFEFF/,"").replace(/\r\n?/g,"\n");
+  body=body.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2}),(\d{3})/g,"$1.$2 --> $3.$4");
+  return "WEBVTT\n\n"+body;
 }
 
 async function streamSigningSecret(){
@@ -3662,10 +3689,21 @@ async function media(type:string,id:string,req?:Request){
     const sig=await hmacHex(payload,signingSecret);
     return Response.redirect(`${gatewayBase}/stream/${a.channel_id}/${a.channel_message_id}?exp=${exp}&sig=${sig}`,307);
   }
-  if(!a.telegram_file_id) return json({error:"poster file id missing"},409);
+  if(!a.telegram_file_id) return json({error:"telegram file id missing"},409);
   const file=await tg("getFile",{file_id:a.telegram_file_id});
   const upstream=await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
   const headers=new Headers(cors);
+  const isSubtitle=type==="movie_subtitle"||type==="episode_subtitle";
+  if(isSubtitle){
+    if(!upstream.ok)return new Response("subtitle unavailable",{status:upstream.status,headers});
+    const raw=await upstream.text();
+    const storedFormat=String(a.metadata?.source_format||"").toLowerCase();
+    const format=storedFormat|| (String(a.file_name||"").toLowerCase().endsWith(".srt")?"srt":"vtt");
+    const body=format==="srt"?srtToVtt(raw):(/^WEBVTT/.test(raw.trim())?raw:"WEBVTT\n\n"+raw);
+    headers.set("Content-Type","text/vtt; charset=utf-8");
+    headers.set("Cache-Control","public, max-age=1800");
+    return new Response(body,{status:200,headers});
+  }
   headers.set("Content-Type",upstream.headers.get("content-type")||a.mime_type||"image/jpeg");
   headers.set("Cache-Control","public, max-age=3600");
   return new Response(upstream.body,{status:upstream.status,headers});
@@ -3852,7 +3890,64 @@ async function progressApi(req:Request){
   }
   const position=Math.max(0,Number(body?.position_seconds||0)),duration=Math.max(0,Number(body?.duration_seconds||0));
   const {error}=await db.from("watch_progress").upsert({user_id:auth.user.id,entity_type:type,entity_id:id,position_seconds:position,duration_seconds:duration,updated_at:new Date().toISOString()});
-  if(error)throw error;return json({ok:true});
+  if(error)throw error;
+  try{await updateWatchHistory(auth.user.id,type,id,position,duration)}catch{}
+  return json({ok:true,completed:duration>0&&position/duration>=0.92});
+}
+
+async function updateWatchHistory(userId:string,type:string,id:string,position:number,duration:number){
+  const now=new Date().toISOString();
+  const completed=duration>0&&position/duration>=0.92;
+  const {data:existing}=await db.from("watch_history")
+    .select("play_count,last_watched_at,completed_at").eq("user_id",userId).eq("entity_type",type).eq("entity_id",id).maybeSingle();
+  if(existing){
+    const last=Date.parse(String(existing.last_watched_at||""));
+    const restart=position<20&&(!Number.isFinite(last)||Date.now()-last>20*60_000);
+    await db.from("watch_history").update({
+      last_watched_at:now,last_position_seconds:position,duration_seconds:duration,
+      play_count:Number(existing.play_count||1)+(restart?1:0),
+      completed_at:completed?(existing.completed_at||now):existing.completed_at
+    }).eq("user_id",userId).eq("entity_type",type).eq("entity_id",id);
+  }else{
+    await db.from("watch_history").insert({
+      user_id:userId,entity_type:type,entity_id:id,first_watched_at:now,last_watched_at:now,
+      last_position_seconds:position,duration_seconds:duration,play_count:1,completed_at:completed?now:null
+    });
+  }
+}
+
+async function watchHistoryApi(req:Request){
+  const auth=await userFromRequest(req);if(!auth)return json({error:"unauthorized"},401);
+  const {data,error}=await db.from("watch_history")
+    .select("entity_type,entity_id,first_watched_at,last_watched_at,completed_at,play_count,last_position_seconds,duration_seconds")
+    .eq("user_id",auth.user.id).order("last_watched_at",{ascending:false}).limit(100);
+  if(error)throw error;
+  const rows:any[]=data??[];
+  const movieIds=rows.filter(x=>x.entity_type==="movie").map(x=>x.entity_id);
+  const episodeIds=rows.filter(x=>x.entity_type==="episode").map(x=>x.entity_id);
+  const movieMap=new Map<string,any>();
+  const episodeMap=new Map<string,any>();
+  if(movieIds.length){
+    const {data:m}=await db.from("movies").select("id,public_id,title,status,deleted_at").in("id",movieIds);
+    for(const x of m??[])if(x.status==="published"&&!x.deleted_at)movieMap.set(x.id,x);
+  }
+  if(episodeIds.length){
+    const {data:eps}=await db.from("episodes").select("id,public_id,title,episode_number,season_id,status,deleted_at").in("id",episodeIds);
+    const seasonIds=[...new Set((eps??[]).map((x:any)=>x.season_id))];
+    const {data:ses}=seasonIds.length?await db.from("seasons").select("id,series_id,season_number").in("id",seasonIds):{data:[] as any[]};
+    const seriesIds=[...new Set((ses??[]).map((x:any)=>x.series_id))];
+    const {data:srs}=seriesIds.length?await db.from("series").select("id,public_id,title,status,deleted_at").in("id",seriesIds):{data:[] as any[]};
+    const seMap=new Map((ses??[]).map((x:any)=>[x.id,x]));
+    const srMap=new Map((srs??[]).map((x:any)=>[x.id,x]));
+    for(const ep of eps??[]){
+      const se:any=seMap.get(ep.season_id),sr:any=se?srMap.get(se.series_id):null;
+      if(ep.status==="published"&&!ep.deleted_at&&sr?.status==="published"&&!sr?.deleted_at){
+        episodeMap.set(ep.id,{...ep,season_number:se.season_number,series_id:sr.id,series_public_id:sr.public_id,series_title:sr.title});
+      }
+    }
+  }
+  const out=rows.map(x=>({...x,meta:x.entity_type==="movie"?movieMap.get(x.entity_id):episodeMap.get(x.entity_id)})).filter(x=>x.meta);
+  return json({ok:true,history:out});
 }
 
 async function publicRequest(req:Request){
@@ -3922,6 +4017,8 @@ Deno.serve(async(req:Request)=>{
   if(req.method==="OPTIONS") return new Response("ok",{headers:cors});
   try{
     const url=new URL(req.url);
+    const runtime=(globalThis as any).EdgeRuntime;
+    if(runtime?.waitUntil)runtime.waitUntil(maybeOperationalCheck());
     if(req.method==="GET"&&url.searchParams.get("health")==="1"){
       return json({
         ok:true,name:"VAYZEN",maxVideoMB:MAX_VIDEO_MB,
@@ -3949,6 +4046,7 @@ Deno.serve(async(req:Request)=>{
     if(action==="catalog"&&req.method==="GET") return catalog();
     if(action==="series_content"&&req.method==="GET") return seriesContent(url);
     if(action==="media_variants"&&req.method==="GET") return publicMediaVariants(url);
+    if(action==="subtitles"&&req.method==="GET") return publicSubtitles(url);
     if(action==="signup"&&req.method==="POST") return authSignup(req);
     if(action==="login"&&req.method==="POST") return authLogin(req);
     if(action==="refresh"&&req.method==="POST") return authRefresh(req);
@@ -3958,6 +4056,7 @@ Deno.serve(async(req:Request)=>{
     if(action==="view"&&req.method==="POST") return recordView(req);
     if(action==="favorites"&&(req.method==="GET"||req.method==="POST")) return favoritesApi(req);
     if(action==="progress"&&(req.method==="GET"||req.method==="POST")) return progressApi(req);
+    if(action==="watch_history"&&req.method==="GET") return watchHistoryApi(req);
     if(req.method==="POST"&&action==="request_content") return publicRequest(req);
     if(req.method==="GET"&&action==="request_status") return requestStatus(url);
     if(req.method==="POST"&&action==="report") return publicReport(req);
