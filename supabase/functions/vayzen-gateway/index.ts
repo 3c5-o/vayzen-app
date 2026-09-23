@@ -527,14 +527,21 @@ async function sendContentItem(chatId:number,type:string,publicId:string){
   const item:any=await contentByPublicId(type,publicId);
   if(!item)return sendContentManager(chatId);
   const nextStatus=item.status==="published"?"hidden":"published";
-  const rows=[
+  const rows:any[]=[
+    [{text:"تعديل البيانات",callback_data:`ce|${type}|${item.public_id}`},{text:"استبدال البوستر",callback_data:`cp|${type}|${item.public_id}`}],
+    [type==="movie"
+      ?{text:"استبدال الفيديو",callback_data:`cv|movie|${item.public_id}`}
+      :{text:"المواسم والحلقات",callback_data:`se|${item.public_id}`}],
     [{text:nextStatus==="published"?"نشر المحتوى":"إخفاء المحتوى",callback_data:`cs|${type}|${item.public_id}|${nextStatus}`}],
     [{text:item.is_featured?"إلغاء التمييز":"تمييز في الرئيسية",callback_data:`cf|${type}|${item.public_id}|${item.is_featured?"0":"1"}`}],
     [{text:"حذف",callback_data:`cd1|${type}|${item.public_id}`}],
     [{text:"رجوع",callback_data:"content"}],
   ];
+  const extra=type==="movie"
+    ?`\nالسنة: ${item.release_year||"—"}\nالمدة: ${item.duration_minutes||"—"} دقيقة`
+    :`\nالسنة: ${item.release_year||"—"}`;
   return send(chatId,
-    `${item.public_id}\n${item.title}\n\nالحالة: ${item.status}\nمميز: ${item.is_featured?"نعم":"لا"}\nالمشاهدات: ${item.view_count||0}`,
+    `${item.public_id}\n${item.title}\n\nالحالة: ${item.status}\nمميز: ${item.is_featured?"نعم":"لا"}\nالجودة: ${item.quality||"—"}\nالمشاهدات: ${item.view_count||0}${extra}`,
     {inline_keyboard:rows}
   );
 }
@@ -573,21 +580,21 @@ async function deleteContent(adminId:number,type:string,publicId:string){
 }
 
 async function sendRequestsManager(chatId:number){
-  const {data}=await db.from("content_requests").select("request_code,request_type,title,status")
+  const {data}=await db.from("content_requests").select("request_code,request_type,title,status,linked_entity_type,linked_entity_id")
     .order("created_at",{ascending:false}).limit(6);
   const rows:any[]=[];
   for(const x of data??[]){
     if(!["added","rejected","duplicate"].includes(x.status)){
       rows.push([
         {text:`مراجعة ${x.request_code}`,callback_data:`rq|${x.request_code}|reviewing`},
-        {text:"تمت الإضافة",callback_data:`rq|${x.request_code}|added`},
+        {text:"ربط بالمحتوى",callback_data:`rql|${x.request_code}`},
         {text:"رفض",callback_data:`rq|${x.request_code}|rejected`},
       ]);
     }
   }
   rows.push([{text:"رجوع للقائمة",callback_data:"menu"}]);
   return send(chatId,
-    "طلبات المستخدمين:\n"+((data??[]).map((x:any)=>`• ${x.request_code} | ${x.title} | ${x.status}`).join("\n")||"لا توجد طلبات"),
+    "طلبات المستخدمين:\n"+((data??[]).map((x:any)=>`• ${x.request_code} | ${x.title} | ${x.status}${x.linked_entity_id?" | مرتبط":""}`).join("\n")||"لا توجد طلبات"),
     {inline_keyboard:rows}
   );
 }
@@ -596,7 +603,14 @@ async function sendReportsManager(chatId:number){
   const {data}=await db.from("reports").select("report_code,entity_public_id,reason,status")
     .order("created_at",{ascending:false}).limit(6);
   const rows:any[]=[];
+  const lines:any[]=[];
   for(const x of data??[]){
+    let related=1;
+    if(x.entity_public_id){
+      const {count}=await db.from("reports").select("id",{head:true,count:"exact"}).eq("entity_public_id",x.entity_public_id).in("status",["new","reviewing"]);
+      related=count||1;
+    }
+    lines.push(`• ${x.report_code} | ${x.entity_public_id||"—"} | ${x.reason} | ${x.status}${related>1?" | "+related+" بلاغات":""}`);
     if(!["resolved","rejected"].includes(x.status)){
       rows.push([
         {text:`مراجعة ${x.report_code}`,callback_data:`rp|${x.report_code}|reviewing`},
@@ -606,10 +620,7 @@ async function sendReportsManager(chatId:number){
     }
   }
   rows.push([{text:"رجوع للقائمة",callback_data:"menu"}]);
-  return send(chatId,
-    "البلاغات:\n"+((data??[]).map((x:any)=>`• ${x.report_code} | ${x.entity_public_id||"—"} | ${x.reason} | ${x.status}`).join("\n")||"لا توجد بلاغات"),
-    {inline_keyboard:rows}
-  );
+  return send(chatId,"البلاغات:\n"+(lines.join("\n")||"لا توجد بلاغات"),{inline_keyboard:rows});
 }
 
 async function systemStatusText(){
