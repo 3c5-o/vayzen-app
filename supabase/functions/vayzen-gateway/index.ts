@@ -488,8 +488,14 @@ async function asset(type:string,id:string){
   return data??null;
 }
 
-async function hmacHex(payload:string){
-  const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(STREAM_SIGNING_SECRET),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
+async function streamSigningSecret(){
+  const {data}=await db.from("app_settings").select("value").eq("key","stream_signing").maybeSingle();
+  const dbSecret=String((data as any)?.value?.secret||"");
+  return dbSecret||STREAM_SIGNING_SECRET;
+}
+
+async function hmacHex(payload:string,secret:string){
+  const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(secret),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
   const sig=await crypto.subtle.sign("HMAC",key,new TextEncoder().encode(payload));
   return [...new Uint8Array(sig)].map(b=>b.toString(16).padStart(2,"0")).join("");
 }
@@ -498,11 +504,12 @@ async function media(type:string,id:string,req?:Request){
   const a:any=await asset(type,id);
   if(!a) return json({error:"not found"},404);
   if(type==="movie_video"||type==="episode_video"){
-    if(!STREAM_GATEWAY||!STREAM_SIGNING_SECRET) return json({error:"streaming gateway not configured"},503);
+    const signingSecret=await streamSigningSecret();
+    if(!STREAM_GATEWAY||!signingSecret) return json({error:"streaming gateway not configured"},503);
     if(a.file_size&&Number(a.file_size)>MAX_VIDEO_BYTES) return json({error:"file exceeds current 500MB limit"},413);
     const exp=Math.floor(Date.now()/1000)+600;
     const payload=`${a.channel_id}:${a.channel_message_id}:${exp}`;
-    const sig=await hmacHex(payload);
+    const sig=await hmacHex(payload,signingSecret);
     const gatewayBase=STREAM_GATEWAY.replace(/\/$/,"");
     return Response.redirect(`${gatewayBase}/stream/${a.channel_id}/${a.channel_message_id}?exp=${exp}&sig=${sig}`,307);
   }
@@ -694,7 +701,7 @@ Deno.serve(async(req:Request)=>{
         botConfigured:Boolean(BOT_TOKEN),
         webhookSecretConfigured:Boolean(BOT_SECRET),
         streamGatewayConfigured:Boolean(STREAM_GATEWAY),
-        streamSigningConfigured:Boolean(STREAM_SIGNING_SECRET),
+        streamSigningConfigured:Boolean(await streamSigningSecret()),
       });
     }
     if(req.method==="GET"&&url.searchParams.has("setup")){
