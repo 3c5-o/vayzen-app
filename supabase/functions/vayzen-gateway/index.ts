@@ -81,38 +81,88 @@ async function send(chatId:string|number,text:string,reply_markup?:unknown){
   return tg("sendMessage",{chat_id:chatId,text,...(reply_markup?{reply_markup}:{})});
 }
 
-type Admin={telegram_user_id:number;role:string;permissions:Record<string,boolean>;is_active:boolean};
+type AdminPermission="content"|"publish"|"delete_content"|"requests"|"reports"|"users"|"stats"|"logs"|"system"|"admins";
+type Admin={telegram_user_id:number;display_name?:string;role:string;permissions:Record<string,boolean>;is_active:boolean};
+
+const permissionLabels:Record<AdminPermission,string>={
+  content:"إدارة المحتوى",publish:"النشر",delete_content:"حذف المحتوى",requests:"الطلبات",reports:"البلاغات",
+  users:"المستخدمون",stats:"الإحصائيات",logs:"السجلات",system:"حالة النظام",admins:"إدارة المشرفين"
+};
 
 async function getAdmin(id:string|number):Promise<Admin|null>{
   const {data}=await db.from("admin_users")
-    .select("telegram_user_id,role,permissions,is_active")
+    .select("telegram_user_id,display_name,role,permissions,is_active")
     .eq("telegram_user_id",Number(id)).maybeSingle();
   return data?.is_active ? data as Admin : null;
 }
 
-function can(admin:Admin,perm:"content"|"requests"|"reports"|"logs"){
-  if(admin.role==="owner"||admin.role==="secondary_admin") return true;
-  const custom=admin.permissions?.[perm];
-  if(typeof custom==="boolean") return custom;
-  if(perm==="content") return admin.role==="content_manager";
-  if(perm==="requests") return ["requests_manager","moderator","support"].includes(admin.role);
-  if(perm==="reports") return ["requests_manager","moderator","support"].includes(admin.role);
+function defaultPermission(role:string,perm:AdminPermission){
+  if(role==="owner")return true;
+  if(role==="secondary_admin")return true;
+  if(role==="content_manager")return ["content","publish","stats"].includes(perm);
+  if(role==="requests_manager")return ["requests","reports","stats"].includes(perm);
+  if(role==="moderator")return ["requests","reports","stats"].includes(perm);
+  if(role==="support")return ["requests","reports"].includes(perm);
   return false;
 }
+function can(admin:Admin,perm:AdminPermission){
+  if(admin.role==="owner")return true;
+  if(admin.role==="secondary_admin"){
+    if(perm==="admins")return true;
+    return true;
+  }
+  const custom=admin.permissions?.[perm];
+  return typeof custom==="boolean"?custom:defaultPermission(admin.role,perm);
+}
+function canManageAdmin(actor:Admin,target:Admin|null,newRole?:string){
+  if(actor.role==="owner"){
+    if(target?.role==="owner"&&target.telegram_user_id!==actor.telegram_user_id)return false;
+    return true;
+  }
+  if(actor.role!=="secondary_admin")return false;
+  if(target&&["owner","secondary_admin"].includes(target.role))return false;
+  if(newRole&&["owner","secondary_admin"].includes(newRole))return false;
+  return true;
+}
 
-const mainMenu={
-  inline_keyboard:[
-    [{text:"إضافة فيلم",callback_data:"add_movie"},{text:"إضافة مسلسل",callback_data:"add_series"}],
-    [{text:"إضافة حلقة",callback_data:"add_episode"}],
-    [{text:"طلبات المستخدمين",callback_data:"requests"},{text:"البلاغات",callback_data:"reports"}],
-    [{text:"إدارة المحتوى",callback_data:"content"},{text:"الإحصائيات",callback_data:"stats"}],
-    [{text:"المستخدمون",callback_data:"users"},{text:"حالة النظام",callback_data:"system_status"}],
-    [{text:"إلغاء العملية",callback_data:"cancel"}],
-  ]
-};
+function roleLabel(role:string){
+  const map:Record<string,string>={owner:"المالك",secondary_admin:"أدمن ثانوي",content_manager:"مشرف محتوى",requests_manager:"مشرف طلبات",moderator:"مشرف",support:"دعم"};
+  return map[role]||role;
+}
 
-async function showMenu(chatId:string|number,text="لوحة إدارة VAYZEN"){
-  return send(chatId,text,mainMenu);
+function menuFor(admin:Admin){
+  const rows:any[]=[];
+  if(can(admin,"content")&&can(admin,"publish")){
+    rows.push([{text:"إضافة فيلم",callback_data:"add_movie"},{text:"إضافة مسلسل",callback_data:"add_series"}]);
+    rows.push([{text:"إضافة حلقات جماعية",callback_data:"batch_episode"},{text:"إضافة حلقة",callback_data:"add_episode"}]);
+  }
+  if(can(admin,"requests")||can(admin,"reports")){
+    const row:any[]=[];
+    if(can(admin,"requests"))row.push({text:"طلبات المستخدمين",callback_data:"requests"});
+    if(can(admin,"reports"))row.push({text:"البلاغات",callback_data:"reports"});
+    if(row.length)rows.push(row);
+  }
+  if(can(admin,"content")||can(admin,"stats")){
+    const row:any[]=[];
+    if(can(admin,"content"))row.push({text:"إدارة المحتوى",callback_data:"content"});
+    if(can(admin,"stats"))row.push({text:"الإحصائيات",callback_data:"stats"});
+    if(row.length)rows.push(row);
+  }
+  if(can(admin,"users")||can(admin,"system")){
+    const row:any[]=[];
+    if(can(admin,"users"))row.push({text:"المستخدمون",callback_data:"users"});
+    if(can(admin,"system"))row.push({text:"حالة النظام",callback_data:"system_status"});
+    if(row.length)rows.push(row);
+  }
+  if(can(admin,"admins"))rows.push([{text:"إدارة المشرفين",callback_data:"admins"},{text:"سجل الإدارة",callback_data:"admin_logs"}]);
+  rows.push([{text:"إلغاء العملية",callback_data:"cancel"}]);
+  return {inline_keyboard:rows};
+}
+
+async function showMenu(chatId:string|number,text="لوحة إدارة VAYZEN",admin?:Admin|null){
+  const a=admin??await getAdmin(chatId);
+  if(!a)return send(chatId,"غير مصرح لك باستخدام لوحة الإدارة.");
+  return send(chatId,`${text}\n\n${roleLabel(a.role)} • ${a.display_name||a.telegram_user_id}`,menuFor(a));
 }
 
 async function getSession(userId:number){
