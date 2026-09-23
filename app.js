@@ -162,11 +162,36 @@ function guestProgress(){
 }
 function setGuestProgress(list){localStorage.setItem(GUEST_PROGRESS_KEY,JSON.stringify(list.slice(0,100)))}
 function renderContinue(){
-  const entries=state.user?state.progress:guestProgress();
-  const movies=entries.filter(x=>x.entity_type==="movie"&&Number(x.position_seconds)>5&&Number(x.duration_seconds)>20).slice(0,10);
-  const items=movies.map(p=>state.movies.find(m=>m.id===p.entity_id)).filter(Boolean);
-  $("#continueRail").innerHTML=items.length?items.map(x=>card(x,"movie",{compact:true})).join(""):'<div class="empty-card">ما عندك مشاهدة غير مكتملة بعد.</div>';
-  bindCards($("#continueRail"));
+  const entries=(state.user?state.progress:guestProgress())
+    .filter(x=>Number(x.position_seconds)>5&&Number(x.duration_seconds)>20&&Number(x.position_seconds)<Number(x.duration_seconds)-5)
+    .slice(0,12);
+  const playable=[];
+  const html=[];
+  for(const p of entries){
+    const pct=Math.max(2,Math.min(98,Math.round((Number(p.position_seconds)/Number(p.duration_seconds))*100)));
+    if(p.entity_type==="movie"){
+      const item=state.movies.find(m=>m.id===p.entity_id);if(!item)continue;
+      const idx=playable.push({type:"movie",id:item.id,title:item.title,publicId:item.public_id,src:mediaUrl("movie_video",item.id)})-1;
+      html.push(`<article class="continue-watch-card" data-cont="${idx}">
+        <div class="continue-poster"><img src="${mediaUrl("movie_poster",item.id)}" alt="" loading="lazy"><span class="continue-play"><svg><use href="#i-play"/></svg></span></div>
+        <div class="continue-copy"><b>${esc(item.title)}</b><small>فيلم • ${formatClock(p.position_seconds)} من ${formatClock(p.duration_seconds)}</small><div class="continue-progress"><i style="width:${pct}%"></i></div></div>
+      </article>`);
+    }else if(p.entity_type==="episode"&&p.series_id){
+      const title=p.series_title||"مسلسل";
+      const epTitle=p.episode_title||("الحلقة "+(p.episode_number||""));
+      const idx=playable.push({
+        type:"episode",id:p.entity_id,title:title+" • "+epTitle,publicId:p.episode_public_id||"",
+        src:mediaUrl("episode_video",p.entity_id),seriesId:p.series_id,seriesTitle:title,
+        seasonNumber:p.season_number||null,episodeNumber:p.episode_number||null,episodeTitle:epTitle
+      })-1;
+      html.push(`<article class="continue-watch-card" data-cont="${idx}">
+        <div class="continue-poster"><img src="${mediaUrl("series_poster",p.series_id)}" alt="" loading="lazy"><span class="continue-play"><svg><use href="#i-play"/></svg></span></div>
+        <div class="continue-copy"><b>${esc(title)}</b><small>${esc(epTitle)} • ${formatClock(p.position_seconds)} من ${formatClock(p.duration_seconds)}</small><div class="continue-progress"><i style="width:${pct}%"></i></div></div>
+      </article>`);
+    }
+  }
+  $("#continueRail").innerHTML=html.length?html.join(""):'<div class="empty-card">ما عندك مشاهدة غير مكتملة بعد.</div>';
+  $("#continueRail").querySelectorAll("[data-cont]").forEach(el=>el.onclick=()=>openPlayer(playable[Number(el.dataset.cont)]));
 }
 function renderMyList(){
   const guest=$("#myListGuest"),grid=$("#myListGrid");
@@ -270,7 +295,14 @@ async function loadSeriesContent(series){
         btn.onclick=()=>openPlayer({
           type:"episode",id:ep.id,title:series.title+" • "+(ep.title||("الحلقة "+ep.episode_number)),
           publicId:ep.public_id,src:mediaUrl("episode_video",ep.id),
-          next:next?{type:"episode",id:next.id,title:series.title+" • "+(next.title||("الحلقة "+next.episode_number)),publicId:next.public_id,src:mediaUrl("episode_video",next.id)}:null
+          seriesId:series.id,seriesTitle:series.title,seasonNumber:seasons[i].season_number,
+          episodeNumber:ep.episode_number,episodeTitle:ep.title||("الحلقة "+ep.episode_number),
+          next:next?{
+            type:"episode",id:next.id,title:series.title+" • "+(next.title||("الحلقة "+next.episode_number)),
+            publicId:next.public_id,src:mediaUrl("episode_video",next.id),
+            seriesId:series.id,seriesTitle:series.title,seasonNumber:seasons[i].season_number,
+            episodeNumber:next.episode_number,episodeTitle:next.title||("الحلقة "+next.episode_number)
+          }:null
         });
       });
     };
@@ -481,7 +513,13 @@ async function closePlayer(){
 }
 async function saveCurrentProgress(){
   const o=state.player;if(!o||!state.prefs.saveProgress||!video.duration||!isFinite(video.duration))return;
-  const entry={entity_type:o.type,entity_id:o.id,position_seconds:Math.floor(video.currentTime||0),duration_seconds:Math.floor(video.duration||0),updated_at:new Date().toISOString()};
+  const entry={
+    entity_type:o.type,entity_id:o.id,position_seconds:Math.floor(video.currentTime||0),duration_seconds:Math.floor(video.duration||0),updated_at:new Date().toISOString(),
+    ...(o.type==="episode"?{
+      series_id:o.seriesId||null,series_title:o.seriesTitle||"",season_number:o.seasonNumber||null,
+      episode_number:o.episodeNumber||null,episode_public_id:o.publicId||"",episode_title:o.episodeTitle||o.title||""
+    }:{})
+  };
   if(state.user){
     const i=state.progress.findIndex(x=>x.entity_type===o.type&&x.entity_id===o.id);if(i>=0)state.progress[i]=entry;else state.progress.unshift(entry);
     try{await rawApi("progress",{method:"POST",auth:true,body:entry})}catch{}
