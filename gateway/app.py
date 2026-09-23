@@ -27,6 +27,7 @@ MAX_RANGE_WINDOW = max(4, int(os.environ.get("MAX_RANGE_WINDOW_MB", "32"))) * 10
 client = TelegramClient(None, API_ID, API_HASH)
 channel_cache = {}
 stream_slots = asyncio.Semaphore(MAX_CONCURRENT_STREAMS)
+active_streams = 0
 
 
 async def refresh_channel_cache():
@@ -206,6 +207,7 @@ async def health():
         "range_streaming": True,
         "chunk_size_kb": CHUNK_SIZE // 1024,
         "range_window_mb": MAX_RANGE_WINDOW // (1024 * 1024),
+        "active_streams": active_streams,
         "max_concurrent_streams": MAX_CONCURRENT_STREAMS,
         "signed_streams": bool(STREAM_SIGNING_SECRET),
         "cached_channels": len(channel_cache),
@@ -236,19 +238,24 @@ async def stream(channel_id: int, message_id: int, request: Request, exp: int, s
         return Response(status_code=status, headers=headers, media_type=mime)
 
     async def body():
+        global active_streams
         remaining = length
         async with stream_slots:
-            async for chunk in client.iter_download(
-                message.media,
-                offset=start,
-                request_size=CHUNK_SIZE,
-                chunk_size=CHUNK_SIZE,
-            ):
-                if remaining <= 0 or await request.is_disconnected():
-                    break
-                if len(chunk) > remaining:
-                    chunk = chunk[:remaining]
-                remaining -= len(chunk)
-                yield chunk
+            active_streams += 1
+            try:
+                async for chunk in client.iter_download(
+                    message.media,
+                    offset=start,
+                    request_size=CHUNK_SIZE,
+                    chunk_size=CHUNK_SIZE,
+                ):
+                    if remaining <= 0 or await request.is_disconnected():
+                        break
+                    if len(chunk) > remaining:
+                        chunk = chunk[:remaining]
+                    remaining -= len(chunk)
+                    yield chunk
+            finally:
+                active_streams = max(0, active_streams - 1)
 
     return StreamingResponse(body(), status_code=status, headers=headers, media_type=mime)
