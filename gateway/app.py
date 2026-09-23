@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 import httpx
-from telethon import TelegramClient
+from telethon import TelegramClient, utils
 
 API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
@@ -28,9 +28,25 @@ channel_cache = {}
 stream_slots = asyncio.Semaphore(MAX_CONCURRENT_STREAMS)
 
 
+async def refresh_channel_cache():
+    try:
+        dialogs = await client.get_dialogs(limit=None)
+        for dialog in dialogs:
+            entity = dialog.entity
+            try:
+                marked_id = utils.get_peer_id(entity)
+            except Exception:
+                continue
+            channel_cache[marked_id] = entity
+    except Exception:
+        # Streaming can still attempt lazy resolution below.
+        pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await client.start(bot_token=BOT_TOKEN)
+    await refresh_channel_cache()
     yield
     await client.disconnect()
 
@@ -81,10 +97,21 @@ def verify_signature(channel_id: int, message_id: int, exp: int, sig: str):
 async def get_channel(channel_id: int):
     if channel_id in channel_cache:
         return channel_cache[channel_id]
+
+    # In-memory Telethon sessions may not know the access hash for a numeric
+    # -100... channel ID until dialogs have been loaded. Refresh once before
+    # falling back to normal entity resolution.
+    await refresh_channel_cache()
+    if channel_id in channel_cache:
+        return channel_cache[channel_id]
+
     try:
         entity = await client.get_entity(channel_id)
     except Exception as exc:
-        raise HTTPException(status_code=404, detail="Telegram channel unavailable") from exc
+        raise HTTPException(
+            status_code=404,
+            detail="Telegram channel unavailable to streaming bot",
+        ) from exc
     channel_cache[channel_id] = entity
     return entity
 
@@ -173,6 +200,7 @@ async def health():
         "chunk_size_kb": CHUNK_SIZE // 1024,
         "max_concurrent_streams": MAX_CONCURRENT_STREAMS,
         "signed_streams": bool(STREAM_SIGNING_SECRET),
+        "cached_channels": len(channel_cache),
     }
 
 
