@@ -113,6 +113,35 @@ create table if not exists public.media_assets (
   unique(entity_type, entity_id, kind, variant)
 );
 
+create table if not exists public.media_transfer_jobs (
+  id uuid primary key default gen_random_uuid(),
+  job_key text unique not null,
+  operation text not null default 'copy_message' check (operation in ('copy_message')),
+  status text not null default 'pending' check (status in ('pending','processing','completed','failed','rolled_back')),
+  channel_key text not null,
+  from_chat_id bigint not null,
+  source_message_id bigint not null,
+  target_channel_id bigint,
+  target_message_id bigint,
+  file_size bigint check (file_size is null or file_size >= 0),
+  attempts integer not null default 0 check (attempts >= 0),
+  max_attempts integer not null default 3 check (max_attempts between 1 and 8),
+  last_error text,
+  started_at timestamptz,
+  completed_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists media_transfer_jobs_status_idx
+  on public.media_transfer_jobs(status, updated_at);
+
+create index if not exists media_transfer_jobs_target_idx
+  on public.media_transfer_jobs(target_channel_id, target_message_id)
+  where target_channel_id is not null and target_message_id is not null;
+
+alter table public.media_transfer_jobs enable row level security;
+
 create table if not exists public.telegram_channels (
   channel_key text primary key,
   telegram_channel_id bigint unique not null,
@@ -424,13 +453,13 @@ begin
 end $$;
 
 insert into public.app_settings(key,value)
-values('app', jsonb_build_object('name','VAYZEN','version','1.0.0','max_video_mb',800))
+values('app', jsonb_build_object('name','VAYZEN','version','1.0.0','max_video_mb',2000))
 on conflict (key) do update
-set value=jsonb_set(public.app_settings.value,'{max_video_mb}','800'::jsonb,true), updated_at=now();
+set value=jsonb_set(public.app_settings.value,'{max_video_mb}','2000'::jsonb,true), updated_at=now();
 
 insert into public.app_settings(key,value)
 values('limits', jsonb_build_object(
-  'max_video_mb',800,
+  'max_video_mb',2000,
   'request_daily',5,
   'report_hourly',10,
   'view_window_minutes',15
