@@ -12,6 +12,32 @@ const BOT_SECRET = Deno.env.get("TELEGRAM_BOT_SECRET") ?? "";
 const STREAM_GATEWAY = Deno.env.get("STREAM_GATEWAY") ?? "";
 const STREAM_SIGNING_SECRET = Deno.env.get("STREAM_SIGNING_SECRET") ?? "";
 const TMDB_API_BASE = "https://api.themoviedb.org/3";
+const BOT_UI_ICON_VERSION = 1;
+const BOT_UI_ICON_KEYS = ["movie","series","episodes","content","requests","report","users","stats","admin","search","settings","back","cancel","delete","check","edit","quality"] as const;
+type BotUiIconKey = typeof BOT_UI_ICON_KEYS[number];
+const BOT_UI_ICON_PNGS:Record<BotUiIconKey,string>={
+  movie:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAABWklEQVR42u3csVHDMBSA4UjnBehgALL/PixABxuIigLukgvIz3qyvq9M4dj6LcvOJblcAAAAAAAAzq0Ygp8+nl/b79ee3t8OG6cqQS6CCII15A/rxaOi1hUzxCULQQTBou7BkCmDtNbaTNsdbTsixExRPl+uD79PKaWkD3LWM/fese4Zpoix00DuFKWKkev4qxi5olQxckXZIneulFKi7lBGbzfqRKxRZ8P3AdwaoN4DGr3de+F79qFGzYxMgzciSton9bM9yUevmYcFiZris2031QyJmOIzbjfsSd0t7/4xffyejCCCIIgg/FfIZ1kjbhfP8mBrhrhkIYggCCIIggiCIIIgCIIIgiCCIIggCCIIgiCIIAgiCBMEWeVnChHH2RVk1K+Mssfo+ebmNtsZ5JLVMUtW1DseNcNOiBGwqK8eJd2/Aa0cJe3/Za22oLtUAwAAAAAAAADL+gIQ9rGeqO2lNAAAAABJRU5ErkJggg==",
+  series:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAABSklEQVR42u3dsW3DMBBAUZHwAu6SAZz998kC6ZwNmN6AhRQ8gXd8r0wTUd8URQZwjgMAAAAAAJisuQXvPT8e4/Vn95/v0HvW3fa1CLKY2xW/ZIwxMt6c38+vWkGyhvjPmFprIWtJF2Ot8TUx5jyaZr19dTOj8FuWGEnesiIXwagNYPoZcjY7Vo6x2tOhRV9Q5hjvjk4ix2qnXnlRRxBBEGQr3rIWG6sZsutOPXIzVelkwQyxqCOIIKRc1Hc4BTZDBEEQQRBEEARBEBvDE057zRCPLAQRhCKLutNeM0QQBBEEQQRBEEHYfGN49Wlvho2oGSIIgghCykXdaa8ZIgiCCIIggiCIIBGqfQ9j9HimBTnb5FWJcsXXGN6qfLI8sgI/JdnMHHdf+eJ2ixG2qO8SJWKcPdPFVo9xHBf9y6NKC7o/GQAAAAAAAFDKH7BSavpDd2qXAAAAAElFTkSuQmCC",
+  episodes:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAABmElEQVR42u3cwVXDMBBFUdvHDbBLA+m/IBpglxLEih1wDsGK/kj3NRApT+M/49jZNgAAAAAAAAAAcDF7ykJaa63cl7fv+3RCKoroKWYnIkvMQUbWvo4Na4f6T6eoR0BW3EtEhVSU0Wvdx+gTVVXGb+v/T5bIkDAICeMc3f6ltMApl85zlIjUjmm0mHN1EWliDjKy9iXUZwr1v06qyXPId2trrbVXr+/yCjF1DxKSdtoft3vrIeXVWTJVhjxu93aFGJM6MWt0WRWlTN/2VquWZeaQKmKWGwzTxSw7qadKWfrWSWK1uJcVJuakY9vePt53FUKGCkkWsXSFpMpYrkKSRSwlpIKIZS5ZlWRMXSHVRExdIVVlTFchlUV88fQGnvlNvcLT76P35V6WDAEhhKCEkIQH0RKagPgKqSqlx7r3ESdj1lcYrmjjZYhQr/8qdM99naMX79+AQoTMIKZHpZ8zby6hjRXqQh0RQkzdRSrE1D1oUjd1yxAZYuoueMma7fI1+oB1+XBTNwAAAAAAAAAAAAAAAAAAQAU+AZun47EmP1RSAAAAAElFTkSuQmCC",
+  content:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAABIElEQVR42u3bURLCIAwFQPD+d8YL6Idt4jzo7gFo8NnUkWYMAAAAAACAs82ORddaq6zAOeeT6pupG+3YeHp9Y4zx2iGMivXT6ysNpHuzd6+TXl/LHULIM+Tbt6Kz5/+ydnp9f7lDqh5wHb+w0uvTssIIRCAIRCAIRCAIRCAIRCAIBIEIBIEIhD0CqTrD7joLT65vJn9wHwu+cEqXXp+WdXrL6jr7rrpOen0td0j3pu+un15f6TOks2c/7d1eAAAAAL7yX1ZYfebUw4Ixpx62f3PqYaE4wj3toW5OvXZtc+ph9WlZYQQiEAQiEAQiEAQiEAQiEASCQASCQATCHoGYU7/OnHpAfVrW6S3LnHrddcyph+3fu72bdAcAAAAAAOCyN9y1wGv65d7+AAAAAElFTkSuQmCC",
+  requests:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAACAUlEQVR42u2bQXKDMBAEkYoP5JY8IPn/f/KB3JIfkJMvKUOMtSvNoO6jyyWz0wIJsywLAAAAAAAAAAAAAAAEU9wL+H593+59/vL1aVlbZU4iBBCCEEAIQgAhCIHOrJmDb9u2ZRfw8/Yx5LdLKcVGSA8Ro7nVGC2mIkOr3ooMrborMrTqr8jQkrJmH2TWbuTG3t/vmb+bOQFr5sFlyxjFUV2tsqrrmaEs5fJ36nuXpVHjZFJdZLSGGTXO1EL+hvdsmFHjTC1kL7SzYUaNM72Qo66RR8M8+p5qV4r0JatFiqOMZQnoy9rbd0duCyMvL5EyMmq32PZGhejQPGfzxLA1TJdORqtHuM+G6tRWavdM/Wy4bj2+lk0Oj4bs2HBt23XyX9h0vwtJcZVhL+Re+M4ybG4MVZn2xnAmEIIQQAhCACEXIa1R7tn+pBHbZaXOS7kzpHc4am2wkpesXiEp9iSzhiBEY/aqduxLnyFZoSm/PpG2yzqzW1IKaPRxV/UQootWf32iOszMKCkO77JIrSGZUlxeLFoXI2Z4l1Ful9V7tqo92ZTc9vYKSfExM3fqswhpvd5nz97W8bPWs5IdfkSwkcVnH0/r+EXhbLgSrUKqyqxDRvAaMruUqPqr4kHNKiNllzWblOh6U8O78mLPugkAAAAAAAAAAAAAAAAAAAAAADv8ApY4C4LXW87/AAAAAElFTkSuQmCC",
+  report:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAABnElEQVR42u3csXUDIRBFUUEHztyA+y/IDThzCevUiS0daRf+wH2pAi183sDoLLrdAAAAAAAAAAzlOI7DLISFsUIoXZy4tFRVt4QhuH4jr2wJQzDmmFvVEoZgXBOoWQzsyKuFomRhnB0VLWEIxtpRzRKGYN7qrmAJQzB3VWsWAycvORQlCxmrONUShoTRUu1ord19tu/3jz9X+dvXZzvrexiyMb2qHaeUh9Za2l7CEIZk1fQ0S/rOYSSGomQpWZnHzxRLGMKQ3OYswRKGMCTTjhRLGBIWSmeHklUijFmWKFm7G1KpVM2whCE7G1JxIx9tCUN2NaTyMXekJV0YWaEoWbuVrJU68sSXIp4KZKUVXHo8q75pfuW47CG7sPo9jKvGxxB2GKeHLDReJSut11mhCfx9T+SReyHJzW/pQF69sJM47l7djogyc+JPKmX3kP/seOTzVDo7sixxylrNkFl23Nu0Z5y2zrCkVwxj5dLVVghkdh8SMS/+Veea+bGp75y+eWKI1PHafDEk7djMjnH9iVkAAAAAAAAAAABAHD81smfLipkGmAAAAABJRU5ErkJggg==",
+  users:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAAB+ElEQVR42u3b227DIBBFUQ/y//8yfUmlKkpcg+fGsNdrW+z4MBgIPQ4AAAAAAAAAAADAkWS4id57v7xJESGQBEHsGIysEMROwbTVwtBqg0CUH2TVUNqKYVQORbKE8e298ORvCcRwSrvL1PgM7Q0DD1FExHvYiwhZoqpj9sNqtTkSrmcwLXtlWDyc0UrznDy0iOqIumZ/mW3b4zO1lapjh5X6eWxi9N3z7fd7792yQ7Sdw5CX0Z9ZDl3t2NTdXu49PLZdqyNru43q2HwdwvZ7UCAh2w4FpsMhQ9aTHl65OswDueqxMw8220ZguZf6SCiR3zaW2Mu623P/2yO6s4d0dQ2ryjFrd/X1wJ0Hc7VSt/zb1IFYhKL1/cfIXpb1+8r9RagVysxD0bi29eThXLU6/rbHIYekMxStAxOR0+pWJYyR62Xey5IKQVhVS4lTJ5m2Nu6sgUpXyGwYT9YDI21HzvDcA/H8X48sVWgRjHiGYfEBVnpfucyyosfhDGsQzU5hfgrQ84FFV4vKmbMqYVgt+LwXkbJjGB4TitlrbHsu68mwlO7k4upDlceu7+w1lq+QyBe5RSjN+yYrDmHhQ9YK1eG6/6R4uqZp3kCW6vi9j0/3Y/VS1mqzxPDy3gujOkaW+wAAAAAAAAAAAAAAAAAAAAAAAAAAAMBDP0iJcEufzW3GAAAAAElFTkSuQmCC",
+  stats:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAABAklEQVR42u3bTRLBMBiA4cY4ADsOwP3PwwHY6Q1ij8x0EvKjz7POwuT1tSbaaQIAAAAAAAAAPgm24F2MMSY3LIQgSAchaoXZyNAXQTKmI2e9ICYEQQRBEEEQBEEEQRBBKLYd+cM/DqfkedL+fh3yJDv8W4jcMDmHhb84gnfJcg+pNx056wVBEEEQRBAEEQRBBEEQBBEEQYZU5Q+qlu9bCLIwxOsaYVyy1hWkl/ctBEEQQRBEEARBEEEQRBAEEQRBBEEQQWyBIAgiCIIIgiCCIMi6FT++2eIBt/l4Xrx2d7vU39SCx2JNiAmpMyktJuMbEzJ0kG6/5S5ZfmUBAAAAAABJT2exRsf3KjunAAAAAElFTkSuQmCC",
+  admin:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAACLElEQVR42u2cQW7DMAwETaMf6K0f6P8f1A/01ieopxRBAKexRUlLcuZYpI64q5UoO/C2AQAAAAAAAIAOlqGI1lr7K8jMMETIhNvfoxpjUY34T/CoqbHIaci4pFlWE3oThiGTBVNNjWVOQ0RzrKoJqkuaVStYfcJY5TQojt8wQSvhFm3A1Ze0UwO8H2QlJGuvaoZ3/fsGUmAIhgD7SKC63yIL8fPxeSjE+/cXD6haa21GT/7MiBXGeNa9Z0qFx+dJyERhR6WldEKyEyIhZzfv2Zu9Z93yhhyJ+4qwPf/LkjVgL4jY+roaYmbmeUga1SF5Xtd7VdizpiNqSuiyMAQwBEOgjCHZ72VJGzKqQ1LuvEI+D4k265cmxPtw6D2bPa834lbRXi0N6umSfT4wQ7jetJRJyKxZrJgWqYSsFOhKWkYkRMaQV8x4FO3Mg6gr119hSIi290ioMwLePsum3pGOkQc4j+9MuamvMOPZ9VcnaIghvYfDWbc2er5n1A86dsV0VGm7p+0hZ2fQvQArbvxd+f5ZP5t1NWRLzKj6eEBViawpGVkXCSEl1EMR1JGvkHT7YfSCUjYoUYtKfaaKVtzs8dL2QpyUlHoRgnqxq8bHkgX6KSn97i+14qu/iE1KgPJmqAmBIUJiYIaQKEpm0PaC1mxlqRISCTNOijVKsMpv4ZabxRghJCJmCC0zmCGSFvYLIVMwQsgUzBDZV1iihNKCEQVP9wAAAAAAAABQiV9PBU2JievDRgAAAABJRU5ErkJggg==",
+  search:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAAB6UlEQVR42u2cwVHEMBAET8qAHwmQf0AkcD9CED+KchVnG1u7M9ruN3XWbWtkdFr78QAAAAAAAAAAAAAAAFibpjqwMcbYHXxrDSGJAioIaiuIWElMW0nECmL6qjIir2ObkMwCuaSlV5DhlJamWowjM3rW5y4t5EzRrhQr6jrWQo4W6c4CZVzT/r+smYVx3xz2zHTMKt6s+4+tEIXfoVylpCxZUcsKO/UDsy66SHvXU0tJXzEZzknpkelQRWncvcos5bcsQAhCDq7DKsvFq3Go3EdICEsWIAQhgBCEAEIQArZCHDZdDptXEsKSBRJC6FxMEOLagqM07l5hljqdZPbo2RZdHLWmC8mbOs+HBAtRaFJzfWh0WkIypTg/wZu+D7lbimsr0s9EUSo4z4cEJOTMlx+/mPH32/F8vX+McglRWkr+kvH2/Ky3MVTqXNwmQykpKUWKTMt2IrwqvkJSSj0fspcEhaSUedfJmWJnJqXU24AcpJR7X5a6lOVeAOYupeQR7pkiR9/oy56pq0op3eSgKKV814maFNqAxKQgREwKQsSkIERMCkLEpCBETApCxKQgREwKQsSkIERMCkLEpCBkkpT/nqMgZIKUK4daCLlZytUTRoTcKEWpA7I0ij3CAAAAAAAAAAAAAJDJN3w7SCVce+tMAAAAAElFTkSuQmCC",
+  settings:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAACa0lEQVR42u2dS1LDMBAFMyouwI4LcP8DcQF2HEGsqKICTiw5mnkv7l4HezStry2ZywUAAAAAAAAAAAAA/AnXwHvvfbNQEbblatRJhABCEAIIQQggBCEp6wbnNY+lkJ8COUrJjr1l1y4nKRWxt4qm7iClKvaWXSAHKZWxR2XBLhe9B4HVMS/tsvYErtRSFCrQ8kHdRYpKa06Z9qpLUepa0xaGqlLUxrlQSsBIwR+ZSKW3j6HSRaxuQfeuPxvTUwi5TsBMslaIGYnJfgzZSkymjL3dU+XaSHp3xtIVsejOlHZGGWoLUnkhWclSlBLOMvYO0E7dVzjKePR6RUlKOMk4kjSXJ882mxyOJstlv284tI5byfx6e//zt6+fH7HiXgi5kaT/ROwRoy5EvsualbH1O/Wuq6m3jlkZs7+vXpu8ZC6qRmvnqtocETEaf0Z5D40hjwpw5F3EVm3/PVbs+c3ofTOF2O/tvU70rRmWA2y2Rgg8tZDrMWN0VvU0K/WKQX024aMLxMpBfXram7HA6r33FffJSq5llzVa0NFZ1OjveXQyUZv3JnnmWZbtGJLZhfC010yK0j1OM+092tW4HKXjnbpQ65ATMlqT2XVi0j05TXMtxpCsJCm+PWyqLWF1srauXz34t2oZFVLuyaiU0hRaRqaUvS2jSorVkbZVJ6hOe6Qt61zgyLVOe+hTeW/t6Y5Fq290Vjqy3c4uQ01KQ4aWlIYMLSlln2da/X7j6PWrpsIln2dyODxTFXv655mc/nNBReypn2dy/DcS2bFLfZ7JrfuyFgIIQQggBCGAEIQAQgAAAAAAAAAAAADgCN915/B4Ql2dvQAAAABJRU5ErkJggg==",
+  back:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAABiElEQVR42u3cwU3EMBRFUTsdzJIG6L8fGmA5HYQ9iIGREPn3vXsbQOTo49iOWMvMzMzMzMzMzMzMzMzMzGxm53meV/78Q4KvGFeiCPLNZFyFIsiDh38FyiHG44f+3yiHGLMW+kOMn9t7b0EKMdZaawsxB6NqQggYNSAUjAoQEkb8GjJ58a6bECJGLAgVIxKEjBEHQseIAknAiAFJwYgAScLAg6RhoEESMZA7ddpRSPSEpGOgQBowMCAtGIg1JHXxRk5IG8boCfmMcX95RT3Y2/vbjpuQxg7CdAhigthgkJQ3JidEEKfEnXo4IuIXaDrLQqwhzz5g8j4Gs6i3oKDeshpQsH9rUxd77D7kmYdMmhT0xjARBb9TT0OJODpJQok5y0pBiTpcTECJO+2lo0Qev5NRYu9DqCjxdw60k+L4G0Pa+VfFFS4JpeZOnYJSeW89+aS48quTyW9gtZ8BTUWp/i7rtyj+z8VBKK4hg1D8n4uDUJq/L8a+EpuZmZmZmZmZmZmZmZmZ/W0fGZTrZW10gBoAAAAASUVORK5CYII=",
+  cancel:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAACv0lEQVR42u2du0EEMQxELXVARgP0XxANkFHCEpFxx9mWRqP1TEhwa+t5/MXyGJIkSZIkSZIkSZIkSZIkSVJ/WcdCX9d1vVxBMxOQouDfAZKdAqELHDsVBCsYOx0EGxgTCC4w1hHGTLBQ32kNZDZIkYGp/DYdELb1A+N6xthgVHQTTGUzlgozTDsZyumCMVeO7JmhCwYXFKuC0WHTr6IOztoKT10cOrplscL4fv+4Zsub0XU5E4xHQUHBYIDiKBi7QUE5Y+X7kVBgY8izVhYRlMhu6q+/o7paR7hjBgYKyn+/PwslyiXO5AwUlFd/t8Ipnu2OjKAgYIwxxtvXp2XHAeqQZ61pprJRUKJgZLrEK9xRASXTGZEu8Qp3oKFkwMhyScnWCRIKyhkUQCIXRBlQqmDsxCXFIat2joSCgHGb3d5sKN26KWogu1A6w6AFsgqlO4wxNk4MHw1c0f1qxvZJNIzIWNA6JCt4rM5oAyQyiOww2gCJCGYHGK2A7AS1C4x2QFaC2wlGSyCZe1kCApoCd4Lid4fRDYqfAKMTFD8FRhcoy0AebQtEnpFk7U1FQoneQvI7OOMXRhWU23dZO87oDsXvBOMOUODXEVBjBgIK3XWEyLOPjAG8yik7caHosjJP+rp1X2lAXrUz4tg1A0rWxU+vtCfyDBzllN1uvOxadMU/JERBybwWHQJkpVVkDMzVTomY5JRmcoicuqIaQ5tMDqvXvSIWdxlQZmFELQFg094ZKKhj15nGgMp+Fwpkp5WsbBBmQFn5Pn1miuuJWMv836wKVZ+S5DOdsk2j6+FslewCI0tWXSFGt1SWu+xaNKtbqhtRaSYHNigMjlZW0nFgVtIVJyhvL/HsRZmtyaeUyv1+4HrkuNcRWMEc/X4IExi9sEMCRm9QEcDRK20HrB8kSZIkSZIkSZIkSZIkSZJK9QMSW4Vgy3COuQAAAABJRU5ErkJggg==",
+  delete:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAABBElEQVR42u3c0Q2CMBiFUdqwgG8u4P4DuYBvjlAX8MmAvX85ZwBS8tHSJoRtAwAAAAAADtaSB/e+P8ZZ1769npH33j2TgiCIIAgiCDiHRJ4hUpxxlrFkeYcgiCAIIgg4h/zHGCPmzNJaa5cNkhQiJUwXI2t8XYyscdplXX3bW2V2zBrvbneT9bBYspzUEUQQBFnEnjy4b7ueX3ZjR13HDLFkIQiCCIIggiCIIAgiCIIgiCAIIgiCCIIggiAIggiCIIIgyFqiPyU96nPP1M9GzRBBEEQQBBEEQZxD5qr2h4dlZkilQ9qM8VqyvEPqzJIZ4+xXutkK4/PPxeLvOAAAAAAAgGo+EUM8jn8LQa8AAAAASUVORK5CYII=",
+  check:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAACmklEQVR42u2dyVEEMQxF286AGwmQf0AkwI0QmgM3apjxIllf9vtXqBpZz5LVXq8LIYQQQgghhBBCCCGEBlSyGXzf993dyFIKQAIBZAZUToGQBU45FYQqmHI6CDUwBRBaYEpGGD3OWvU7aYFEl63qZXNRhbHCCWr2LAXS2viINKFkW1FpsELZqWBnBUafHd6VYYmEoTyFEWV7BcaYfV6RUoGhBaUCQwtKVWpcViiyQJ71lqwwWuy3jJIKDC0o9UIP9f3+ETITXYmO/2E8guIdJTUqxLNERi+UcCDKi0xWaaonfc36oxIdbU7/+3fJqZNdoqM1Alr/b8Yv9fTo6ElHb1+fxbudR5e9MzDkBvXs6cobxqh/zCMkQ7qyhGHd3uNSlmKaOhaIOoxhIBnHjwgYI34yjRDV8cMbhmW7t09ZGdLUMUCywQgHErXmoAojFMizNYeVsJVghAFpWXM4EUYIEIs1h11hLAfSu+ZwGoylQKzXHFQLhDRAenplr3MzlrcSKcsDyk4wzIG0zN1YQlGBEb5zcXbuxgJKhsgY8VPYh+EMlN3SlASQUSg7w7iuiSNtlttHPUrWVTCst9EOR4jlGoC18xQiY9Q/MtPvVk7MmKbcgYyWgbPOXA1D7oyhx5LtqFOVImPGL1Wx9/Q6NwKG7LFor40NrU5WGzNm/VGVe9ErZ0fB8NwGVb17hRcURRgW2aJkMVRF3u00S1mrznHvDMN8DNkZyqoMUFUalRWG/Jd61LVGUTBSnA/ZBUrEzUZhx6LVoURdMyVxFatSWRxtr/ugrnCxZKbOw72914H39o5EAjdbC9f03P0u/rHF6wgHfrkf936IKpijX9hRAsMbVCJgeKVNAA7vGG5UNiOEEEIIIYQQQgghhH71AyKMDabf1MftAAAAAElFTkSuQmCC",
+  edit:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAABh0lEQVR42u3XQU7DMBRF0cZiATBjA+x/P7AAmLGEMIpUIQptQpNn/3NHnVRqfWI7/3SSJEmSJEmSJEmSJElSdp/PL3Pab2rVMdJQmp2RhdKqY6ShNBhZKA1GFkqDkYXSYGShDA/y9PE29TSnlDiyekIpATLP8/z4/trFRN8qYCyfe0BpVTC2omw59oBcwFiLshfGsCC/YdyKsifGkCDXYFyLsjfGcCC3YPyFcgTGUCBrMC4t/lEYQ+2MtR09mX9vqrwzpmmK+/8NBhAYo4GMitElyMgY3YGMjtEVSAWMbkCqYHQBUgkjHqQaRjRIRYxYkKoYkSCVMeJAqmNEgcAIAoERBAIjAGRBgBG0Q2CEgGyBGB0jelKviLE7iGMqCARGEAiMIBAYQSAwgkC2vt5u/T6QOyxmRZS7gPzncVMN5a7ntKk8DGQNStXLPG6HVIdYejj0aYCQ89oL46BJ/ScEGDvfIee7w+IHVHXKliSXunvjyJmqeSYLzyECAkRAJEmSJEmSJEkK6wu9Zjyu2zHnBgAAAABJRU5ErkJggg==",
+  quality:"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAABZElEQVR42u3czVHDMBAGUMtDAXCDAqD/eqAAuEEH5u4ZDCaJvT/vHTM6OPlirWTvaJoAAAAAAAAAABIYES7i8/F5WX/28PE2BBIgiO7BzJHD2DNOIAeE0TGUeaJeDVmW5c//4K+nl19rxU93xP37a/wfdIyR/g5ZF+6uKyxTlkBIEci6ZnRb6p5a1LcK+5YMBf0aRf3ujIv4zx1w6Rc1Ze1YVV17vEBuGEq3JbCnvQAAQMt9iD1Pw0CydLjMwtg/TiAHhBElFG8MKxb1vS+ojnJGh0uJrpMjRe9wMWUFIxCBxFp1RetwKV3Utwr7lks6XFJ2nUTeh5z9fcpPWdk6XFrUkEwdLp72TjpcAADAPqT3HmJkDaJqMHOFMPaME8gBYVQKxRvDijXkFi+osp6J0qrrpMOZKKYsgVAmkA5nooTuOsl4JkrprpOOZ6KEnrI6nokSvoZ0OxPF014AAAAAAAAAIIVvK7mo61cVEiYAAAAASUVORK5CYII="
+};
+const BOT_UI_ICON_ALTS:Record<BotUiIconKey,string>={
+  movie:"🎬",series:"📺",episodes:"🎞️",content:"🗂️",requests:"📥",report:"⚠️",users:"👥",stats:"📊",admin:"🛡️",
+  search:"🔎",settings:"⚙️",back:"↩️",cancel:"✖️",delete:"🗑️",check:"✅",edit:"✏️",quality:"🎚️"
+};
 const publishableMap = envMap("SUPABASE_PUBLISHABLE_KEYS");
 const PUBLIC_KEY = Deno.env.get("SUPABASE_ANON_KEY") ?? publishableMap["default"] ?? "";
 
@@ -198,6 +224,120 @@ async function tg(method:string,body:Record<string,unknown>){
   return j.result;
 }
 
+
+type TelegramInlineButton={text:string;callback_data?:string;url?:string;web_app?:unknown;login_url?:unknown;style?:"primary"|"success"|"danger";icon_custom_emoji_id?:string;[key:string]:unknown};
+type TelegramMarkup={inline_keyboard?:TelegramInlineButton[][];[key:string]:unknown};
+let botUiIconCache:{expires:number;ids:Partial<Record<BotUiIconKey,string>>}|null=null;
+
+function botUiAssetUrl(name:BotUiIconKey){
+  return `${SUPABASE_URL}/functions/v1/vayzen-gateway?action=bot_icon_asset&name=${encodeURIComponent(name)}&v=${BOT_UI_ICON_VERSION}`;
+}
+async function readBotUiIconIds(){
+  if(botUiIconCache&&botUiIconCache.expires>Date.now())return botUiIconCache.ids;
+  const {data}=await db.from("app_settings").select("value").eq("key","bot_ui_icons").maybeSingle();
+  const value:any=data?.value||{};
+  const ids=(value.version===BOT_UI_ICON_VERSION&&value.status==="ready"&&value.icons&&typeof value.icons==="object")?value.icons:{};
+  botUiIconCache={expires:Date.now()+5*60_000,ids};
+  return ids as Partial<Record<BotUiIconKey,string>>;
+}
+async function writeBotUiState(value:Record<string,unknown>){
+  const {error}=await db.from("app_settings").upsert({key:"bot_ui_icons",value,updated_at:new Date().toISOString()});
+  if(error)throw error;
+  botUiIconCache=null;
+}
+function botUiIconKey(button:TelegramInlineButton):BotUiIconKey|undefined{
+  const a=String(button.callback_data||"");
+  const t=String(button.text||"");
+  if(a==="add_movie"||a.startsWith("add_movie_"))return "movie";
+  if(a==="add_series"||a.startsWith("add_series_"))return "series";
+  if(a==="batch_episode"||a==="add_episode"||a.startsWith("add_episode_for|")||a.startsWith("ae_")||a.startsWith("epi|"))return "episodes";
+  if(a==="requests"||a.startsWith("rq|")||a.startsWith("rql|"))return "requests";
+  if(a==="reports"||a.startsWith("rp|"))return "report";
+  if(a==="users"||a.startsWith("usr|")||a==="user_search"||a.startsWith("usb|"))return "users";
+  if(a==="stats")return "stats";
+  if(a==="admins"||a.startsWith("adm"))return "admin";
+  if(a==="admin_logs")return "content";
+  if(a==="system_status"||a==="bot_ui_settings"||a==="bot_ui_setup")return "settings";
+  if(a==="tmdb_settings"||a.startsWith("tmdb_")||a.startsWith("content_search")||a==="user_search"||t.includes("بحث"))return "search";
+  if(a==="content"||a==="content_movies"||a==="content_series"||a.startsWith("cm|"))return "content";
+  if(a.startsWith("q|")||a.startsWith("qa|")||a.startsWith("qv|")||a.startsWith("qr|")||t.includes("الجودات")||t.includes("الجودة"))return "quality";
+  if(a.startsWith("ce|")||a.startsWith("cef|")||a.startsWith("epe|")||a.startsWith("sedit|")||t.includes("تعديل"))return "edit";
+  if(a==="cancel"||t.includes("إلغاء"))return "cancel";
+  if(a==="menu"||t.includes("رجوع")||t.includes("تراجع")||t.includes("القائمة"))return "back";
+  if(a.includes("del")||a.startsWith("cd")||a.startsWith("sd")||a.startsWith("qd")||a.startsWith("epd")||t.includes("حذف"))return "delete";
+  if(a.startsWith("confirm")||a.includes("|published")||a.includes("|resolved")||a==="tmdb_token_test"||t.includes("نشر")||t.includes("استخدام هذه النتيجة")||t.includes("تم الحل")||t.includes("تفعيل"))return "check";
+  return undefined;
+}
+function botUiButtonStyle(button:TelegramInlineButton):"primary"|"success"|"danger"|undefined{
+  const a=String(button.callback_data||"");
+  const t=String(button.text||"");
+  if(a==="cancel"||a.includes("del")||a.startsWith("cd")||a.startsWith("sd")||a.startsWith("qd")||a.startsWith("epd")||a.includes("|rejected")||t.includes("حذف")||t.includes("رفض")||t.includes("تعطيل"))return "danger";
+  if(a.startsWith("confirm")||a.includes("|published")||a.includes("|resolved")||a==="tmdb_token_test"||t.includes("نشر")||t.includes("استخدام هذه النتيجة")||t.includes("تم الحل")||t.includes("إعادة التفعيل"))return "success";
+  if(a==="add_movie"||a==="add_series"||a==="batch_episode"||a==="add_episode"||a==="content"||a==="requests"||a==="reports"||a==="users"||a==="stats"||a==="admins"||a==="system_status"||a==="tmdb_settings"||a==="bot_ui_settings"||a.startsWith("content_")||a==="user_search")return "primary";
+  return undefined;
+}
+async function decorateInlineKeyboard(markup?:unknown){
+  const raw=markup as TelegramMarkup|undefined;
+  if(!raw?.inline_keyboard)return markup;
+  const ids=await readBotUiIconIds();
+  return {
+    ...raw,
+    inline_keyboard:raw.inline_keyboard.map(row=>row.map(button=>{
+      const style=button.style??botUiButtonStyle(button);
+      const iconKey=botUiIconKey(button);
+      const iconId=iconKey?ids[iconKey]:undefined;
+      return {...button,...(style?{style}:{}),...(iconId?{icon_custom_emoji_id:iconId}:{})};
+    }))
+  };
+}
+async function ensureBotUiIcons(ownerId:number,force=false){
+  const {data}=await db.from("app_settings").select("value").eq("key","bot_ui_icons").maybeSingle();
+  const current:any=data?.value||{};
+  if(!force&&current.version===BOT_UI_ICON_VERSION&&current.status==="ready"&&current.icons)return current;
+  if(!force&&current.status==="unsupported"&&current.retry_after&&Date.parse(current.retry_after)>Date.now())return current;
+  try{
+    const me:any=await tg("getMe",{});
+    const username=String(me?.username||"").replace(/[^A-Za-z0-9_]/g,"");
+    if(!username)throw new Error("Bot username unavailable");
+    const setName=`vayzen_ui_v${BOT_UI_ICON_VERSION}_by_${username}`.slice(0,64);
+    let set:any=null;
+    try{set=await tg("getStickerSet",{name:setName});}catch{}
+    if(!set){
+      const stickers=BOT_UI_ICON_KEYS.map(key=>({
+        sticker:botUiAssetUrl(key),format:"static",emoji_list:[BOT_UI_ICON_ALTS[key]],keywords:["vayzen",key]
+      }));
+      await tg("createNewStickerSet",{
+        user_id:ownerId,name:setName,title:"VAYZEN Interface Icons",stickers,
+        sticker_type:"custom_emoji",needs_repainting:false
+      });
+      set=await tg("getStickerSet",{name:setName});
+    }
+    const stickers=Array.isArray(set?.stickers)?set.stickers:[];
+    if(stickers.length<BOT_UI_ICON_KEYS.length)throw new Error("Custom icon set is incomplete");
+    const icons:Partial<Record<BotUiIconKey,string>>={};
+    BOT_UI_ICON_KEYS.forEach((key,i)=>{
+      const id=String(stickers[i]?.custom_emoji_id||"");
+      if(id)icons[key]=id;
+    });
+    if(Object.keys(icons).length!==BOT_UI_ICON_KEYS.length)throw new Error("Custom emoji identifiers are unavailable");
+    const value={version:BOT_UI_ICON_VERSION,status:"ready",set_name:setName,icons,updated_at:new Date().toISOString()};
+    await writeBotUiState(value);
+    await systemLog("info","VAYZEN bot UI custom icons ready",{set_name:setName,count:Object.keys(icons).length});
+    return value;
+  }catch(err){
+    const message=err instanceof Error?err.message:String(err);
+    const value={version:BOT_UI_ICON_VERSION,status:"unsupported",error:message.slice(0,300),retry_after:new Date(Date.now()+24*60*60_000).toISOString(),updated_at:new Date().toISOString()};
+    await writeBotUiState(value);
+    await systemLog("warning","VAYZEN bot UI icons unavailable",{error:message.slice(0,250)});
+    return value;
+  }
+}
+async function botUiStatus(){
+  const {data}=await db.from("app_settings").select("value").eq("key","bot_ui_icons").maybeSingle();
+  const v:any=data?.value||{};
+  return {status:String(v.status||"not_configured"),count:v.icons?Object.keys(v.icons).length:0,error:String(v.error||""),set_name:String(v.set_name||"")};
+}
+
 async function channel(key:string){
   const {data,error}=await db.from("telegram_channels")
     .select("telegram_channel_id,title,is_active")
@@ -208,7 +348,8 @@ async function channel(key:string){
 }
 
 async function send(chatId:string|number,text:string,reply_markup?:unknown){
-  return tg("sendMessage",{chat_id:chatId,text,...(reply_markup?{reply_markup}:{})});
+  const decorated=reply_markup?await decorateInlineKeyboard(reply_markup):undefined;
+  return tg("sendMessage",{chat_id:chatId,text,...(decorated?{reply_markup:decorated}:{})});
 }
 
 
@@ -241,10 +382,10 @@ async function sendTmdbPreview(chatId:number,type:"movie"|"series",mapped:any,bu
     "",
     `TMDb ID: ${mapped.external_id}`
   ].filter(Boolean).join("\n").slice(0,980);
-  const reply_markup={inline_keyboard:[
+  const reply_markup=await decorateInlineKeyboard({inline_keyboard:[
     [{text:"استخدام هذه النتيجة",callback_data:`tmdb_use|${type==="movie"?"m":"s"}|${mapped.external_id}`}],
     [{text:"بحث جديد",callback_data:`tmdb_again|${type==="movie"?"m":"s"}`},{text:"إلغاء",callback_data:"cancel"}]
-  ]};
+  ]});
   if(posterUrl){
     const m=await tg("sendPhoto",{chat_id:chatId,photo:posterUrl,caption,reply_markup});
     return {message:m,poster:photoFrom(m),poster_source_message_id:Number(m.message_id)};
@@ -308,27 +449,32 @@ function menuFor(admin:Admin){
     rows.push([{text:"إضافة فيلم",callback_data:"add_movie"},{text:"إضافة مسلسل",callback_data:"add_series"}]);
     rows.push([{text:"إضافة حلقات جماعية",callback_data:"batch_episode"},{text:"إضافة حلقة",callback_data:"add_episode"}]);
   }
+  if(can(admin,"content")||admin.role==="owner"){
+    const row:any[]=[];
+    if(can(admin,"content"))row.push({text:"إدارة المحتوى",callback_data:"content"});
+    if(admin.role==="owner")row.push({text:"TMDb",callback_data:"tmdb_settings"});
+    if(row.length)rows.push(row);
+  }
   if(can(admin,"requests")||can(admin,"reports")){
     const row:any[]=[];
     if(can(admin,"requests"))row.push({text:"طلبات المستخدمين",callback_data:"requests"});
     if(can(admin,"reports"))row.push({text:"البلاغات",callback_data:"reports"});
     if(row.length)rows.push(row);
   }
-  if(can(admin,"content")||can(admin,"stats")){
-    const row:any[]=[];
-    if(can(admin,"content"))row.push({text:"إدارة المحتوى",callback_data:"content"});
-    if(can(admin,"stats"))row.push({text:"الإحصائيات",callback_data:"stats"});
-    if(row.length)rows.push(row);
-  }
-  if(can(admin,"users")||can(admin,"system")){
+  if(can(admin,"users")||can(admin,"admins")){
     const row:any[]=[];
     if(can(admin,"users"))row.push({text:"المستخدمون",callback_data:"users"});
+    if(can(admin,"admins"))row.push({text:"المشرفون",callback_data:"admins"});
+    if(row.length)rows.push(row);
+  }
+  if(can(admin,"stats")||can(admin,"system")){
+    const row:any[]=[];
+    if(can(admin,"stats"))row.push({text:"الإحصائيات",callback_data:"stats"});
     if(can(admin,"system"))row.push({text:"حالة النظام",callback_data:"system_status"});
     if(row.length)rows.push(row);
   }
-  if(can(admin,"admins"))rows.push([{text:"إدارة المشرفين",callback_data:"admins"},{text:"سجل الإدارة",callback_data:"admin_logs"}]);
-  else if(can(admin,"logs"))rows.push([{text:"سجل الإدارة",callback_data:"admin_logs"}]);
-  if(admin.role==="owner")rows.push([{text:"إعدادات TMDb",callback_data:"tmdb_settings"}]);
+  if(can(admin,"logs"))rows.push([{text:"سجل الإدارة",callback_data:"admin_logs"}]);
+  if(admin.role==="owner")rows.push([{text:"هوية أزرار VAYZEN",callback_data:"bot_ui_settings"}]);
   rows.push([{text:"إلغاء العملية",callback_data:"cancel"}]);
   return {inline_keyboard:rows};
 }
@@ -336,6 +482,7 @@ function menuFor(admin:Admin){
 async function showMenu(chatId:string|number,text="لوحة إدارة VAYZEN",admin?:Admin|null){
   const a=admin??await getAdmin(chatId);
   if(!a)return send(chatId,"غير مصرح لك باستخدام لوحة الإدارة.");
+  if(a.role==="owner")await ensureBotUiIcons(Number(a.telegram_user_id));
   return send(chatId,`${text}\n\n${roleLabel(a.role)} • ${a.display_name||a.telegram_user_id}`,menuFor(a));
 }
 
@@ -1428,6 +1575,26 @@ async function callback(q:any){
   if(a==="cancel"){
     await clearSession(userId);
     return showMenu(chatId,"تم إلغاء العملية.");
+  }
+  if(a==="bot_ui_settings"){
+    if(admin.role!=="owner")return send(chatId,"إعدادات هوية البوت متاحة للمالك فقط.");
+    const status=await botUiStatus();
+    const ready=status.status==="ready";
+    const stateText=ready?`مفعلة • ${status.count} أيقونة`:status.status==="unsupported"?"الألوان مفعلة • الأيقونات تحتاج إعادة تهيئة":"بانتظار التهيئة";
+    const extra=!ready&&status.error?`\n\nآخر نتيجة: ${status.error.slice(0,180)}`:"";
+    return send(chatId,`هوية أزرار VAYZEN\n\nألوان الأزرار: مفعلة\nالأيقونات المخصصة: ${stateText}${extra}\n\nالنظام يحافظ على نفس الوظائف ويغير الشكل فقط.`,{inline_keyboard:[
+      [{text:ready?"إعادة تهيئة الأيقونات":"تفعيل الأيقونات",callback_data:"bot_ui_setup"}],
+      [{text:"رجوع",callback_data:"menu"}]
+    ]});
+  }
+  if(a==="bot_ui_setup"){
+    if(admin.role!=="owner")return send(chatId,"إعدادات هوية البوت متاحة للمالك فقط.");
+    await send(chatId,"جاري تجهيز مجموعة أيقونات VAYZEN...");
+    const result:any=await ensureBotUiIcons(userId,true);
+    if(result.status==="ready"){
+      return send(chatId,`تم تفعيل أيقونات VAYZEN بنجاح.\nالعدد: ${Object.keys(result.icons||{}).length}`,{inline_keyboard:[[{text:"العودة للوحة الإدارة",callback_data:"menu"}]]});
+    }
+    return send(chatId,`تم تفعيل ألوان الأزرار، لكن Telegram لم يسمح بالأيقونات المخصصة حاليًا.\n\n${String(result.error||"").slice(0,220)}`,{inline_keyboard:[[{text:"رجوع",callback_data:"bot_ui_settings"}]]});
   }
   if(a==="tmdb_settings"){
     if(admin.role!=="owner")return send(chatId,"إعدادات TMDb متاحة للمالك فقط.");
@@ -2878,6 +3045,14 @@ Deno.serve(async(req:Request)=>{
       return json({ok:true,webhook,telegram:r});
     }
     const action=url.searchParams.get("action");
+    if(action==="bot_icon_asset"&&req.method==="GET"){
+      const name=String(url.searchParams.get("name")||"") as BotUiIconKey;
+      const b64=BOT_UI_ICON_PNGS[name];
+      if(!b64)return new Response("not found",{status:404,headers:cors});
+      const raw=atob(b64),bytes=new Uint8Array(raw.length);
+      for(let i=0;i<raw.length;i++)bytes[i]=raw.charCodeAt(i);
+      return new Response(bytes,{status:200,headers:{...cors,"Content-Type":"image/png","Cache-Control":"public, max-age=31536000, immutable"}});
+    }
     if(action==="catalog"&&req.method==="GET") return catalog();
     if(action==="series_content"&&req.method==="GET") return seriesContent(url);
     if(action==="media_variants"&&req.method==="GET") return publicMediaVariants(url);
