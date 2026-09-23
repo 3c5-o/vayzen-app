@@ -7,7 +7,7 @@ const GUEST_PROGRESS_KEY="vayzen.guest.progress";
 
 const state={
   movies:[],series:[],favorites:[],progress:[],user:null,session:null,
-  query:"",movieGenre:"",seriesGenre:"",movieYear:"",seriesYear:"",detail:null,player:null,nextEpisode:null,
+  query:"",movieGenre:"",seriesGenre:"",movieYear:"",seriesYear:"",currentPage:"home",detail:null,player:null,nextEpisode:null,
   prefs:{autoplayNext:true,saveProgress:true}
 };
 const viewedThisSession=new Set();
@@ -87,7 +87,11 @@ async function refreshSession(){
   }
 }
 
-function mediaUrl(kind,id){return API+"?media="+encodeURIComponent(kind)+"&id="+encodeURIComponent(id)}
+function mediaUrl(kind,id,quality=""){
+  const q=new URLSearchParams({media:kind,id});
+  if(quality&&quality!=="default")q.set("quality",quality);
+  return API+"?"+q.toString();
+}
 function typeLabel(type){return type==="movie"?"فيلم":"مسلسل"}
 function genreList(x){return Array.isArray(x.genres)?x.genres:[]}
 function isFav(type,id){return state.favorites.some(x=>x.entity_type===type&&x.entity_id===id)}
@@ -167,6 +171,15 @@ function renderHero(){
   if(!x)return;
   const type=state.movies.includes(x)?"movie":"series";
   $("#heroTitle").textContent=x.title;
+  const heroMeta=$("#heroMeta");
+  if(heroMeta){
+    const bits=[];
+    if(x.release_year)bits.push("<span>"+esc(x.release_year)+"</span>");
+    if(x.quality)bits.push("<span>"+esc(x.quality)+"</span>");
+    if(genreList(x)[0])bits.push("<span>"+esc(genreList(x)[0])+"</span>");
+    if(Number(x.view_count)>0)bits.push("<span>"+Number(x.view_count).toLocaleString("ar-IQ")+" مشاهدة</span>");
+    heroMeta.innerHTML=bits.join("");
+  }
   $("#heroText").textContent=x.description||"شاهد التفاصيل واكتشف المزيد على VAYZEN.";
   $("#heroMedia").style.backgroundImage=`url("${mediaUrl(type==="movie"?"movie_poster":"series_poster",x.id)}")`;
   $("#heroDetails").onclick=()=>openDetails(type,x.id);
