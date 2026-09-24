@@ -8,7 +8,7 @@ const GUEST_PROGRESS_KEY="vayzen.guest.progress";
 const state={
   movies:[],series:[],favorites:[],progress:[],watchHistory:[],user:null,session:null,
   query:"",movieGenre:"",seriesGenre:"",movieYear:"",seriesYear:"",currentPage:"home",detail:null,detailVariant:"",player:null,nextEpisode:null,searchReturnPage:"home",
-  heroItems:[],heroIndex:0,pendingSignupEmail:"",passwordReset:{email:"",token:""},
+  heroItems:[],heroIndex:0,
   prefs:{autoplayNext:true,saveProgress:true}
 };
 const viewedThisSession=new Set();
@@ -687,110 +687,10 @@ $("#registerForm").addEventListener("submit",async e=>{
   if(pass!==confirm){showToast("كلمتا المرور غير متطابقتين");return}
   const btn=e.submitter;btn.disabled=true;
   try{
-    const email=$("#registerEmail").value.trim();
-    const j=await rawApi("signup",{method:"POST",body:{display_name:$("#registerName").value.trim(),email,password:pass}});
-    if(j.session){
-      setSession(j.session);closeModal("authModal");await loadUserState();showToast("تم إنشاء الحساب");
-    }else{
-      state.pendingSignupEmail=email;
-      $("#signupOtpEmailLabel").textContent=email;
-      $("#signupOtpCode").value="";
-      closeModal("authModal");
-      openModal("signupOtpModal");
-      showToast("تم إرسال رمز التحقق إلى بريدك");
-    }
+    const j=await rawApi("signup",{method:"POST",body:{display_name:$("#registerName").value.trim(),email:$("#registerEmail").value.trim(),password:pass}});
+    if(j.session){setSession(j.session);closeModal("authModal");await loadUserState();showToast("تم إنشاء الحساب")}
+    else{setAuthTab("login");showToast("تم إنشاء الحساب. تحقق من بريدك إذا طُلب التأكيد")}
   }catch(err){showToast(err.message)}finally{btn.disabled=false}
-});
-
-$("#signupOtpForm").addEventListener("submit",async e=>{
-  e.preventDefault();
-  const code=$("#signupOtpCode").value.trim();
-  if(!/^[0-9]{6,10}$/.test(code)){showToast("أدخل رمز التحقق بالأرقام");return}
-  const btn=e.submitter;btn.disabled=true;
-  try{
-    const j=await rawApi("signup_verify",{method:"POST",body:{email:state.pendingSignupEmail,token:code}});
-    setSession(j.session);
-    state.pendingSignupEmail="";
-    e.target.reset();
-    closeModal("signupOtpModal");
-    await loadUserState();
-    showToast("تم تأكيد البريد وإنشاء الحساب");
-  }catch(err){showToast(err.message)}finally{btn.disabled=false}
-});
-
-$("#forgotPasswordBtn").onclick=()=>{
-  $("#resetEmail").value=$("#loginEmail").value.trim();
-  closeModal("authModal");
-  openModal("resetRequestModal");
-};
-
-async function sendPasswordResetCode(){
-  const email=$("#resetEmail").value.trim()||state.passwordReset.email;
-  if(!email.includes("@")){showToast("أدخل بريدًا إلكترونيًا صالحًا");return false}
-  await rawApi("password_reset_request",{method:"POST",body:{email}});
-  state.passwordReset={email,token:""};
-  $("#resetOtpEmailLabel").textContent=email;
-  $("#resetOtpCode").value="";
-  return true;
-}
-
-$("#resetRequestForm").addEventListener("submit",async e=>{
-  e.preventDefault();
-  const btn=e.submitter;btn.disabled=true;
-  try{
-    if(await sendPasswordResetCode()){
-      closeModal("resetRequestModal");
-      openModal("resetOtpModal");
-      showToast("إذا كان البريد مسجلاً فسيصل رمز الاسترجاع إليه");
-    }
-  }catch(err){showToast(err.message)}finally{btn.disabled=false}
-});
-
-$("#resetResendBtn").onclick=async e=>{
-  const btn=e.currentTarget;btn.disabled=true;
-  try{
-    $("#resetEmail").value=state.passwordReset.email;
-    if(await sendPasswordResetCode())showToast("تم طلب رمز جديد");
-  }catch(err){showToast(err.message)}finally{btn.disabled=false}
-};
-
-$("#resetOtpForm").addEventListener("submit",e=>{
-  e.preventDefault();
-  const code=$("#resetOtpCode").value.trim();
-  if(!/^[0-9]{6,10}$/.test(code)){showToast("أدخل رمز التحقق بالأرقام");return}
-  state.passwordReset.token=code;
-  $("#resetNewPassword").value="";
-  $("#resetConfirmPassword").value="";
-  closeModal("resetOtpModal");
-  openModal("resetNewPasswordModal");
-});
-
-$("#resetNewPasswordForm").addEventListener("submit",async e=>{
-  e.preventDefault();
-  const next=$("#resetNewPassword").value;
-  const confirm=$("#resetConfirmPassword").value;
-  if(next.length<8){showToast("كلمة المرور الجديدة يجب أن تكون 8 أحرف على الأقل");return}
-  if(next!==confirm){showToast("تأكيد كلمة المرور غير مطابق");return}
-  const btn=e.submitter;btn.disabled=true;
-  try{
-    await rawApi("password_reset_complete",{method:"POST",body:{
-      email:state.passwordReset.email,
-      token:state.passwordReset.token,
-      new_password:next
-    }});
-    state.passwordReset={email:"",token:""};
-    e.target.reset();
-    closeModal("resetNewPasswordModal");
-    setAuthTab("login");
-    openModal("authModal");
-    showToast("تم تغيير كلمة المرور. سجل الدخول بكلمتك الجديدة");
-  }catch(err){
-    showToast(err.message);
-    if(/رمز|code|token/i.test(err.message||"")){
-      closeModal("resetNewPasswordModal");
-      openModal("resetOtpModal");
-    }
-  }finally{btn.disabled=false}
 });
 
 $("#profileForm").addEventListener("submit",async e=>{
