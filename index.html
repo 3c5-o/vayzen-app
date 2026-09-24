@@ -275,7 +275,6 @@
       <label><span>البريد الإلكتروني</span><input type="email" id="loginEmail" autocomplete="email" required></label>
       <label><span>كلمة المرور</span><input type="password" id="loginPassword" autocomplete="current-password" minlength="8" required></label>
       <button class="btn primary wide" type="submit">دخول</button>
-      <button class="btn secondary wide" type="button" id="forgotPasswordBtn">نسيت كلمة المرور؟</button>
     </form>
 
     <form id="registerForm" class="form-stack hidden">
@@ -285,52 +284,6 @@
       <label><span>تأكيد كلمة المرور</span><input type="password" id="registerConfirm" autocomplete="new-password" minlength="8" required></label>
       <button class="btn primary wide" type="submit">إنشاء الحساب</button>
       <p class="fine">باستخدام VAYZEN أنت توافق على شروط الاستخدام وسياسة الخصوصية.</p>
-    </form>
-  </div>
-</div>
-
-<div class="modal" id="signupOtpModal">
-  <div class="sheet compact-sheet">
-    <div class="sheet-header"><div><h3>تأكيد البريد الإلكتروني</h3><p>أدخل رمز التحقق المرسل إلى بريدك لإكمال إنشاء الحساب</p></div><button class="sheet-close inline" data-close="signupOtpModal">×</button></div>
-    <form id="signupOtpForm" class="form-stack">
-      <p class="fine" id="signupOtpEmailLabel"></p>
-      <label><span>رمز التحقق</span><input class="otp-code-input" type="text" id="signupOtpCode" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6,10}" minlength="6" maxlength="10" required></label>
-      <button class="btn primary wide" type="submit">تأكيد الحساب</button>
-      <p class="fine">أدخل الأرقام كما وصلت في رسالة VAYZEN.</p>
-    </form>
-  </div>
-</div>
-
-<div class="modal" id="resetRequestModal">
-  <div class="sheet compact-sheet">
-    <div class="sheet-header"><div><h3>استرجاع كلمة المرور</h3><p>سنرسل رمز تحقق إلى بريد الحساب</p></div><button class="sheet-close inline" data-close="resetRequestModal">×</button></div>
-    <form id="resetRequestForm" class="form-stack">
-      <label><span>البريد الإلكتروني</span><input type="email" id="resetEmail" autocomplete="email" required></label>
-      <button class="btn primary wide" type="submit">إرسال رمز الاسترجاع</button>
-      <p class="fine">لأسباب أمنية لن نكشف ما إذا كان البريد مسجلاً أم لا.</p>
-    </form>
-  </div>
-</div>
-
-<div class="modal" id="resetOtpModal">
-  <div class="sheet compact-sheet">
-    <div class="sheet-header"><div><h3>رمز الاسترجاع</h3><p>أدخل الرمز الذي وصلك عبر البريد</p></div><button class="sheet-close inline" data-close="resetOtpModal">×</button></div>
-    <form id="resetOtpForm" class="form-stack">
-      <p class="fine" id="resetOtpEmailLabel"></p>
-      <label><span>رمز التحقق</span><input class="otp-code-input" type="text" id="resetOtpCode" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6,10}" minlength="6" maxlength="10" required></label>
-      <button class="btn primary wide" type="submit">متابعة</button>
-      <button class="btn secondary wide" type="button" id="resetResendBtn">إعادة إرسال الرمز</button>
-    </form>
-  </div>
-</div>
-
-<div class="modal" id="resetNewPasswordModal">
-  <div class="sheet compact-sheet">
-    <div class="sheet-header"><div><h3>كلمة مرور جديدة</h3><p>اختر كلمة مرور جديدة للحساب</p></div><button class="sheet-close inline" data-close="resetNewPasswordModal">×</button></div>
-    <form id="resetNewPasswordForm" class="form-stack">
-      <label><span>كلمة المرور الجديدة</span><input type="password" id="resetNewPassword" autocomplete="new-password" minlength="8" required></label>
-      <label><span>تأكيد كلمة المرور</span><input type="password" id="resetConfirmPassword" autocomplete="new-password" minlength="8" required></label>
-      <button class="btn primary wide" type="submit">تحديث كلمة المرور</button>
     </form>
   </div>
 </div>
