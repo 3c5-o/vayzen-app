@@ -3765,6 +3765,51 @@ async function authSignup(req:Request){
   return json({ok:true,user:data.user?{id:data.user.id,email:data.user.email}:null,session:data.session?{access_token:data.session.access_token,refresh_token:data.session.refresh_token,expires_at:data.session.expires_at}:null});
 }
 
+
+async function verifySignupOtp(req:Request){
+  const body=await req.json().catch(()=>null);
+  const email=String(body?.email||"").trim();
+  const token=String(body?.token||"").trim();
+  if(!PUBLIC_KEY||!email.includes("@")||!/^[0-9]{6,10}$/.test(token))return json({error:"بيانات التحقق غير صالحة"},400);
+  const client=createClient(SUPABASE_URL,PUBLIC_KEY,{auth:{persistSession:false,autoRefreshToken:false}});
+  const {data,error}=await client.auth.verifyOtp({email,token,type:"signup"});
+  if(error||!data.session||!data.user)return json({error:"رمز التحقق غير صحيح أو منتهي الصلاحية"},400);
+  const {data:profile}=await db.from("profiles").select("is_disabled").eq("id",data.user.id).maybeSingle();
+  if(profile?.is_disabled)return json({error:"هذا الحساب معطّل حاليًا"},403);
+  return json({ok:true,user:{id:data.user.id,email:data.user.email},session:{access_token:data.session.access_token,refresh_token:data.session.refresh_token,expires_at:data.session.expires_at}});
+}
+
+async function requestPasswordReset(req:Request){
+  const body=await req.json().catch(()=>null);
+  const email=String(body?.email||"").trim();
+  if(!PUBLIC_KEY||!email.includes("@"))return json({error:"أدخل بريدًا إلكترونيًا صالحًا"},400);
+  const client=createClient(SUPABASE_URL,PUBLIC_KEY,{auth:{persistSession:false,autoRefreshToken:false}});
+  const {error}=await client.auth.resetPasswordForEmail(email);
+  if(error){
+    const msg=String(error.message||"");
+    if(/rate|limit|too many/i.test(msg))return json({error:"تم طلب رمز مؤخرًا. انتظر قليلًا ثم حاول مرة أخرى"},429);
+    // Do not reveal whether an account exists for this email.
+  }
+  return json({ok:true,message:"إذا كان البريد مرتبطًا بحساب فسيصل رمز الاسترجاع إليه"});
+}
+
+async function completePasswordReset(req:Request){
+  const body=await req.json().catch(()=>null);
+  const email=String(body?.email||"").trim();
+  const token=String(body?.token||"").trim();
+  const next=String(body?.new_password||"");
+  if(!PUBLIC_KEY||!email.includes("@")||!/^[0-9]{6,10}$/.test(token))return json({error:"بيانات الاسترجاع غير صالحة"},400);
+  if(next.length<8)return json({error:"كلمة المرور الجديدة يجب أن تكون 8 أحرف على الأقل"},400);
+
+  const client=createClient(SUPABASE_URL,PUBLIC_KEY,{auth:{persistSession:false,autoRefreshToken:false}});
+  const {data,error}=await client.auth.verifyOtp({email,token,type:"recovery"});
+  if(error||!data.user)return json({error:"رمز الاسترجاع غير صحيح أو منتهي الصلاحية"},400);
+
+  const {error:updateError}=await db.auth.admin.updateUserById(data.user.id,{password:next});
+  if(updateError)return json({error:updateError.message||"تعذر تحديث كلمة المرور"},400);
+  return json({ok:true});
+}
+
 async function authLogin(req:Request){
   const body=await req.json().catch(()=>null);
   const email=String(body?.email||"").trim();
@@ -4079,6 +4124,9 @@ Deno.serve(async(req:Request)=>{
     if(action==="media_variants"&&req.method==="GET") return publicMediaVariants(url);
     if(action==="subtitles"&&req.method==="GET") return publicSubtitles(url);
     if(action==="signup"&&req.method==="POST") return authSignup(req);
+    if(action==="signup_verify"&&req.method==="POST") return verifySignupOtp(req);
+    if(action==="password_reset_request"&&req.method==="POST") return requestPasswordReset(req);
+    if(action==="password_reset_complete"&&req.method==="POST") return completePasswordReset(req);
     if(action==="login"&&req.method==="POST") return authLogin(req);
     if(action==="refresh"&&req.method==="POST") return authRefresh(req);
     if(action==="me"&&req.method==="GET") return me(req);
