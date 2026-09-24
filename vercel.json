@@ -1,0 +1,11 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "rm -rf public && mkdir -p public && cp index.html styles.css app.js public/",
+  "outputDirectory": "public",
+  "rewrites": [
+    {
+      "source": "/api",
+      "destination": "https://aszcgivlsaldcgocljwe.supabase.co/functions/v1/vayzen-gateway"
+    }
+  ]
+}
