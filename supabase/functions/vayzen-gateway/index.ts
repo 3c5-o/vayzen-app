@@ -534,6 +534,12 @@ async function showMenu(chatId:string|number,text="لوحة إدارة VAYZEN",a
   if(a.role==="owner")await ensureBotUiIcons(Number(a.telegram_user_id));
   return send(chatId,`${text}\n\n${roleLabel(a.role)} • ${a.display_name||a.telegram_user_id}`,menuFor(a));
 }
+function cancelMarkup(label="إلغاء"){
+  return {inline_keyboard:[[{text:label,callback_data:"cancel"}]]};
+}
+function cancelablePrompt(chatId:string|number,text:string,label="إلغاء"){
+  return send(chatId,text,cancelMarkup(label));
+}
 
 async function getSession(userId:number){
   const {data}=await db.from("bot_sessions").select("flow,step,draft,updated_at")
@@ -1056,6 +1062,7 @@ async function replaceStoredAsset(opts:{
   if(oldAsset?.channel_id&&oldAsset?.channel_message_id&&!sameTarget){
     await deleteCopiedMessage({channel_id:oldAsset.channel_id,message_id:oldAsset.channel_message_id});
   }
+  if(opts.kind==="video"&&(opts.entityType==="movie"||opts.entityType==="episode"))await syncVideoQualityLabel(opts.entityType,opts.entityId);
   await adminLog(opts.adminId,"asset_replace",opts.entityType,opts.entityId,opts.publicId,{kind:opts.kind,variant});
 }
 
@@ -1099,6 +1106,7 @@ async function sendSeasonEpisodes(chatId:number,seriesPublicId:string,seasonNumb
   if(error)throw error;
   const rows:any[]=(eps??[]).map((ep:any)=>[{text:`${ep.status==="published"?"●":"○"} الحلقة ${ep.episode_number} • ${String(ep.title||"").slice(0,22)}`,callback_data:`epi|${ep.public_id}`}]);
   const nextStatus=season.status==="published"?"hidden":"published";
+  rows.push([{text:"رفع / إضافة جودات للموسم",callback_data:`batch_season|${series.public_id}|${seasonNumber}`}]);
   rows.push([{text:"إضافة حلقة",callback_data:`ae_season|${series.public_id}|${seasonNumber}`}]);
   rows.push([{text:nextStatus==="published"?"نشر الموسم":"إخفاء الموسم",callback_data:`ss|${series.public_id}|${seasonNumber}|${nextStatus}`},{text:"تعديل اسم الموسم",callback_data:`sedit|${series.public_id}|${seasonNumber}`}]);
   rows.push([{text:"حذف الموسم",callback_data:`sd1|${series.public_id}|${seasonNumber}`}]);
@@ -1189,6 +1197,7 @@ async function deleteQuality(adminId:number,type:string,publicId:string,variant:
   if(old)await deleteCopiedMessage({channel_id:old.channel_id,message_id:old.channel_message_id});
   const {error}=await db.from("media_assets").delete().eq("entity_type",target.entityType).eq("entity_id",target.item.id).eq("kind","video").eq("variant",v);
   if(error)throw error;
+  await syncVideoQualityLabel(target.entityType,target.item.id);
   await adminLog(adminId,"quality_delete",target.entityType,target.item.id,publicId,{variant:v});
 }
 
@@ -1457,27 +1466,84 @@ async function sendBatchSeriesPicker(chatId:number){
   return send(chatId,(data??[]).length?"إضافة حلقات جماعية\n\nاختر المسلسل:":"لا توجد مسلسلات منشورة بعد.",{inline_keyboard:rows});
 }
 
-async function sendBatchSeasonPicker(chatId:number,seriesPublicId:string){
-  const series:any=await contentByPublicId("series",seriesPublicId);if(!series)return sendBatchSeriesPicker(chatId);
-  const {data:seasons}=await db.from("seasons").select("season_number,title,status").eq("series_id",series.id).order("season_number",{ascending:true});
-  const rows:any[]=(seasons??[]).map((x:any)=>[{text:`الموسم ${x.season_number}`,callback_data:`batch_season|${series.public_id}|${x.season_number}`}]);
-  rows.push([{text:"موسم جديد",callback_data:`batch_newseason|${series.public_id}`}]);
-  rows.push([{text:"رجوع",callback_data:"batch_episode"}]);
-  return send(chatId,`${series.title}\n\nاختر الموسم:`,{inline_keyboard:rows});
+async function seasonEpisodeCatalog(seriesPublicId:string,seasonNumber:number){
+  const series:any=await contentByPublicId("series",seriesPublicId);if(!series)return null;
+  const {data:season}=await db.from("seasons").select("id,season_number,title,status").eq("series_id",series.id).eq("season_number",seasonNumber).maybeSingle();
+  if(!season)return {series,season:null,episodes:[]};
+  const {data:episodes}=await db.from("episodes").select("id,public_id,episode_number,title,status").eq("season_id",season.id).order("episode_number",{ascending:true});
+  const ids=(episodes??[]).map((x:any)=>x.id);
+  const {data:assets}=ids.length
+    ?await db.from("media_assets").select("entity_id,variant").eq("entity_type","episode").eq("kind","video").in("entity_id",ids)
+    :{data:[] as any[]};
+  const q=new Map<string,string[]>();
+  for(const a of assets??[]){
+    const list=q.get(String(a.entity_id))||[];list.push(normalizeVariant(a.variant));q.set(String(a.entity_id),list);
+  }
+  return {series,season,episodes:(episodes??[]).map((ep:any)=>({...ep,variants:(q.get(String(ep.id))||[]).sort((a,b)=>qualityRank(b)-qualityRank(a))}))};
+}
+function seasonQualityGuide(catalog:any){
+  const eps:any[]=catalog?.episodes||[];
+  const lines=eps.slice(0,30).map((ep:any)=>{
+    const variants=(ep.variants||[]).map((v:string)=>variantLabel(v)).join(" / ")||"بدون فيديو";
+    return `E${String(ep.episode_number).padStart(2,"0")} • ${String(ep.title||`الحلقة ${ep.episode_number}`).slice(0,34)} • ${variants}`;
+  });
+  return `${catalog.series.title}\n${catalog.season?.title||`الموسم ${catalog.season?.season_number||""}`}\n\nالحلقات المستوردة من TMDb/النظام:\n${lines.join("\n")||"لا توجد حلقات بعد."}${eps.length>30?"\n…":""}\n\nأرسل ملفات الفيديو. الأفضل تسمية الملف أو الـCaption مثل:\nS01E01 1080p\nE01 | 720p\nE01 | 480p\n\nيمكن إرسال أكثر من جودة لنفس الحلقة، والجودة الموجودة مسبقًا لن تُستبدل تلقائيًا.`;
+}
+async function startBatchExistingSeason(userId:number,chatId:number,seriesPublicId:string,seasonNumber:number){
+  const catalog:any=await seasonEpisodeCatalog(seriesPublicId,seasonNumber);
+  if(!catalog?.series)return sendBatchSeriesPicker(chatId);
+  if(!catalog?.season||!catalog.episodes.length){
+    await setSession(userId,"batch_episode","start",{series_public_id:seriesPublicId,series_title:catalog.series.title,season_number:seasonNumber,items:[]});
+    return cancelablePrompt(chatId,`الموسم ${seasonNumber} لا يحتوي حلقات مستوردة بعد.\nأرسل رقم أول حلقة، مثال: 1`);
+  }
+  const episodeTitles:Record<string,string>={};
+  for(const ep of catalog.episodes)episodeTitles[String(ep.episode_number)]=String(ep.title||`الحلقة ${ep.episode_number}`);
+  const first=Math.max(1,Number(catalog.episodes[0]?.episode_number||1));
+  await setSession(userId,"batch_episode","receiving",{
+    series_public_id:seriesPublicId,series_title:catalog.series.title,season_number:seasonNumber,
+    items:[],next_episode:first,episode_titles:episodeTitles,quality_link_mode:true
+  });
+  return send(chatId,seasonQualityGuide(catalog),{inline_keyboard:[
+    [{text:"إنهاء ومراجعة",callback_data:"batch_finish"}],
+    [{text:"إلغاء",callback_data:"cancel"}]
+  ]});
 }
 
-function parseBatchEpisodeCaption(value:string,nextEpisode:number){
+async function sendBatchSeasonPicker(chatId:number,seriesPublicId:string){
+  const series:any=await contentByPublicId("series",seriesPublicId);if(!series)return sendBatchSeriesPicker(chatId);
+  const {data:seasons}=await db.from("seasons").select("id,season_number,title,status").eq("series_id",series.id).order("season_number",{ascending:true});
+  const rows:any[]=[];
+  for(const x of seasons??[]){
+    const {count}=await db.from("episodes").select("id",{head:true,count:"exact"}).eq("season_id",x.id);
+    rows.push([{text:`الموسم ${x.season_number} • ${count||0} حلقة`,callback_data:`batch_season|${series.public_id}|${x.season_number}`}]);
+  }
+  rows.push([{text:"موسم جديد",callback_data:`batch_newseason|${series.public_id}`}]);
+  rows.push([{text:"رجوع",callback_data:"batch_episode"}]);
+  return send(chatId,`${series.title}\n\nاختر الموسم لرفع الحلقات والجودات:`,{inline_keyboard:rows});
+}
+
+function parseBatchEpisodeCaption(value:string,nextEpisode:number,fileName=""){
   const parts=value.split("|").map(x=>x.trim()).filter(Boolean);
   let episode=nextEpisode,title="",variant="default",explicitEpisode=false;
   if(parts.length){
     const m=parts[0].match(/^(?:e|ep|حلقة)?\s*(\d{1,4})$/i);
     if(m){episode=Number(m[1]);explicitEpisode=true;parts.shift();}
   }
+  const hint=`${value} ${fileName}`;
+  if(!explicitEpisode){
+    const em=hint.match(/(?:^|[^a-z0-9])s\d{1,2}[ ._-]*e(\d{1,4})(?:[^0-9]|$)/i)
+      ||hint.match(/(?:^|[^a-z0-9])(?:e|ep|episode)[ ._-]?(\d{1,4})(?:[^0-9]|$)/i);
+    if(em){episode=Number(em[1]);explicitEpisode=true;}
+  }
   for(const p of parts){
     const compact=p.toLowerCase().replace(/\s+/g,"");
     if(/^(?:\d{3,4}p|4k|default)$/.test(compact))variant=normalizeVariant(compact);
     else if(!title)title=p.slice(0,180);
     else title=(title+" | "+p).slice(0,180);
+  }
+  if(variant==="default"){
+    const qm=hint.match(/(?:^|[^0-9])(360p|480p|540p|720p|1080p|1440p|2160p|4k)(?:[^0-9]|$)/i);
+    if(qm)variant=normalizeVariant(qm[1]);
   }
   return {episode_number:episode,title:title||`الحلقة ${episode}`,variant,explicitEpisode};
 }
@@ -1486,18 +1552,22 @@ function batchEpisodeSummary(d:any){
   const items:any[]=Array.isArray(d.items)?d.items:[];
   const grouped=new Map<number,any[]>();
   for(const x of items){const n=Number(x.episode_number);if(!grouped.has(n))grouped.set(n,[]);grouped.get(n)!.push(x);}
-  const lines=[...grouped.entries()].sort((a,b)=>a[0]-b[0]).map(([n,arr])=>`E${String(n).padStart(2,"0")}: ${arr.map(x=>variantLabel(x.variant)).join(" / ")}`);
+  const titleMap:any=d.episode_titles||{};
+  const lines=[...grouped.entries()].sort((a,b)=>a[0]-b[0]).map(([n,arr])=>{
+    const title=String(titleMap[String(n)]||titleMap[n]||"").trim();
+    return `E${String(n).padStart(2,"0")}${title?" • "+title:""}: ${arr.map(x=>variantLabel(x.variant)).join(" / ")}`;
+  });
   return `معاينة الرفع الجماعي\n\n${d.series_title||d.series_public_id}\nالموسم: ${d.season_number}\nالحلقات: ${grouped.size}\nملفات الفيديو: ${items.length}\n\n${lines.slice(0,30).join("\n")}${lines.length>30?"\n…":""}`;
 }
 
-async function episodeHasVideo(seriesPublicId:string,seasonNumber:number,episodeNumber:number){
-  const series:any=await contentByPublicId("series",seriesPublicId);if(!series)return false;
+async function episodeVideoVariantState(seriesPublicId:string,seasonNumber:number,episodeNumber:number){
+  const series:any=await contentByPublicId("series",seriesPublicId);if(!series)return {episode:null,variants:new Set<string>()};
   const {data:season}=await db.from("seasons").select("id").eq("series_id",series.id).eq("season_number",seasonNumber).maybeSingle();
-  if(!season)return false;
-  const {data:ep}=await db.from("episodes").select("id").eq("season_id",season.id).eq("episode_number",episodeNumber).maybeSingle();
-  if(!ep)return false;
-  const {count}=await db.from("media_assets").select("id",{head:true,count:"exact"}).eq("entity_type","episode").eq("entity_id",ep.id).eq("kind","video");
-  return Number(count||0)>0;
+  if(!season)return {episode:null,variants:new Set<string>()};
+  const {data:ep}=await db.from("episodes").select("id,public_id,title,status").eq("season_id",season.id).eq("episode_number",episodeNumber).maybeSingle();
+  if(!ep)return {episode:null,variants:new Set<string>()};
+  const {data:assets}=await db.from("media_assets").select("variant").eq("entity_type","episode").eq("entity_id",ep.id).eq("kind","video");
+  return {episode:ep,variants:new Set<string>((assets??[]).map((x:any)=>normalizeVariant(x.variant)))};
 }
 
 async function publishBatchEpisodes(userId:number,chatId:number,d:any){
@@ -1509,22 +1579,28 @@ async function publishBatchEpisodes(userId:number,chatId:number,d:any){
     const previous=results.find((x:any)=>Number(x.episode)===episodeNumber);
     if(previous?.ok&&!(previous.failedVariants?.length))continue;
     for(let i=results.length-1;i>=0;i--)if(Number(results[i]?.episode)===episodeNumber)results.splice(i,1);
-    const hasVideo=await episodeHasVideo(d.series_public_id,Number(d.season_number),episodeNumber);
-    const isResume=Boolean(d.batch_retry||previous);
-    if(hasVideo&&!isResume){
-      results.push({episode:episodeNumber,ok:false,error:"الحلقة تحتوي فيديو مسبقًا"});continue;
-    }
+
+    const current=await episodeVideoVariantState(d.series_public_id,Number(d.season_number),episodeNumber);
     const sorted=[...files].sort((a,b)=>qualityRank(String(b.variant))-qualityRank(String(a.variant)));
-    const first=sorted[0];
+    const pending=sorted.filter((x:any)=>!current.variants.has(normalizeVariant(x.variant)));
+    const skippedVariants=sorted.filter((x:any)=>current.variants.has(normalizeVariant(x.variant))).map((x:any)=>variantLabel(x.variant));
+
+    if(!pending.length){
+      results.push({episode:episodeNumber,ok:true,public_id:current.episode?.public_id||null,failedVariants:[],skippedVariants});
+      continue;
+    }
+
+    const first=pending[0];
     try{
+      const mappedTitle=String((d.episode_titles||{})[String(episodeNumber)]||(d.episode_titles||{})[episodeNumber]||"").trim();
       const epPublicId=await publishEpisode(userId,chatId,{
         series_public_id:d.series_public_id,season_number:Number(d.season_number),episode_number:episodeNumber,
-        title:first.title||`الحلقة ${episodeNumber}`,description:"",quality:variantLabel(first.variant),variant:first.variant,
+        title:mappedTitle||first.title||`الحلقة ${episodeNumber}`,description:"",quality:variantLabel(first.variant),variant:first.variant,
         video:first.file,video_source_message_id:first.source_message_id
       });
       const ep:any=await episodeByPublicId(epPublicId);
       const failedVariants:string[]=[];
-      for(const extra of sorted.slice(1)){
+      for(const extra of pending.slice(1)){
         try{
           await replaceStoredAsset({
             adminId:userId,chatId,entityType:"episode",entityId:ep.id,publicId:ep.public_id,kind:"video",channelKey:"series_storage",
@@ -1533,8 +1609,9 @@ async function publishBatchEpisodes(userId:number,chatId:number,d:any){
           });
         }catch{failedVariants.push(variantLabel(extra.variant));}
       }
-      results.push({episode:episodeNumber,ok:true,public_id:epPublicId,failedVariants});
-    }catch(err){results.push({episode:episodeNumber,ok:false,error:adminErrorText(err)});}
+      await syncVideoQualityLabel("episode",ep.id);
+      results.push({episode:episodeNumber,ok:true,public_id:epPublicId,failedVariants,skippedVariants});
+    }catch(err){results.push({episode:episodeNumber,ok:false,error:adminErrorText(err),skippedVariants});}
     d.batch_results=results;
     d.batch_retry=true;
     d.batch_last_episode=episodeNumber;
@@ -2362,7 +2439,7 @@ async function callback(q:any){
   if(a==="tmdb_token_set"){
     if(admin.role!=="owner")return send(chatId,"إعدادات TMDb متاحة للمالك فقط.");
     await setSession(userId,"tmdb_settings","token",{});
-    return send(chatId,"أرسل API Read Access Token الخاص بـTMDb.\n\nسأختبره أولًا، ثم يُحفظ مشفّرًا ولن يظهر كاملًا بعد الحفظ.");
+    return cancelablePrompt(chatId,"أرسل API Read Access Token الخاص بـTMDb.\n\nسأختبره أولًا، ثم يُحفظ مشفّرًا ولن يظهر كاملًا بعد الحفظ.");
   }
   if(a==="tmdb_token_test"){
     if(admin.role!=="owner")return send(chatId,"إعدادات TMDb متاحة للمالك فقط.");
@@ -2395,14 +2472,14 @@ async function callback(q:any){
   if(a==="add_movie_manual"){
     if(!can(admin,"content")||!can(admin,"publish")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
     await setSession(userId,"movie","title",{});
-    return send(chatId,"أرسل اسم الفيلم.");
+    return cancelablePrompt(chatId,"أرسل اسم الفيلم.");
   }
   if(a==="add_movie_tmdb"){
     if(!can(admin,"content")||!can(admin,"publish")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
     const status=await tmdbStatus();
     if(!status.configured)return send(chatId,"TMDb غير مربوط حاليًا. استخدم الإدخال اليدوي أو اطلب من الـOwner إضافة Access Token.",{inline_keyboard:[[{text:"إدخال يدوي",callback_data:"add_movie_manual"},{text:"رجوع",callback_data:"menu"}]]});
     await setSession(userId,"tmdb_search","query",{type:"movie"});
-    return send(chatId,"أرسل اسم الفيلم للبحث في TMDb.");
+    return cancelablePrompt(chatId,"أرسل اسم الفيلم للبحث في TMDb.");
   }
   if(a==="add_series"){
     if(!can(admin,"content")||!can(admin,"publish")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
@@ -2415,14 +2492,14 @@ async function callback(q:any){
   if(a==="add_series_manual"){
     if(!can(admin,"content")||!can(admin,"publish")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
     await setSession(userId,"series","title",{});
-    return send(chatId,"أرسل اسم المسلسل.");
+    return cancelablePrompt(chatId,"أرسل اسم المسلسل.");
   }
   if(a==="add_series_tmdb"){
     if(!can(admin,"content")||!can(admin,"publish")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
     const status=await tmdbStatus();
     if(!status.configured)return send(chatId,"TMDb غير مربوط حاليًا. استخدم الإدخال اليدوي أو اطلب من الـOwner إضافة Access Token.",{inline_keyboard:[[{text:"إدخال يدوي",callback_data:"add_series_manual"},{text:"رجوع",callback_data:"menu"}]]});
     await setSession(userId,"tmdb_search","query",{type:"series"});
-    return send(chatId,"أرسل اسم المسلسل للبحث في TMDb.");
+    return cancelablePrompt(chatId,"أرسل اسم المسلسل للبحث في TMDb.");
   }
   if(a.startsWith("tmdb_again|")){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
@@ -2486,16 +2563,14 @@ async function callback(q:any){
   if(a.startsWith("batch_season|")){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
     const [,id,n]=a.split("|");
-    const series:any=await contentByPublicId("series",id);if(!series)return sendBatchSeriesPicker(chatId);
-    await setSession(userId,"batch_episode","start",{series_public_id:id,series_title:series.title,season_number:Number(n),items:[]});
-    return send(chatId,`الموسم ${n}\nأرسل رقم أول حلقة، مثال: 1`);
+    return startBatchExistingSeason(userId,chatId,id,Number(n));
   }
   if(a.startsWith("batch_newseason|")){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
     const [,id]=a.split("|");
     const series:any=await contentByPublicId("series",id);if(!series)return sendBatchSeriesPicker(chatId);
     await setSession(userId,"batch_episode","season",{series_public_id:id,series_title:series.title,items:[]});
-    return send(chatId,"أرسل رقم الموسم الجديد.");
+    return cancelablePrompt(chatId,"أرسل رقم الموسم الجديد.");
   }
   if(a==="batch_finish"){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
@@ -2532,6 +2607,7 @@ async function callback(q:any){
       const results=await publishBatchEpisodes(userId,chatId,draft);
       const ok=results.filter((x:any)=>x.ok).length,failed=results.length-ok;
       const partial=results.filter((x:any)=>x.ok&&x.failedVariants?.length);
+      const skipped=results.reduce((n:number,x:any)=>n+(Array.isArray(x.skippedVariants)?x.skippedVariants.length:0),0);
       const failures=results.filter((x:any)=>!x.ok).map((x:any)=>`E${x.episode}: ${x.error}`).slice(0,12).join("\n");
       const partialText=partial.map((x:any)=>`E${x.episode}: فشل ${x.failedVariants.join(" / ")}`).slice(0,8).join("\n");
       const needsRetry=failed>0||partial.length>0;
@@ -2543,7 +2619,7 @@ async function callback(q:any){
       const buttons=needsRetry
         ?[[{text:"إعادة محاولة الفاشل",callback_data:"confirm_batch_episode"}],[{text:"فتح المسلسل",callback_data:`se|${draft.series_public_id}`},{text:"القائمة",callback_data:"menu"}]]
         :[[{text:"فتح المسلسل",callback_data:`se|${draft.series_public_id}`},{text:"القائمة",callback_data:"menu"}]];
-      return send(chatId,`${needsRetry?"اكتمل النشر جزئيًا.":"اكتمل النشر الجماعي."}\n\nنجح: ${ok}\nفشل: ${failed}${partial.length?`\nجودات جزئية: ${partial.length}`:""}${failures?`\n\nالفشل:\n${failures}`:""}${partialText?`\n\nجودات تحتاج إعادة محاولة:\n${partialText}`:""}`,{inline_keyboard:buttons});
+      return send(chatId,`${needsRetry?"اكتمل النشر جزئيًا.":"اكتمل النشر الجماعي."}\n\nنجح: ${ok}\nفشل: ${failed}${skipped?`\nجودات موجودة مسبقًا تم تجاوزها: ${skipped}`:""}${partial.length?`\nجودات جزئية: ${partial.length}`:""}${failures?`\n\nالفشل:\n${failures}`:""}${partialText?`\n\nجودات تحتاج إعادة محاولة:\n${partialText}`:""}`,{inline_keyboard:buttons});
     }catch(err){
       await setSession(userId,"batch_episode","confirm",{...(session.draft||{}),batch_retry:true});
       return send(chatId,`فشل النشر الجماعي.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"استئناف المحاولة",callback_data:"confirm_batch_episode"},{text:"إلغاء",callback_data:"cancel"}]]});
@@ -2565,20 +2641,20 @@ async function callback(q:any){
     const [,id,n]=a.split("|");
     const seasonNumber=Number(n);
     await setSession(userId,"episode","episode",{series_public_id:id,season_number:seasonNumber});
-    return send(chatId,`الموسم ${seasonNumber}\nأرسل رقم الحلقة.`);
+    return cancelablePrompt(chatId,`الموسم ${seasonNumber}\nأرسل رقم الحلقة.`);
   }
   if(a.startsWith("ae_newseason|")){
     if(!can(admin,"content")) return send(chatId,"لا تملك صلاحية إضافة المحتوى.");
     const [,id]=a.split("|");
     await setSession(userId,"episode","season",{series_public_id:id});
-    return send(chatId,"أرسل رقم الموسم الجديد.");
+    return cancelablePrompt(chatId,"أرسل رقم الموسم الجديد.");
   }
   if(a==="movie_add_quality"){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
     const session=await getSession(userId);
     if(!session||session.flow!=="movie"||session.step!=="video_review")return showMenu(chatId,"انتهت جلسة الفيلم.");
     await setSession(userId,"movie","quality_extra",session.draft);
-    return send(chatId,"أرسل اسم الجودة الإضافية، مثال: 480p أو 720p أو 1080p أو 4K.");
+    return cancelablePrompt(chatId,"أرسل اسم الجودة الإضافية، مثال: 480p أو 720p أو 1080p أو 4K.");
   }
   if(a==="confirm_movie"){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
@@ -2616,8 +2692,8 @@ async function callback(q:any){
       const result=await tmdbImportSeriesStructure(userId,id,Number(draft.external_id));
       await clearSession(userId);
       const failed=(result.failed_seasons||[]).length?`\nمواسم تعذر جلبها: ${result.failed_seasons.join("، ")}`:"";
-      await send(chatId,`تم استيراد المسلسل بنجاح.\nSeries ID: ${id}\n\nالمواسم الجديدة: ${result.seasons_added}\nالمواسم المحدثة: ${result.seasons_updated}\nالحلقات الجديدة: ${result.episodes_added}\nالحلقات المحدثة: ${result.episodes_updated}${failed}\n\nالحلقات المستوردة تبقى Draft إلى أن تربط الفيديو.`);
-      return sendSeriesEpisodes(chatId,id);
+      await send(chatId,`تم استيراد المسلسل بنجاح.\nSeries ID: ${id}\n\nالمواسم الجديدة: ${result.seasons_added}\nالمواسم المحدثة: ${result.seasons_updated}\nالحلقات الجديدة: ${result.episodes_added}\nالحلقات المحدثة: ${result.episodes_updated}${failed}\n\nتم جلب أسماء الحلقات ومعلوماتها من TMDb. الآن اختر الموسم واربط ملفات الجودات بالحلقات.`);
+      return sendBatchSeasonPicker(chatId,id);
     }catch(err){
       await clearSession(userId);
       if(id)return send(chatId,`تم نشر المسلسل، لكن تعذر إكمال استيراد المواسم.\nSeries ID: ${id}\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"فتح إدارة المسلسل",callback_data:`cm|series|${id}`},{text:"القائمة",callback_data:"menu"}]]});
@@ -2711,13 +2787,13 @@ async function callback(q:any){
   if(a==="content_search"){
     if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
     await setSession(userId,"search_content","query",{});
-    return send(chatId,"أرسل اسم الفيلم أو المسلسل أو الـ ID.");
+    return cancelablePrompt(chatId,"أرسل اسم الفيلم أو المسلسل أو الـ ID.");
   }
   if(a.startsWith("content_search_type|")){
     if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
     const [,type]=a.split("|");
     await setSession(userId,"search_content","query",{type});
-    return send(chatId,type==="movie"?"ابحث باسم الفيلم أو Movie ID.":"ابحث باسم المسلسل أو Series ID.");
+    return cancelablePrompt(chatId,type==="movie"?"ابحث باسم الفيلم أو Movie ID.":"ابحث باسم المسلسل أو Series ID.");
   }
   if(a.startsWith("cm|")){
     if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
@@ -2734,21 +2810,21 @@ async function callback(q:any){
     if(!allowed.includes(field)||(field==="duration_minutes"&&type!=="movie"))return sendContentEditMenu(chatId,type,id);
     await setSession(userId,"edit_content","value",{type,public_id:id,field});
     const labels:any={title:"الاسم",description:"الوصف",release_year:"السنة",genres:"التصنيفات مفصولة بفواصل",language:"اللغة",country:"الدولة",quality:"الجودة",duration_minutes:"المدة بالدقائق"};
-    return send(chatId,`أرسل القيمة الجديدة لـ ${labels[field]||field}.\nاستخدم - لمسح الحقل الاختياري.`);
+    return cancelablePrompt(chatId,`أرسل القيمة الجديدة لـ ${labels[field]||field}.\nاستخدم - لمسح الحقل الاختياري.`,"إلغاء التعديل");
   }
   if(a.startsWith("cp|")){
     if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
     const [,type,id]=a.split("|");
     if(!["movie","series"].includes(type))return sendContentManager(chatId);
     await setSession(userId,"replace_poster","file",{type,public_id:id});
-    return send(chatId,"أرسل البوستر الجديد الآن.");
+    return cancelablePrompt(chatId,"أرسل البوستر الجديد الآن.","إلغاء التعديل");
   }
   if(a.startsWith("cv|")){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
     const [,type,id]=a.split("|");
     if(type!=="movie")return sendContentManager(chatId);
     await setSession(userId,"replace_movie_video","file",{type,public_id:id});
-    return send(chatId,"أرسل فيديو الفيلم الجديد. الحد الأقصى 2GB.");
+    return cancelablePrompt(chatId,"أرسل فيديو الفيلم الجديد. الحد الأقصى 2GB.","إلغاء التعديل");
   }
   if(a.startsWith("se|")){
     if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
@@ -2772,7 +2848,7 @@ async function callback(q:any){
     if(!can(admin,"content"))return send(chatId,"لا تملك صلاحية إدارة المحتوى.");
     const [,id,n]=a.split("|");
     await setSession(userId,"edit_season","title",{series_public_id:id,season_number:Number(n)});
-    return send(chatId,"أرسل الاسم الجديد للموسم.");
+    return cancelablePrompt(chatId,"أرسل الاسم الجديد للموسم.","إلغاء التعديل");
   }
   if(a.startsWith("sd1|")){
     if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
@@ -2804,13 +2880,13 @@ async function callback(q:any){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
     const [,type,id]=a.split("|");
     await setSession(userId,"add_quality","label",{type,public_id:id});
-    return send(chatId,"أرسل اسم الجودة، مثال: 480p أو 720p أو 1080p أو 4K.");
+    return cancelablePrompt(chatId,"أرسل اسم الجودة، مثال: 480p أو 720p أو 1080p أو 4K.");
   }
   if(a.startsWith("qr|")){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
     const [,type,id,variant]=a.split("|");
     await setSession(userId,"replace_quality","file",{type,public_id:id,variant:normalizeVariant(variant)});
-    return send(chatId,`أرسل فيديو ${variantLabel(variant)} الجديد. الحد الأقصى 2GB.`);
+    return cancelablePrompt(chatId,`أرسل فيديو ${variantLabel(variant)} الجديد. الحد الأقصى 2GB.`,"إلغاء التعديل");
   }
   if(a.startsWith("qd1|")){
     if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
@@ -2842,13 +2918,13 @@ async function callback(q:any){
     const [,id,field]=a.split("|");
     if(!["title","description","quality"].includes(field))return sendEpisodeItem(chatId,id);
     await setSession(userId,"edit_episode","value",{public_id:id,field});
-    return send(chatId,`أرسل ${field==="title"?"اسم الحلقة":field==="description"?"وصف الحلقة":"الجودة"} الجديد.`);
+    return cancelablePrompt(chatId,`أرسل ${field==="title"?"اسم الحلقة":field==="description"?"وصف الحلقة":"الجودة"} الجديد.`,"إلغاء التعديل");
   }
   if(a.startsWith("epv|")){
     if(!can(admin,"content")||!can(admin,"publish"))return send(chatId,"لا تملك صلاحية النشر.");
     const [,id]=a.split("|");
     await setSession(userId,"replace_episode_video","file",{public_id:id});
-    return send(chatId,"أرسل فيديو الحلقة الجديد. الحد الأقصى 2GB.");
+    return cancelablePrompt(chatId,"أرسل فيديو الحلقة الجديد. الحد الأقصى 2GB.","إلغاء التعديل");
   }
   if(a.startsWith("epd1|")){
     if(!can(admin,"delete_content"))return send(chatId,"لا تملك صلاحية حذف المحتوى.");
@@ -3318,7 +3394,7 @@ async function message(m:any){
     if(s.step==="season"){
       const n=Number(text);if(!Number.isInteger(n)||n<1||n>999)return send(chatId,"رقم الموسم غير صحيح.");
       d.season_number=n;await setSession(userId,"batch_episode","start",d);
-      return send(chatId,`الموسم ${n}\nأرسل رقم أول حلقة، مثال: 1`);
+      return cancelablePrompt(chatId,`الموسم ${n}\nأرسل رقم أول حلقة، مثال: 1`);
     }
     if(s.step==="start"){
       const n=Number(text);if(!Number.isInteger(n)||n<1||n>9999)return send(chatId,"رقم الحلقة غير صحيح.");
@@ -3331,11 +3407,9 @@ async function message(m:any){
       try{validateVideoFile(file)}catch(err){return send(chatId,adminErrorText(err));}
       const items:any[]=Array.isArray(d.items)?d.items:[];
       if(items.length>=120)return send(chatId,"وصلت إلى 120 ملفًا في هذه الدفعة. اضغط إنهاء ومراجعة ثم ابدأ دفعة جديدة.",{inline_keyboard:[[{text:"إنهاء ومراجعة",callback_data:"batch_finish"}]]});
-      const parsed=parseBatchEpisodeCaption(caption,Number(d.next_episode||1));
-      if(parsed.variant==="default"){
-        const fn=String(file.file_name||"").toLowerCase();const qm=fn.match(/(?:^|[^0-9])(360p|480p|540p|720p|1080p|1440p|2160p|4k)(?:[^0-9]|$)/i);
-        if(qm)parsed.variant=normalizeVariant(qm[1]);
-      }
+      const parsed=parseBatchEpisodeCaption(caption,Number(d.next_episode||1),String(file.file_name||""));
+      const mappedTitle=String((d.episode_titles||{})[String(parsed.episode_number)]||(d.episode_titles||{})[parsed.episode_number]||"").trim();
+      if(mappedTitle&&(!caption||parsed.title===`الحلقة ${parsed.episode_number}`))parsed.title=mappedTitle;
       if(items.some((x:any)=>Number(x.episode_number)===parsed.episode_number&&normalizeVariant(x.variant)===parsed.variant)){
         return send(chatId,`E${parsed.episode_number} بجودة ${variantLabel(parsed.variant)} موجودة داخل الدفعة بالفعل.`);
       }
@@ -3379,7 +3453,7 @@ async function message(m:any){
     if(variant==="default"&&raw!=="default")return send(chatId,"اسم الجودة غير صالح. استخدم مثل 480p أو 720p أو 1080p أو 4K.");
     d.variant=variant;
     await setSession(userId,"add_quality","file",d);
-    return send(chatId,`أرسل فيديو جودة ${variantLabel(variant)}. الحد الأقصى 2GB.`);
+    return cancelablePrompt(chatId,`أرسل فيديو جودة ${variantLabel(variant)}. الحد الأقصى 2GB.`);
   }
   if(s.flow==="add_quality"&&s.step==="file"){
     const target:any=await qualityTarget(String(d.type||""),String(d.public_id||""));
@@ -3498,7 +3572,6 @@ async function message(m:any){
     await clearSession(userId);
     return sendEpisodeItem(chatId,ep.public_id);
   }
-
   if(s.flow==="link_request"&&s.step==="content_id"){
     const code=String(d.request_code||"");
     const id=text.toUpperCase();
@@ -3516,24 +3589,24 @@ async function message(m:any){
   }
 
   if(s.flow==="movie"){
-    if(s.step==="title"){if(!text)return send(chatId,"أرسل الاسم.");d.title=text;await setSession(userId,"movie","original_title",d);return send(chatId,"أرسل الاسم الأصلي، أو - للتخطي.");}
-    if(s.step==="original_title"){d.original_title=text==="-"?"":text;await setSession(userId,"movie","description",d);return send(chatId,"أرسل وصف الفيلم، أو - للتخطي.");}
-    if(s.step==="description"){d.description=text==="-"?"":text;await setSession(userId,"movie","year",d);return send(chatId,"أرسل سنة الإصدار.");}
-    if(s.step==="year"){const y=yearOf(text);if(!y)return send(chatId,"السنة غير صحيحة.");d.release_year=y;await setSession(userId,"movie","genres",d);return send(chatId,"أرسل التصنيفات، مثال: أكشن، خيال علمي.");}
-    if(s.step==="genres"){d.genres=splitGenres(text);await setSession(userId,"movie","language",d);return send(chatId,"أرسل اللغة.");}
-    if(s.step==="language"){d.language=text;await setSession(userId,"movie","country",d);return send(chatId,"أرسل الدولة، أو - للتخطي.");}
-    if(s.step==="country"){d.country=text==="-"?"":text;await setSession(userId,"movie","duration",d);return send(chatId,"أرسل مدة الفيلم بالدقائق، أو - للتخطي.");}
-    if(s.step==="duration"){const n=positiveOrNull(text);if(text!=="-"&&!n)return send(chatId,"أرسل رقمًا صحيحًا أو -.");d.duration_minutes=n;await setSession(userId,"movie","quality",d);return send(chatId,"أرسل الجودة، مثال 1080p.");}
+    if(s.step==="title"){if(!text)return send(chatId,"أرسل الاسم.");d.title=text;await setSession(userId,"movie","original_title",d);return cancelablePrompt(chatId,"أرسل الاسم الأصلي، أو - للتخطي.");}
+    if(s.step==="original_title"){d.original_title=text==="-"?"":text;await setSession(userId,"movie","description",d);return cancelablePrompt(chatId,"أرسل وصف الفيلم، أو - للتخطي.");}
+    if(s.step==="description"){d.description=text==="-"?"":text;await setSession(userId,"movie","year",d);return cancelablePrompt(chatId,"أرسل سنة الإصدار.");}
+    if(s.step==="year"){const y=yearOf(text);if(!y)return send(chatId,"السنة غير صحيحة.");d.release_year=y;await setSession(userId,"movie","genres",d);return cancelablePrompt(chatId,"أرسل التصنيفات، مثال: أكشن، خيال علمي.");}
+    if(s.step==="genres"){d.genres=splitGenres(text);await setSession(userId,"movie","language",d);return cancelablePrompt(chatId,"أرسل اللغة.");}
+    if(s.step==="language"){d.language=text;await setSession(userId,"movie","country",d);return cancelablePrompt(chatId,"أرسل الدولة، أو - للتخطي.");}
+    if(s.step==="country"){d.country=text==="-"?"":text;await setSession(userId,"movie","duration",d);return cancelablePrompt(chatId,"أرسل مدة الفيلم بالدقائق، أو - للتخطي.");}
+    if(s.step==="duration"){const n=positiveOrNull(text);if(text!=="-"&&!n)return send(chatId,"أرسل رقمًا صحيحًا أو -.");d.duration_minutes=n;await setSession(userId,"movie","quality",d);return cancelablePrompt(chatId,"أرسل الجودة، مثال 1080p.");}
     if(s.step==="quality"){
       d.quality=text;
       if(d.poster){await setSession(userId,"movie","video",d);return send(chatId,`أرسل فيديو جودة ${variantLabel(normalizeVariant(text))}. الحد الحالي 2GB.`);}
-      await setSession(userId,"movie","poster",d);return send(chatId,"أرسل بوستر الفيلم.");
+      await setSession(userId,"movie","poster",d);return cancelablePrompt(chatId,"أرسل بوستر الفيلم.");
     }
     if(s.step==="poster"){
       const f=photoFrom(m);if(!f)return send(chatId,"أرسل صورة البوستر.");
       d.poster=f;d.poster_source_message_id=m.message_id;
       if(d.tmdb_imported&&!d.quality){await setSession(userId,"movie","quality",d);return send(chatId,"أرسل جودة أول فيديو، مثال 1080p.");}
-      await setSession(userId,"movie","video",d);return send(chatId,"أرسل فيديو الفيلم. الحد الحالي 2GB.");
+      await setSession(userId,"movie","video",d);return cancelablePrompt(chatId,"أرسل فيديو الفيلم. الحد الحالي 2GB.");
     }
     if(s.step==="video"){
       const f=videoFrom(m);if(!f)return send(chatId,"أرسل ملف فيديو.");
@@ -3562,14 +3635,14 @@ async function message(m:any){
   }
 
   if(s.flow==="series"){
-    if(s.step==="title"){if(!text)return send(chatId,"أرسل الاسم.");d.title=text;await setSession(userId,"series","original_title",d);return send(chatId,"أرسل الاسم الأصلي، أو - للتخطي.");}
-    if(s.step==="original_title"){d.original_title=text==="-"?"":text;await setSession(userId,"series","description",d);return send(chatId,"أرسل وصف المسلسل، أو - للتخطي.");}
-    if(s.step==="description"){d.description=text==="-"?"":text;await setSession(userId,"series","year",d);return send(chatId,"أرسل سنة الإصدار.");}
-    if(s.step==="year"){const y=yearOf(text);if(!y)return send(chatId,"السنة غير صحيحة.");d.release_year=y;await setSession(userId,"series","genres",d);return send(chatId,"أرسل التصنيفات.");}
-    if(s.step==="genres"){d.genres=splitGenres(text);await setSession(userId,"series","language",d);return send(chatId,"أرسل اللغة.");}
-    if(s.step==="language"){d.language=text;await setSession(userId,"series","country",d);return send(chatId,"أرسل الدولة، أو - للتخطي.");}
-    if(s.step==="country"){d.country=text==="-"?"":text;await setSession(userId,"series","quality",d);return send(chatId,"أرسل الجودة.");}
-    if(s.step==="quality"){d.quality=text;await setSession(userId,"series","poster",d);return send(chatId,"أرسل بوستر المسلسل.");}
+    if(s.step==="title"){if(!text)return send(chatId,"أرسل الاسم.");d.title=text;await setSession(userId,"series","original_title",d);return cancelablePrompt(chatId,"أرسل الاسم الأصلي، أو - للتخطي.");}
+    if(s.step==="original_title"){d.original_title=text==="-"?"":text;await setSession(userId,"series","description",d);return cancelablePrompt(chatId,"أرسل وصف المسلسل، أو - للتخطي.");}
+    if(s.step==="description"){d.description=text==="-"?"":text;await setSession(userId,"series","year",d);return cancelablePrompt(chatId,"أرسل سنة الإصدار.");}
+    if(s.step==="year"){const y=yearOf(text);if(!y)return send(chatId,"السنة غير صحيحة.");d.release_year=y;await setSession(userId,"series","genres",d);return cancelablePrompt(chatId,"أرسل التصنيفات.");}
+    if(s.step==="genres"){d.genres=splitGenres(text);await setSession(userId,"series","language",d);return cancelablePrompt(chatId,"أرسل اللغة.");}
+    if(s.step==="language"){d.language=text;await setSession(userId,"series","country",d);return cancelablePrompt(chatId,"أرسل الدولة، أو - للتخطي.");}
+    if(s.step==="country"){d.country=text==="-"?"":text;await setSession(userId,"series","quality",d);return cancelablePrompt(chatId,"أرسل الجودة.");}
+    if(s.step==="quality"){d.quality=text;await setSession(userId,"series","poster",d);return cancelablePrompt(chatId,"أرسل بوستر المسلسل.");}
     if(s.step==="poster"){
       const f=photoFrom(m);if(!f)return send(chatId,"أرسل صورة البوستر.");
       d.poster=f;d.poster_source_message_id=m.message_id;
@@ -3582,12 +3655,12 @@ async function message(m:any){
   }
 
   if(s.flow==="episode"){
-    if(s.step==="series_id"){if(!/^SER-\d{6}$/i.test(text))return send(chatId,"Series ID غير صحيح.");d.series_public_id=text.toUpperCase();await setSession(userId,"episode","season",d);return send(chatId,"أرسل رقم الموسم.");}
-    if(s.step==="season"){const n=Number(text);if(!Number.isInteger(n)||n<1)return send(chatId,"رقم الموسم غير صحيح.");d.season_number=n;await setSession(userId,"episode","episode",d);return send(chatId,"أرسل رقم الحلقة.");}
-    if(s.step==="episode"){const n=Number(text);if(!Number.isInteger(n)||n<1)return send(chatId,"رقم الحلقة غير صحيح.");d.episode_number=n;await setSession(userId,"episode","title",d);return send(chatId,"أرسل اسم الحلقة، أو - للاسم التلقائي.");}
-    if(s.step==="title"){d.title=text==="-"?`الحلقة ${d.episode_number}`:text;await setSession(userId,"episode","description",d);return send(chatId,"أرسل وصف الحلقة، أو - للتخطي.");}
-    if(s.step==="description"){d.description=text==="-"?"":text;await setSession(userId,"episode","quality",d);return send(chatId,"أرسل الجودة.");}
-    if(s.step==="quality"){d.quality=text;await setSession(userId,"episode","video",d);return send(chatId,"أرسل فيديو الحلقة. الحد 2GB.");}
+    if(s.step==="series_id"){if(!/^SER-\d{6}$/i.test(text))return send(chatId,"Series ID غير صحيح.");d.series_public_id=text.toUpperCase();await setSession(userId,"episode","season",d);return cancelablePrompt(chatId,"أرسل رقم الموسم.");}
+    if(s.step==="season"){const n=Number(text);if(!Number.isInteger(n)||n<1)return send(chatId,"رقم الموسم غير صحيح.");d.season_number=n;await setSession(userId,"episode","episode",d);return cancelablePrompt(chatId,"أرسل رقم الحلقة.");}
+    if(s.step==="episode"){const n=Number(text);if(!Number.isInteger(n)||n<1)return send(chatId,"رقم الحلقة غير صحيح.");d.episode_number=n;await setSession(userId,"episode","title",d);return cancelablePrompt(chatId,"أرسل اسم الحلقة، أو - للاسم التلقائي.");}
+    if(s.step==="title"){d.title=text==="-"?`الحلقة ${d.episode_number}`:text;await setSession(userId,"episode","description",d);return cancelablePrompt(chatId,"أرسل وصف الحلقة، أو - للتخطي.");}
+    if(s.step==="description"){d.description=text==="-"?"":text;await setSession(userId,"episode","quality",d);return cancelablePrompt(chatId,"أرسل الجودة.");}
+    if(s.step==="quality"){d.quality=text;await setSession(userId,"episode","video",d);return cancelablePrompt(chatId,"أرسل فيديو الحلقة. الحد 2GB.");}
     if(s.step==="video"){
       const f=videoFrom(m);if(!f)return send(chatId,"أرسل ملف فيديو.");
       try{validateVideoFile(f)}catch(err){return send(chatId,adminErrorText(err));}
@@ -3604,6 +3677,14 @@ function qualityRank(v:string){
   if(x==="4k")return 4000;
   const m=x.match(/^(\d{3,4})p$/);
   return m?Number(m[1]):(x==="default"?1:0);
+}
+async function syncVideoQualityLabel(entityType:"movie"|"episode",entityId:string){
+  const {data}=await db.from("media_assets").select("variant").eq("entity_type",entityType).eq("entity_id",entityId).eq("kind","video");
+  const variants=(data??[]).map((x:any)=>normalizeVariant(x.variant)).sort((a:string,b:string)=>qualityRank(b)-qualityRank(a));
+  const label=variants.length?variantLabel(variants[0]):"";
+  const table=entityType==="movie"?"movies":"episodes";
+  await db.from(table).update({quality:label,updated_at:new Date().toISOString()}).eq("id",entityId);
+  return variants;
 }
 async function asset(type:string,id:string,variant="default"){
   if(!/^[0-9a-f-]{36}$/i.test(id)) return null;
@@ -3860,7 +3941,23 @@ async function seriesContent(url:URL){
   for(const season of seasons??[]){
     const {data:episodes,error:e}=await db.from("episodes").select("id,public_id,episode_number,title,description,duration_minutes,quality,rating,rating_count").eq("season_id",season.id).eq("status","published").order("episode_number",{ascending:true});
     if(e)throw e;
-    out.push({...season,episodes:episodes??[]});
+    const eps:any[]=episodes??[];
+    const ids=eps.map((x:any)=>x.id);
+    const {data:assets,error:assetError}=ids.length
+      ?await db.from("media_assets").select("entity_id,variant,file_size").eq("entity_type","episode").eq("kind","video").in("entity_id",ids)
+      :{data:[] as any[],error:null};
+    if(assetError)throw assetError;
+    const qmap=new Map<string,any[]>();
+    for(const a of assets??[]){
+      const list=qmap.get(String(a.entity_id))||[];
+      list.push({variant:normalizeVariant(a.variant),label:variantLabel(a.variant),file_size:Number(a.file_size||0)});
+      qmap.set(String(a.entity_id),list);
+    }
+    const enriched=eps.map((ep:any)=>({
+      ...ep,
+      qualities:(qmap.get(String(ep.id))||[]).sort((a:any,b:any)=>qualityRank(b.variant)-qualityRank(a.variant))
+    }));
+    out.push({...season,episodes:enriched});
   }
   return json({ok:true,seasons:out});
 }
