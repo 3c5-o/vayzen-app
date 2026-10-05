@@ -232,7 +232,7 @@ async function canonicalMap(table:"movies"|"series",keys:string[]){
   for(let i=0;i<unique.length;i+=80){
     const part=unique.slice(i,i+80);
     const {data,error}=await db.from(table)
-      .select("id,public_id,identity_key,title,release_year,status,external_source,external_id")
+      .select("id,public_id,identity_key,title,release_year,status,external_source,external_id,ingestion_status")
       .in("identity_key",part);
     if(error)throw error;
     for(const row of data??[])if(row.identity_key&&!map.has(row.identity_key))map.set(row.identity_key,row);
@@ -292,8 +292,9 @@ async function syncXtreamRefsAndSources(args:{
   items:Record<string,unknown>[];
   categories:Map<string,string>;
   autoPublish:boolean;
+  parentCatalogJobId?:string|null;
 }){
-  const {account,entityType,items,categories,autoPublish}=args;
+  const {account,entityType,items,categories,autoPublish,parentCatalogJobId=null}=args;
   const prepared=items.map(raw=>{
     const rawName=String(raw.name??raw.title??"").trim();
     const title=normalizeCatalogTitle(rawName)||rawName||"بدون اسم";
@@ -366,6 +367,30 @@ async function syncXtreamRefsAndSources(args:{
     if(error)throw error;
   }
 
+  let seriesJobsQueued=0;
+  if(entityType==="series"){
+    for(const item of prepared){
+      const entity=canonical.get(item.key);
+      const ref=existingRefs.get(item.externalId);
+      if(!entity||!ref?.id)continue;
+      const queued=await queueSeriesIngestJob({
+        seriesId:String(entity.id),
+        accountId:String(account.id),
+        providerRefId:String(ref.id),
+        externalSeriesId:item.externalId,
+        parentCatalogJobId:parentCatalogJobId||null,
+        priority:createdKeys.has(item.key)?80:50,
+      });
+      if(queued)seriesJobsQueued++;
+      if(createdKeys.has(item.key)){
+        const {error:stateError}=await db.from("series").update({
+          status:"draft",ingestion_status:"queued",last_ingestion_error:{},updated_at:now
+        }).eq("id",entity.id);
+        if(stateError)throw stateError;
+      }
+    }
+  }
+
   if(entityType==="movie"){
     const existingSources=new Map<string,any>();
     for(let i=0;i<externalIds.length;i+=80){
@@ -415,9 +440,94 @@ async function syncXtreamRefsAndSources(args:{
     const key=[...canonical.entries()].find(([,v]:any)=>String(v.id)===String(x.id))?.[0];
     return key?createdKeys.has(String(key)):false;
   });
-  return {processed:prepared.length,createdItems,mergedItems,sourceLinks,entities,createdEntities};
+  return {processed:prepared.length,createdItems,mergedItems,sourceLinks,entities,createdEntities,seriesJobsQueued};
 }
 
+
+async function queueSeriesIngestJob(args:{
+  seriesId:string;accountId:string;providerRefId:string;externalSeriesId:string;
+  parentCatalogJobId?:string|null;priority?:number;
+}){
+  const {data:active,error:activeError}=await db.from("series_ingest_jobs")
+    .select("id,status").eq("series_id",args.seriesId)
+    .in("status",["queued","running"]).limit(1).maybeSingle();
+  if(activeError)throw activeError;
+  if(active)return false;
+
+  const {data:recent}=await db.from("series_ingest_jobs")
+    .select("id,status,completed_at").eq("series_id",args.seriesId)
+    .eq("provider_account_id",args.accountId)
+    .order("created_at",{ascending:false}).limit(1).maybeSingle();
+  if(recent?.status==="completed"){
+    const {data:seriesRow}=await db.from("series")
+      .select("ingestion_status,playable_episodes").eq("id",args.seriesId).maybeSingle();
+    if(seriesRow?.ingestion_status==="ready"&&Number(seriesRow.playable_episodes||0)>0)return false;
+  }
+
+  const settings=await pipelineSettingsValue();
+  const {error}=await db.from("series_ingest_jobs").insert({
+    series_id:args.seriesId,
+    provider_account_id:args.accountId,
+    provider_ref_id:args.providerRefId,
+    external_series_id:args.externalSeriesId,
+    parent_catalog_job_id:args.parentCatalogJobId||null,
+    status:"queued",
+    priority:Number(args.priority||50),
+    max_attempts:settings.series_ingest_max_attempts,
+    next_attempt_at:new Date().toISOString(),
+    last_error:null,
+    last_error_detail:{}
+  });
+  if(error){
+    if(String((error as any)?.code||"")==="23505")return false;
+    throw error;
+  }
+  return true;
+}
+
+async function enqueueSeriesRepairBacklog(limit=250){
+  const max=Math.max(1,Math.min(2000,Number(limit||250)));
+  const {data:rows,error}=await db.from("series")
+    .select("id,status,ingestion_status")
+    .in("status",["published","draft"])
+    .order("updated_at",{ascending:true})
+    .limit(max);
+  if(error)throw error;
+  let queued=0;
+  for(const row of rows??[]){
+    const {data:refs,error:refsError}=await db.from("content_provider_refs")
+      .select("id,provider_account_id,external_id")
+      .eq("provider_type","xtream").eq("entity_type","series").eq("entity_id",row.id).eq("is_active",true)
+      .order("last_seen_at",{ascending:false}).limit(1);
+    if(refsError)throw refsError;
+    const ref:any=(refs??[])[0];
+    if(!ref)continue;
+    const {count:playable}=await db.from("playback_sources")
+      .select("id",{count:"exact",head:true})
+      .eq("entity_type","episode").eq("source_type","xtream").eq("is_active",true)
+      .in("entity_id",await seriesEpisodeIds(String(row.id)));
+    if(Number(playable||0)>0&&row.ingestion_status==="ready")continue;
+    const did=await queueSeriesIngestJob({
+      seriesId:String(row.id),accountId:String(ref.provider_account_id),
+      providerRefId:String(ref.id),externalSeriesId:String(ref.external_id),priority:70
+    });
+    if(did){
+      queued++;
+      await db.from("series").update({ingestion_status:"queued",updated_at:new Date().toISOString()}).eq("id",row.id);
+    }
+  }
+  return queued;
+}
+
+async function seriesEpisodeIds(seriesId:string){
+  const {data:seasons,error}=await db.from("seasons").select("id").eq("series_id",seriesId);
+  if(error)throw error;
+  const seasonIds=(seasons??[]).map((x:any)=>String(x.id));
+  if(!seasonIds.length)return [] as string[];
+  const {data:episodes,error:episodeError}=await db.from("episodes").select("id").in("season_id",seasonIds);
+  if(episodeError)throw episodeError;
+  return (episodes??[]).map((x:any)=>String(x.id));
+}
 
 async function pipelineSettingsValue(){
   const {data}=await db.from("app_settings").select("value").eq("key","content_sync_pipeline").maybeSingle();
@@ -556,7 +666,7 @@ async function processXtreamCatalogJob(){
 
   const internalChunk=Math.min(200,remaining);
   try{
-    const result:any=await syncXtreamBatch(String(job.account_id),Number(job.started_by||0),internalChunk);
+    const result:any=await syncXtreamBatch(String(job.account_id),Number(job.started_by||0),internalChunk,String(job.id));
     const processed=Number(result.movies_seen||0)+Number(result.series_seen||0);
     const totals={
       processed_items:Number(job.processed_items||0)+processed,
@@ -745,7 +855,7 @@ async function pipelineWorkerTick(req:Request){
   return json({ok:true,xtream,tmdb,announcements});
 }
 
-async function syncXtreamBatch(accountId:string,startedBy:number,batchOverride?:number){
+async function syncXtreamBatch(accountId:string,startedBy:number,batchOverride?:number,parentCatalogJobId?:string|null){
   const account=await xtreamAccountWithSecret(accountId);
   if(!account.is_enabled)throw new Error("حساب Xtream متوقف.");
   const credentials=await xtreamCredentials(account);
@@ -780,10 +890,10 @@ async function syncXtreamBatch(accountId:string,startedBy:number,batchOverride?:
     const movieBatch=snapshot.movies.slice(movieCursor,movieCursor+movieTake);
     const seriesBatch=snapshot.series.slice(seriesCursor,seriesCursor+seriesTake);
     const movieResult=movieBatch.length
-      ?await syncXtreamRefsAndSources({account,entityType:"movie",items:movieBatch,categories:movieCategories,autoPublish:settings.auto_publish})
+      ?await syncXtreamRefsAndSources({account,entityType:"movie",items:movieBatch,categories:movieCategories,autoPublish:settings.auto_publish,parentCatalogJobId})
       :{processed:0,createdItems:0,mergedItems:0,sourceLinks:0};
     const seriesResult=seriesBatch.length
-      ?await syncXtreamRefsAndSources({account,entityType:"series",items:seriesBatch,categories:seriesCategories,autoPublish:settings.auto_publish})
+      ?await syncXtreamRefsAndSources({account,entityType:"series",items:seriesBatch,categories:seriesCategories,autoPublish:false,parentCatalogJobId})
       :{processed:0,createdItems:0,mergedItems:0,sourceLinks:0};
 
     movieCursor+=movieTake;seriesCursor+=seriesTake;
@@ -812,10 +922,7 @@ async function syncXtreamBatch(accountId:string,startedBy:number,batchOverride?:
         queueTmdbEntities("series",seriesResult.entities||[])
       ]);
     }
-    await Promise.all([
-      queueXtreamAnnouncementChunks(runId,String(account.name||"Xtream"),"movie",movieResult.createdEntities||[]),
-      queueXtreamAnnouncementChunks(runId,String(account.name||"Xtream"),"series",seriesResult.createdEntities||[])
-    ]);
+    await queueXtreamAnnouncementChunks(runId,String(account.name||"Xtream"),"movie",movieResult.createdEntities||[]);
 
     const summary={
       movies_seen:movieResult.processed,series_seen:seriesResult.processed,
@@ -829,7 +936,8 @@ async function syncXtreamBatch(accountId:string,startedBy:number,batchOverride?:
         run_id:runId,
         batch_size:batch,
         tmdb_queued:(movieResult.entities||[]).length+(seriesResult.entities||[]).length,
-        announcements_queued:(movieResult.createdEntities||[]).length+(seriesResult.createdEntities||[]).length
+        announcements_queued:(movieResult.createdEntities||[]).length,
+        series_jobs_queued:Number(seriesResult.seriesJobsQueued||0)
       }
     };
     await db.from("xtream_sync_runs").update({
