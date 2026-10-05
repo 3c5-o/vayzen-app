@@ -4433,6 +4433,13 @@ async function publicSubtitles(url:URL){
     language_code:x.language_code,label:x.label,format:x.source_format,is_default:x.is_default,
     src:`?media=${mediaType}&id=${encodeURIComponent(id)}&quality=${encodeURIComponent(subtitleVariant(x.language_code))}`
   }));
+  if(!tracks.length&&await legacyRecoveredEntity(type as "movie"|"episode",id)){
+    const legacy=await legacyGatewayUrl();
+    if(legacy)return Response.redirect(
+      `${legacy}?action=subtitles&type=${encodeURIComponent(type)}&id=${encodeURIComponent(id)}`,
+      307
+    );
+  }
   return json({ok:true,tracks});
 }
 
@@ -4440,6 +4447,19 @@ function srtToVtt(text:string){
   let body=String(text||"").replace(/^\uFEFF/,"").replace(/\r\n?/g,"\n");
   body=body.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2}),(\d{3})/g,"$1.$2 --> $3.$4");
   return "WEBVTT\n\n"+body;
+}
+
+async function legacyGatewayUrl(){
+  const {data}=await db.from("app_settings").select("value").eq("key","legacy_gateway").maybeSingle();
+  const value:any=data?.value||{};
+  if(value.enabled===false)return "";
+  return String(value.url||"").replace(/\/$/,"");
+}
+
+async function legacyRecoveredEntity(entityType:"movie"|"series"|"episode",id:string){
+  const table=entityType==="movie"?"movies":entityType==="series"?"series":"episodes";
+  const {data}=await db.from(table).select("external_metadata").eq("id",id).maybeSingle();
+  return Boolean((data as any)?.external_metadata?.legacy_recovered);
 }
 
 async function streamSigningSecret(){
@@ -4486,7 +4506,23 @@ async function media(type:string,id:string,req?:Request){
     return Response.redirect(`${gatewayBase}/xtream/${encodeURIComponent(token)}`,307);
   }
 
-  if(!a) return json({error:"not found"},404);
+  if(!a){
+    const legacyTypes=["movie_poster","movie_backdrop","series_poster","series_backdrop","movie_subtitle","episode_subtitle"];
+    if(legacyTypes.includes(type)){
+      const entityType=type.startsWith("movie_")?"movie":type.startsWith("series_")?"series":"episode";
+      if(await legacyRecoveredEntity(entityType as "movie"|"series"|"episode",id)){
+        const legacy=await legacyGatewayUrl();
+        if(legacy){
+          const suffix=(type.endsWith("_subtitle")&&quality)?`&quality=${encodeURIComponent(quality)}`:"";
+          return Response.redirect(
+            `${legacy}?media=${encodeURIComponent(type)}&id=${encodeURIComponent(id)}${suffix}`,
+            307
+          );
+        }
+      }
+    }
+    return json({error:"not found"},404);
+  }
   if(!a.telegram_file_id) return json({error:"telegram file id missing"},409);
   const file=await tg("getFile",{file_id:a.telegram_file_id});
   const upstream=await tgFile(String(file.file_path||""));
