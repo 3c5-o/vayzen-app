@@ -71,6 +71,35 @@ try:
     run("edge_health",lambda:health(EDGE_URL+"?health=1"))
     run("series_full",series)
     run("mkv_audio",mkv)
+
+    def release_helper():
+        url=os.environ.get("HELPER_URL","").strip()
+        nonce=os.environ.get("RELEASE_NONCE","").strip()
+        if not url or not nonce:
+            raise RuntimeError("release helper configuration missing")
+        req=urllib.request.Request(
+            url,
+            data=b"{}",
+            headers={
+                "User-Agent":"VAYZEN-Smoke/1.0",
+                "Content-Type":"application/json",
+                "x-vayzen-release-nonce":nonce,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req,timeout=240) as res:
+            status=int(res.status)
+            data=json.loads(res.read().decode("utf-8"))
+        if not data.get("ok"):
+            raise RuntimeError("release helper returned ok=false")
+        return {
+            "status":status,
+            "completed_at":data.get("completed_at"),
+            "already_completed":bool(data.get("already_completed")),
+            "actions":[x.get("action") for x in (data.get("results") or [])],
+        }
+
+    run("backup_alerts",release_helper)
     RESULT["ok"]=all(v.get("ok") for v in RESULT["checks"].values())
 except Exception as exc:
     RESULT["ok"]=False
