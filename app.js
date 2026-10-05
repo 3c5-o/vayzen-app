@@ -1392,15 +1392,27 @@ $("#globalSearchBtn").onclick=()=>{
   panel.classList.toggle("hidden");
   if(opening){state.searchReturnPage=state.currentPage==="search"?"home":state.currentPage;setTimeout(()=>$("#searchInput").focus(),20)}
 };
+let searchDebounceTimer=0;
 $("#clearSearch").onclick=()=>{
-  $("#searchInput").value="";state.query="";renderCatalog();
+  clearTimeout(searchDebounceTimer);searchRequestSeq++;
+  $("#searchInput").value="";state.query="";
+  state.searchResults=[];state.searchTotal=0;state.searchHasMore=false;state.searchPage=1;
+  renderCatalog();
   if(state.currentPage==="search")go(state.searchReturnPage||"home");
 };
 $("#searchInput").oninput=e=>{
   state.query=e.target.value;
-  renderCatalog();
-  if(state.query.trim()){if(state.currentPage!=="search")go("search")}
-  else if(state.currentPage==="search")go(state.searchReturnPage||"home");
+  clearTimeout(searchDebounceTimer);
+  if(state.query.trim()){
+    if(state.currentPage!=="search")go("search");
+    $("#searchResultsGrid").innerHTML=skeletonCards(6);
+    searchDebounceTimer=setTimeout(()=>runSearch({reset:true}),300);
+  }else{
+    searchRequestSeq++;
+    state.searchResults=[];state.searchTotal=0;state.searchHasMore=false;state.searchPage=1;
+    renderCatalog();
+    if(state.currentPage==="search")go(state.searchReturnPage||"home");
+  }
 };
 $("#editProfileBtn").onclick=()=>openModal("editProfileModal");
 $("#openPasswordBtn").onclick=()=>openModal("changePasswordModal");
@@ -1409,6 +1421,9 @@ $("#openRequestsHistory").onclick=openRequests;
 $("#openReportGeneral").onclick=()=>openReport("other","");
 $("#autoplayNext").onchange=e=>{state.prefs.autoplayNext=e.target.checked;savePrefs()};
 $("#saveProgress").onchange=e=>{state.prefs.saveProgress=e.target.checked;savePrefs()};
+$("#loadMoreMovies").onclick=()=>loadCatalogType("movie",{reset:false});
+$("#loadMoreSeries").onclick=()=>loadCatalogType("series",{reset:false});
+$("#loadMoreSearch").onclick=()=>runSearch({reset:false});
 
 async function boot(){
   const splash=$("#splash");
