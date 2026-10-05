@@ -887,6 +887,126 @@ function announcementText(row:any){
   return [...header,...lines].join("\n").slice(0,4000);
 }
 
+async function exactXtreamUpstream(source:any){
+  const accountId=String(source?.xtream_account_id||"");
+  if(!accountId)throw new Error("Xtream source account is missing");
+  const account:any=await xtreamAccountWithSecret(accountId);
+  if(!account?.is_enabled||account.status==="disabled"||account.status==="down")throw new Error("Xtream account is unavailable");
+  const credentials=await xtreamCredentials(account);
+  const entityType=String(source.entity_type||"");
+  const path=entityType==="movie"?"movie":"series";
+  if(!["movie","episode"].includes(entityType))throw new Error("Unsupported Xtream media type");
+  const extension=String(source.container_extension||"mp4").replace(/[^a-zA-Z0-9]/g,"").toLowerCase()||"mp4";
+  return credentials.server.replace(/\/+$/,"")+"/"+path+"/"+
+    encodeURIComponent(credentials.username)+"/"+encodeURIComponent(credentials.password)+"/"+
+    encodeURIComponent(String(source.external_stream_id||""))+"."+extension;
+}
+
+async function ensureMediaProbeSeeded(){
+  const {data:settingsRow,error:settingsError}=await db.from("app_settings").select("value").eq("key","content_sync_pipeline").maybeSingle();
+  if(settingsError)throw settingsError;
+  const value:any=(settingsRow as any)?.value||{};
+  if(value.media_probe_seeded_at)return {seeded:false,queued:0};
+  const {data:sources,error}=await db.from("playback_sources")
+    .select("id").eq("source_type","xtream").eq("is_active",true).limit(10000);
+  if(error)throw error;
+  let queued=0;
+  for(const source of sources??[])if(await queueMediaProbeSource(String(source.id)).catch(()=>false))queued++;
+  await db.from("app_settings").upsert({
+    key:"content_sync_pipeline",
+    value:{...value,media_probe_seeded_at:new Date().toISOString(),media_probe_seeded_count:queued},
+    updated_at:new Date().toISOString()
+  });
+  return {seeded:true,queued};
+}
+
+async function processMediaProbeQueue(){
+  const gateway=await mediaCompatibilityGateway();
+  if(!gateway)return {worked:false,configured:false};
+  const {data:job,error}=await db.from("media_probe_jobs")
+    .select("id,playback_source_id,status,attempts,max_attempts")
+    .in("status",["queued","failed"]).lte("next_attempt_at",new Date().toISOString())
+    .order("created_at",{ascending:true}).limit(1).maybeSingle();
+  if(error)throw error;
+  if(!job)return {worked:false,configured:true};
+
+  const attempts=Number(job.attempts||0)+1;
+  await db.from("media_probe_jobs").update({
+    status:"probing",attempts,started_at:new Date().toISOString(),last_error:null,last_error_detail:{}
+  }).eq("id",job.id);
+
+  try{
+    const {data:source,error:sourceError}=await db.from("playback_sources")
+      .select("id,entity_type,entity_id,xtream_account_id,external_stream_id,container_extension")
+      .eq("id",job.playback_source_id).maybeSingle();
+    if(sourceError)throw sourceError;
+    if(!source)throw new Error("Playback source not found");
+    const upstream=await exactXtreamUpstream(source);
+    const token=await xtreamProxyToken(upstream);
+    const bridge=await telegramBridgeConfig();
+    if(!bridge.secret)throw new Error("Worker shared secret is not configured");
+
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),45_000);
+    let response:Response;
+    try{
+      response=await fetch(gateway+"/probe/"+encodeURIComponent(token),{
+        method:"POST",
+        headers:{"x-vayzen-edge-secret":bridge.secret,"accept":"application/json"},
+        signal:controller.signal
+      });
+    }finally{clearTimeout(timer);}
+    const payload:any=await response.json().catch(()=>({}));
+    if(!response.ok||!payload?.ok)throw new Error(String(payload?.detail||payload?.error||("Media probe HTTP "+response.status)));
+
+    const mode=["direct","hls_remux","audio_aac","full_h264_aac"].includes(String(payload.recommended_mode))
+      ?String(payload.recommended_mode):"audio_aac";
+    const probeStatus=mode==="direct"?"compatible":mode==="full_h264_aac"?"needs_full_transcode":"needs_audio_transcode";
+    const {error:updateSourceError}=await db.from("playback_sources").update({
+      video_codec:String(payload.video_codec||"").slice(0,40),
+      audio_codec:String(payload.audio_codec||"").slice(0,40),
+      audio_channels:Number(payload.audio_channels||0)||null,
+      probe_status:probeStatus,
+      compatibility_mode:mode,
+      metadata:{
+        ...(source as any).metadata,
+        probe:{
+          format:String(payload.format||"").slice(0,120),
+          duration_seconds:Number(payload.duration_seconds||0)||null,
+          probed_at:new Date().toISOString()
+        }
+      },
+      last_checked_at:new Date().toISOString()
+    }).eq("id",source.id);
+    if(updateSourceError)throw updateSourceError;
+    await db.from("media_probe_jobs").update({
+      status:"completed",last_error:null,last_error_detail:{},completed_at:new Date().toISOString()
+    }).eq("id",job.id);
+    return {worked:true,configured:true,completed:true,source_id:source.id,mode};
+  }catch(err){
+    const detail=errorDetail(err);
+    const maxAttempts=Math.max(1,Number(job.max_attempts||5));
+    const exhausted=attempts>=maxAttempts;
+    const next=new Date(Date.now()+queueBackoffSeconds(attempts)*1000).toISOString();
+    await db.from("media_probe_jobs").update({
+      status:exhausted?"permanent_failed":"failed",
+      last_error:detail.message,last_error_detail:detail,next_attempt_at:next,
+      ...(exhausted?{completed_at:new Date().toISOString()}:{})
+    }).eq("id",job.id);
+    if(exhausted){
+      const {data:source}=await db.from("playback_sources")
+        .select("id,container_extension").eq("id",job.playback_source_id).maybeSingle();
+      if(source){
+        await db.from("playback_sources").update({
+          probe_status:"failed",
+          compatibility_mode:String(source.container_extension||"").toLowerCase()==="mkv"?"audio_aac":"direct"
+        }).eq("id",source.id);
+      }
+    }
+    return {worked:true,configured:true,completed:false,failed:true,exhausted,error:detail.message};
+  }
+}
+
 async function processAnnouncementOutbox(limitOverride?:number){
   const settings=await pipelineSettingsValue();
   const limit=Math.max(1,Math.min(5,Number(limitOverride||settings.announcement_worker_batch)));
@@ -936,14 +1056,16 @@ async function internalWorkerAuthorized(req:Request){
 async function pipelineWorkerTick(req:Request){
   if(!(await internalWorkerAuthorized(req)))return json({error:"unauthorized"},401);
   const repairSeed=await ensureSeriesRepairSeeded().catch(error=>({seeded:false,queued:0,error:adminErrorText(error)}));
+  const mediaProbeSeed=await ensureMediaProbeSeeded().catch(error=>({seeded:false,queued:0,error:adminErrorText(error)}));
   await enqueuePendingTmdbBacklog(1000).catch(()=>0);
+  const mediaProbe=await processMediaProbeQueue();
   const seriesIngest=await processSeriesIngestJob();
   const xtream=seriesIngest?.worked
     ?{worked:false,blocked_by_series:true}
     :await processXtreamCatalogJob();
   const tmdb=await processMetadataSyncQueue((seriesIngest?.worked||xtream?.worked)?6:undefined);
   const announcements=await processAnnouncementOutbox();
-  return json({ok:true,repairSeed,seriesIngest,xtream,tmdb,announcements});
+  return json({ok:true,repairSeed,mediaProbeSeed,mediaProbe,seriesIngest,xtream,tmdb,announcements});
 }
 
 async function syncXtreamBatch(accountId:string,startedBy:number,batchOverride?:number,parentCatalogJobId?:string|null){
@@ -5431,7 +5553,7 @@ async function xtreamStreamSource(entityType:"movie"|"episode",id:string,variant
   if(!/^[0-9a-f-]{36}$/i.test(id))return null;
   const requested=normalizeVariant(variant);
   let query=db.from("playback_sources")
-    .select("id,xtream_account_id,external_stream_id,container_extension,quality,priority,health_status,metadata")
+    .select("id,xtream_account_id,external_stream_id,container_extension,quality,priority,health_status,probe_status,compatibility_mode,video_codec,audio_codec,audio_channels,metadata")
     .eq("entity_type",entityType).eq("entity_id",id)
     .eq("source_type","xtream").eq("is_active",true)
     .neq("health_status","down")
@@ -5489,7 +5611,7 @@ async function publicMediaVariants(url:URL){
 
   let xtream:any[]=[];
   const xtreamResult=await db.from("playback_sources")
-    .select("quality,container_extension,priority,health_status")
+    .select("quality,container_extension,priority,health_status,probe_status,compatibility_mode,video_codec,audio_codec")
     .eq("entity_type",type).eq("entity_id",id).eq("source_type","xtream").eq("is_active",true)
     .neq("health_status","down");
   if(!xtreamResult.error)xtream=xtreamResult.data??[];
@@ -5508,7 +5630,7 @@ async function publicMediaVariants(url:URL){
     if(current){current.source_count=Number(current.source_count||1)+1;continue;}
     const ext=String(row.container_extension||"").toLowerCase();
     const mime=ext==="m3u8"?"application/vnd.apple.mpegurl":ext==="ts"?"video/mp2t":ext==="webm"?"video/webm":ext==="mkv"?"video/x-matroska":"video/mp4";
-    byVariant.set(variant,{variant,label:variantLabel(variant),file_size:null,mime_type:mime,source_count:1});
+    byVariant.set(variant,{variant,label:variantLabel(variant),file_size:null,mime_type:mime,source_count:1,probe_status:row.probe_status||"unknown",compatibility_mode:row.compatibility_mode||"direct",video_codec:row.video_codec||"",audio_codec:row.audio_codec||"",delivery:(row.compatibility_mode&&row.compatibility_mode!=="direct")||ext==="m3u8"?"hls":"direct"});
   }
   const variants=[...byVariant.values()].sort((a:any,b:any)=>qualityRank(b.variant)-qualityRank(a.variant));
   if(!variants.length)return json({error:"not found"},404);
@@ -5572,6 +5694,13 @@ async function streamGateway(){
   return dbUrl||STREAM_GATEWAY.replace(/\/$/,"");
 }
 
+async function mediaCompatibilityGateway(){
+  const {data}=await db.from("app_settings").select("value").eq("key","media_compat_gateway").maybeSingle();
+  const value:any=(data as any)?.value||{};
+  if(value.enabled===false)return "";
+  return String(value.url||"").replace(/\/$/,"");
+}
+
 async function hmacHex(payload:string,secret:string){
   const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(secret),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
   const sig=await crypto.subtle.sign("HMAC",key,new TextEncoder().encode(payload));
@@ -5601,6 +5730,14 @@ async function media(type:string,id:string,req?:Request){
     const xtream=await xtreamStreamSource(entityType,id,quality);
     if(!xtream)return json({error:"not found"},404);
     const token=await xtreamProxyToken(xtream.upstream);
+    const compatibilityMode=String(xtream.source?.compatibility_mode||"direct");
+    if(compatibilityMode!=="direct"){
+      const compatBase=await mediaCompatibilityGateway();
+      if(compatBase){
+        const mode=["hls_remux","audio_aac","full_h264_aac"].includes(compatibilityMode)?compatibilityMode:"audio_aac";
+        return Response.redirect(compatBase+"/hls/"+encodeURIComponent(token)+"/index.m3u8?mode="+encodeURIComponent(mode),307);
+      }
+    }
     return Response.redirect(`${gatewayBase}/xtream/${encodeURIComponent(token)}`,307);
   }
 
