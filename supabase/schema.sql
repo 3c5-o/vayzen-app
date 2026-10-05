@@ -684,6 +684,31 @@ as $
     ) || ':' || coalesce(p_year,0)::text
 $;
 
+create or replace function public.set_vayzen_content_identity()
+returns trigger
+language plpgsql
+set search_path=public
+as $
+begin
+  new.identity_key=public.vayzen_identity_key(
+    case when tg_table_name='movies' then 'movie' else 'series' end,
+    new.title,
+    new.release_year
+  );
+  return new;
+end
+$;
+
+drop trigger if exists trg_movies_identity_key on public.movies;
+create trigger trg_movies_identity_key
+before insert or update of title,release_year on public.movies
+for each row execute function public.set_vayzen_content_identity();
+
+drop trigger if exists trg_series_identity_key on public.series;
+create trigger trg_series_identity_key
+before insert or update of title,release_year on public.series
+for each row execute function public.set_vayzen_content_identity();
+
 update public.movies
 set identity_key=public.vayzen_identity_key('movie',title,release_year)
 where identity_key is null or btrim(identity_key)='';
