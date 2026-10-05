@@ -1,15 +1,19 @@
 import asyncio
+import base64
 import hashlib
 import hmac
+import json
 import os
 import re
 import time
 from contextlib import asynccontextmanager
+from urllib.parse import urljoin, urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 import httpx
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from telethon import TelegramClient, utils
 
 API_ID = int(os.environ["TELEGRAM_API_ID"])
@@ -29,6 +33,9 @@ STREAM_QUEUE_TIMEOUT = max(1.0, float(os.environ.get("STREAM_QUEUE_TIMEOUT_SECON
 MAX_MEDIA_BYTES = max(1, int(os.environ.get("MAX_MEDIA_MB", "2000"))) * 1024 * 1024
 MEDIA_CACHE_TTL = max(5.0, float(os.environ.get("MEDIA_CACHE_TTL_SECONDS", "60")))
 MEDIA_CACHE_MAX = max(32, int(os.environ.get("MEDIA_CACHE_MAX", "256")))
+XTREAM_PROXY_TTL_SECONDS = max(300, min(24 * 60 * 60, int(os.environ.get("XTREAM_PROXY_TTL_SECONDS", str(6 * 60 * 60)))))
+XTREAM_PROXY_CONNECT_TIMEOUT = max(3.0, float(os.environ.get("XTREAM_PROXY_CONNECT_TIMEOUT_SECONDS", "12")))
+XTREAM_PROXY_READ_TIMEOUT = max(10.0, float(os.environ.get("XTREAM_PROXY_READ_TIMEOUT_SECONDS", "45")))
 
 client = TelegramClient(None, API_ID, API_HASH)
 channel_cache = {}
@@ -113,6 +120,98 @@ def verify_signature(channel_id: int, message_id: int, exp: int, sig: str):
     expected = hmac.new(STREAM_SIGNING_SECRET, payload, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, sig or ""):
         raise HTTPException(status_code=401, detail="Invalid stream signature")
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(value: str) -> bytes:
+    padding = "=" * ((4 - len(value) % 4) % 4)
+    return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+
+
+def _xtream_proxy_key() -> bytes:
+    if not STREAM_SIGNING_SECRET:
+        raise HTTPException(status_code=503, detail="Streaming secret is not configured")
+    return hashlib.sha256(b"vayzen:xtream-proxy:v1:" + STREAM_SIGNING_SECRET).digest()
+
+
+def encrypt_xtream_target(url: str, exp: int | None = None) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("Unsupported upstream URL")
+    expires = int(exp or (time.time() + XTREAM_PROXY_TTL_SECONDS))
+    payload = json.dumps({"u": url, "e": expires}, separators=(",", ":")).encode()
+    nonce = os.urandom(12)
+    encrypted = AESGCM(_xtream_proxy_key()).encrypt(nonce, payload, b"vayzen-xtream-v1")
+    return "v1." + _b64url_encode(nonce + encrypted)
+
+
+def decrypt_xtream_target(token: str) -> tuple[str, int]:
+    if not token.startswith("v1.") or len(token) > 8192:
+        raise HTTPException(status_code=401, detail="Invalid Xtream stream token")
+    try:
+        raw = _b64url_decode(token[3:])
+        if len(raw) < 29:
+            raise ValueError("short token")
+        nonce, encrypted = raw[:12], raw[12:]
+        payload = AESGCM(_xtream_proxy_key()).decrypt(nonce, encrypted, b"vayzen-xtream-v1")
+        data = json.loads(payload.decode())
+        url = str(data.get("u") or "")
+        exp = int(data.get("e") or 0)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Invalid Xtream stream token") from exc
+    if exp < int(time.time()) - 5:
+        raise HTTPException(status_code=401, detail="Xtream stream link expired")
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Invalid Xtream upstream URL")
+    return url, exp
+
+
+def xtream_proxy_path(url: str, exp: int) -> str:
+    return "/xtream/" + encrypt_xtream_target(url, exp)
+
+
+def rewrite_hls_playlist(text: str, source_url: str, exp: int) -> str:
+    def rewrite_uri_attr(match):
+        raw = match.group(1)
+        if raw.startswith(("data:", "blob:")):
+            return match.group(0)
+        absolute = urljoin(source_url, raw)
+        return 'URI="' + xtream_proxy_path(absolute, exp) + '"'
+
+    out = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            out.append(line)
+            continue
+        if stripped.startswith("#"):
+            out.append(re.sub(r'URI="([^"]+)"', rewrite_uri_attr, line))
+            continue
+        if stripped.startswith(("data:", "blob:")):
+            out.append(line)
+            continue
+        absolute = urljoin(source_url, stripped)
+        out.append(xtream_proxy_path(absolute, exp))
+    return "\n".join(out)
+
+
+def upstream_headers(request: Request, target: str):
+    parsed = urlparse(target)
+    headers = {
+        "Accept": request.headers.get("accept") or "*/*",
+        "User-Agent": "VAYZEN/1.0",
+        "Referer": f"{parsed.scheme}://{parsed.netloc}/",
+    }
+    range_header = request.headers.get("range")
+    if range_header:
+        headers["Range"] = range_header
+    return headers
 
 
 async def get_channel(channel_id: int):
@@ -248,9 +347,98 @@ async def health():
         "stream_rejections": stream_rejections,
         "bytes_served": bytes_served,
         "signed_streams": bool(STREAM_SIGNING_SECRET),
+        "xtream_private_proxy": bool(STREAM_SIGNING_SECRET),
+        "xtream_proxy_ttl_seconds": XTREAM_PROXY_TTL_SECONDS,
         "cached_channels": len(channel_cache),
         "cached_media": len(media_cache),
     }
+
+
+@app.api_route("/xtream/{token}", methods=["GET", "HEAD"])
+async def xtream_proxy(token: str, request: Request):
+    target, exp = decrypt_xtream_target(token)
+    timeout = httpx.Timeout(
+        connect=XTREAM_PROXY_CONNECT_TIMEOUT,
+        read=XTREAM_PROXY_READ_TIMEOUT,
+        write=XTREAM_PROXY_READ_TIMEOUT,
+        pool=XTREAM_PROXY_CONNECT_TIMEOUT,
+    )
+    headers = upstream_headers(request, target)
+    client_http = httpx.AsyncClient(follow_redirects=True, timeout=timeout)
+
+    try:
+        upstream_request = client_http.build_request(request.method, target, headers=headers)
+        upstream = await client_http.send(upstream_request, stream=True)
+    except Exception as exc:
+        await client_http.aclose()
+        raise HTTPException(status_code=502, detail="Xtream upstream connection failed") from exc
+
+    content_type = (upstream.headers.get("content-type") or "application/octet-stream").split(";")[0].strip().lower()
+    final_url = str(upstream.url)
+    is_hls = (
+        "mpegurl" in content_type
+        or final_url.lower().split("?", 1)[0].endswith(".m3u8")
+        or target.lower().split("?", 1)[0].endswith(".m3u8")
+    )
+
+    if request.method == "HEAD":
+        out_headers = {
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        }
+        for key in ("content-length", "content-range", "accept-ranges"):
+            value = upstream.headers.get(key)
+            if value:
+                out_headers[key.title()] = value
+        status = upstream.status_code
+        await upstream.aclose()
+        await client_http.aclose()
+        return Response(status_code=status, headers=out_headers, media_type=content_type)
+
+    if is_hls:
+        try:
+            raw = await upstream.aread()
+            playlist = raw.decode("utf-8", errors="replace")
+            rewritten = rewrite_hls_playlist(playlist, final_url, exp)
+        finally:
+            await upstream.aclose()
+            await client_http.aclose()
+        return Response(
+            content=rewritten,
+            status_code=upstream.status_code,
+            media_type="application/vnd.apple.mpegurl",
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    out_headers = {
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
+    for key in ("content-length", "content-range", "accept-ranges"):
+        value = upstream.headers.get(key)
+        if value:
+            out_headers[key.title()] = value
+
+    async def proxy_body():
+        try:
+            async for chunk in upstream.aiter_bytes(CHUNK_SIZE):
+                if await request.is_disconnected():
+                    break
+                if chunk:
+                    yield chunk
+        finally:
+            await upstream.aclose()
+            await client_http.aclose()
+
+    return StreamingResponse(
+        proxy_body(),
+        status_code=upstream.status_code,
+        headers=out_headers,
+        media_type=content_type,
+    )
 
 
 @app.api_route("/stream/{channel_id}/{message_id}", methods=["GET", "HEAD"])
