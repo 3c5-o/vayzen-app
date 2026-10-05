@@ -5631,10 +5631,16 @@ async function publicMediaVariants(url:URL){
   for(const row of xtream){
     const variant=normalizeVariant(row.quality||"default");
     const current=byVariant.get(variant);
-    if(current){current.source_count=Number(current.source_count||1)+1;continue;}
     const ext=String(row.container_extension||"").toLowerCase();
+    const xtreamDelivery=((row.compatibility_mode&&row.compatibility_mode!=="direct")||ext==="m3u8")?"hls":"direct";
+    if(current){
+      current.source_count=Number(current.source_count||1)+1;
+      current.fallback_delivery=xtreamDelivery;
+      current.fallback_compatibility_mode=row.compatibility_mode||"direct";
+      continue;
+    }
     const mime=ext==="m3u8"?"application/vnd.apple.mpegurl":ext==="ts"?"video/mp2t":ext==="webm"?"video/webm":ext==="mkv"?"video/x-matroska":"video/mp4";
-    byVariant.set(variant,{variant,label:variantLabel(variant),file_size:null,mime_type:mime,source_count:1,probe_status:row.probe_status||"unknown",compatibility_mode:row.compatibility_mode||"direct",video_codec:row.video_codec||"",audio_codec:row.audio_codec||"",delivery:(row.compatibility_mode&&row.compatibility_mode!=="direct")||ext==="m3u8"?"hls":"direct"});
+    byVariant.set(variant,{variant,label:variantLabel(variant),file_size:null,mime_type:mime,source_count:1,probe_status:row.probe_status||"unknown",compatibility_mode:row.compatibility_mode||"direct",video_codec:row.video_codec||"",audio_codec:row.audio_codec||"",delivery:xtreamDelivery,fallback_delivery:xtreamDelivery});
   }
   const variants=[...byVariant.values()].sort((a:any,b:any)=>qualityRank(b.variant)-qualityRank(a.variant));
   if(!variants.length)return json({error:"not found"},404);
