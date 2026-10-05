@@ -40,6 +40,7 @@ MEDIA_CACHE_MAX = max(32, int(os.environ.get("MEDIA_CACHE_MAX", "256")))
 XTREAM_PROXY_TTL_SECONDS = max(300, min(24 * 60 * 60, int(os.environ.get("XTREAM_PROXY_TTL_SECONDS", str(6 * 60 * 60)))))
 XTREAM_PROXY_CONNECT_TIMEOUT = max(3.0, float(os.environ.get("XTREAM_PROXY_CONNECT_TIMEOUT_SECONDS", "12")))
 XTREAM_PROXY_READ_TIMEOUT = max(10.0, float(os.environ.get("XTREAM_PROXY_READ_TIMEOUT_SECONDS", "45")))
+PIPELINE_WORKER_INTERVAL = max(4.0, float(os.environ.get("PIPELINE_WORKER_INTERVAL_SECONDS", "7")))
 
 client = TelegramClient(None, API_ID, API_HASH)
 telegram_start_lock = asyncio.Lock()
@@ -130,14 +131,70 @@ async def configure_bot_webhook():
         print("Telegram webhook configuration error:", repr(exc))
 
 
+async def pipeline_worker_loop():
+    # The worker only calls the private Edge action using the existing shared
+    # secret. Long syncs are split inside the Edge function, so the public API
+    # and Telegram webhook remain responsive.
+    await asyncio.sleep(5.0)
+    timeout = httpx.Timeout(180.0, connect=20.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
+        while True:
+            delay = PIPELINE_WORKER_INTERVAL
+            try:
+                if VAYZEN_API_TARGET and EDGE_SHARED_SECRET:
+                    response = await http.post(
+                        f"{VAYZEN_API_TARGET}?action=pipeline_worker",
+                        headers={
+                            "x-vayzen-edge-secret": EDGE_SHARED_SECRET.decode("utf-8"),
+                            "content-type": "application/json",
+                        },
+                        content=b"{}",
+                    )
+                    if response.status_code >= 400:
+                        print(
+                            "Pipeline worker HTTP",
+                            response.status_code,
+                            response.text[:300],
+                        )
+                        delay = max(15.0, PIPELINE_WORKER_INTERVAL)
+                    else:
+                        try:
+                            payload = response.json()
+                            xtream = payload.get("xtream") or {}
+                            tmdb = payload.get("tmdb") or {}
+                            announcements = payload.get("announcements") or {}
+                            busy = bool(
+                                xtream.get("worked")
+                                or tmdb.get("worked")
+                                or announcements.get("worked")
+                            )
+                            delay = PIPELINE_WORKER_INTERVAL if busy else max(12.0, PIPELINE_WORKER_INTERVAL)
+                        except Exception:
+                            pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print("Pipeline worker error:", repr(exc))
+                delay = max(20.0, PIPELINE_WORKER_INTERVAL)
+            await asyncio.sleep(delay)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await ensure_telegram_client()
     await refresh_channel_cache()
     await configure_bot_webhook()
-    yield
-    if client.is_connected():
-        await client.disconnect()
+    pipeline_task = asyncio.create_task(pipeline_worker_loop())
+    try:
+        yield
+    finally:
+        pipeline_task.cancel()
+        try:
+            await pipeline_task
+        except asyncio.CancelledError:
+            pass
+        if client.is_connected():
+            await client.disconnect()
 
 
 app = FastAPI(title="VAYZEN Telegram Streaming Gateway", lifespan=lifespan)
