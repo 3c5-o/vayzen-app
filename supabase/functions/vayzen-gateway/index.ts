@@ -103,6 +103,398 @@ async function decryptLocalSecret(value:string){
   const plain=await crypto.subtle.decrypt({name:"AES-GCM",iv:b64ToBytes(iv64)},key,b64ToBytes(data64));
   return new TextDecoder().decode(plain);
 }
+
+const XTREAM_SYNC_BATCH_DEFAULT=120;
+const COUNTRY_NAMES:Record<string,string>={
+  IQ:"العراق",TR:"تركيا",SY:"سوريا",EG:"مصر",LB:"لبنان",SA:"السعودية",KW:"الكويت",
+  AE:"الإمارات",QA:"قطر",BH:"البحرين",OM:"عمان",JO:"الأردن",PS:"فلسطين",MA:"المغرب",
+  DZ:"الجزائر",TN:"تونس",KR:"كوريا الجنوبية",JP:"اليابان",IN:"الهند",US:"الولايات المتحدة",
+  GB:"بريطانيا",ES:"إسبانيا",FR:"فرنسا",DE:"ألمانيا",IT:"إيطاليا",MX:"المكسيك",CN:"الصين"
+};
+
+async function xtreamSettingsValue(){
+  const {data}=await db.from("app_settings").select("value").eq("key","xtream").maybeSingle();
+  return {
+    enabled:Boolean((data as any)?.value?.enabled),
+    auto_publish:Boolean((data as any)?.value?.auto_publish),
+    sync_movies:(data as any)?.value?.sync_movies!==false,
+    sync_series:(data as any)?.value?.sync_series!==false,
+    sync_batch_size:Math.max(20,Math.min(200,Number((data as any)?.value?.sync_batch_size||XTREAM_SYNC_BATCH_DEFAULT))),
+    source_failover:(data as any)?.value?.source_failover!==false,
+  };
+}
+
+async function xtreamAccounts(){
+  const {data,error}=await db.from("xtream_accounts")
+    .select("id,name,server_url,priority,is_enabled,sync_movies,sync_series,sync_live,status,last_error,last_checked_at,last_sync_at,movie_count,series_count,episode_count,metadata,created_at")
+    .order("priority",{ascending:false}).order("created_at",{ascending:true});
+  if(error)throw error;
+  return data??[];
+}
+
+async function xtreamAccountWithSecret(id:string){
+  const {data,error}=await db.from("xtream_accounts")
+    .select("id,name,server_url,credentials_ciphertext,priority,is_enabled,sync_movies,sync_series,sync_live,status,last_error,last_checked_at,last_sync_at,movie_count,series_count,episode_count,metadata")
+    .eq("id",id).maybeSingle();
+  if(error)throw error;
+  if(!data)throw new Error("Xtream account not found");
+  return data as any;
+}
+
+async function xtreamCredentials(row:any):Promise<XtreamCredentials>{
+  const plain=await decryptLocalSecret(String(row?.credentials_ciphertext||""));
+  const parsed=JSON.parse(plain||"{}");
+  return validateXtreamCredentials({
+    server:String(row?.server_url||parsed.server||""),
+    username:String(parsed.username||""),
+    password:String(parsed.password||""),
+  });
+}
+
+function xtreamAuthActive(auth:any){
+  const user=auth?.user_info||auth||{};
+  const status=String(user?.status||"").toLowerCase();
+  const authFlag=String(user?.auth??"1");
+  return authFlag!=="0"&&!["disabled","banned","expired"].includes(status);
+}
+
+async function xtreamSnapshot(credentials:XtreamCredentials){
+  const auth=await xtreamRequest(credentials);
+  if(!xtreamAuthActive(auth))throw new Error("حساب Xtream غير فعال أو بيانات الدخول غير صحيحة.");
+  const [vodCategories,vodStreams,seriesCategories,seriesList]=await Promise.all([
+    xtreamRequest(credentials,"get_vod_categories").catch(()=>[]),
+    xtreamRequest(credentials,"get_vod_streams").catch(()=>[]),
+    xtreamRequest(credentials,"get_series_categories").catch(()=>[]),
+    xtreamRequest(credentials,"get_series").catch(()=>[]),
+  ]);
+  return {
+    auth,
+    vodCategories:asXtreamArray(vodCategories),
+    movies:asXtreamArray(vodStreams),
+    seriesCategories:asXtreamArray(seriesCategories),
+    series:asXtreamArray(seriesList),
+  };
+}
+
+async function saveXtreamAccount(input:{
+  id?:string;name:string;server:string;username:string;password:string;priority?:number;createdBy?:number;
+}){
+  const credentials=validateXtreamCredentials({server:input.server,username:input.username,password:input.password});
+  const snapshot=await xtreamSnapshot(credentials);
+  const encrypted=await encryptLocalSecret(JSON.stringify(credentials));
+  const row:any={
+    name:String(input.name||"").trim().slice(0,80),
+    server_url:credentials.server,
+    credentials_ciphertext:encrypted,
+    priority:Math.max(0,Math.min(1000,Number(input.priority??50))),
+    is_enabled:true,
+    status:"active",
+    last_error:null,
+    last_checked_at:new Date().toISOString(),
+    movie_count:snapshot.movies.length,
+    series_count:snapshot.series.length,
+    metadata:{
+      auth_status:String(snapshot.auth?.user_info?.status||"Active"),
+      max_connections:Number(snapshot.auth?.user_info?.max_connections||0)||null,
+      active_connections:Number(snapshot.auth?.user_info?.active_cons||0)||0,
+      sync_cursor:{movie:0,series:0}
+    },
+    created_by:input.createdBy||null,
+  };
+  if(!row.name)throw new Error("اسم حساب Xtream مطلوب.");
+  if(input.id){
+    const {data,error}=await db.from("xtream_accounts").update(row).eq("id",input.id).select("id,name").single();
+    if(error)throw error;return data;
+  }
+  const {data,error}=await db.from("xtream_accounts").insert(row).select("id,name").single();
+  if(error)throw error;return data;
+}
+
+function splitGenres(value:unknown){
+  return String(value??"").split(/[,|/]/).map(x=>x.trim()).filter(Boolean).slice(0,12);
+}
+
+function compactXtreamMetadata(item:Record<string,unknown>,categoryName:string){
+  return {
+    category_id:String(item.category_id??""),
+    category_name:categoryName,
+    stream_icon:String(item.stream_icon??item.cover??""),
+    container_extension:String(item.container_extension??""),
+    rating:Number(item.rating_5based??item.rating??0)||null,
+    added:String(item.added??""),
+  };
+}
+
+async function canonicalMap(table:"movies"|"series",keys:string[]){
+  const unique=[...new Set(keys.filter(Boolean))];
+  const map=new Map<string,any>();
+  for(let i=0;i<unique.length;i+=80){
+    const part=unique.slice(i,i+80);
+    const {data,error}=await db.from(table)
+      .select("id,identity_key,title,release_year,status,external_source,external_id")
+      .in("identity_key",part);
+    if(error)throw error;
+    for(const row of data??[])if(row.identity_key&&!map.has(row.identity_key))map.set(row.identity_key,row);
+  }
+  return map;
+}
+
+async function createCanonicalRows(
+  table:"movies"|"series",
+  type:"movie"|"series",
+  items:Array<{key:string;title:string;year:number|null;countryCode:string;categoryName:string;raw:Record<string,unknown>}>,
+  autoPublish:boolean
+){
+  const unique=new Map<string,(typeof items)[number]>();
+  for(const item of items)if(item.key&&!unique.has(item.key))unique.set(item.key,item);
+  const existing=await canonicalMap(table,[...unique.keys()]);
+  const missing=[...unique.values()].filter(x=>!existing.has(x.key));
+  if(missing.length){
+    const rows=missing.map(item=>{
+      const base:any={
+        title:item.title,
+        original_title:item.title,
+        description:String(item.raw.plot??item.raw.description??"").trim().slice(0,5000),
+        release_year:item.year,
+        genres:splitGenres(item.raw.genre??item.raw.genres),
+        language:"",
+        country:item.countryCode?(COUNTRY_NAMES[item.countryCode]||item.countryCode):"",
+        country_code:item.countryCode||null,
+        origin_country_codes:item.countryCode?[item.countryCode]:[],
+        original_language_code:null,
+        quality:qualityFromName(item.raw.name,item.raw.container_extension),
+        status:autoPublish?"published":"draft",
+        identity_key:item.key,
+        external_metadata:{xtream_seed:compactXtreamMetadata(item.raw,item.categoryName)},
+      };
+      if(type==="movie"){
+        base.duration_minutes=null;
+      }
+      return base;
+    });
+    const {data,error}=await db.from(table).insert(rows).select("id,identity_key,title,release_year,status");
+    if(error)throw error;
+    for(const row of data??[])if(row.identity_key)existing.set(row.identity_key,row);
+  }
+  return existing;
+}
+
+async function syncXtreamRefsAndSources(args:{
+  account:any;
+  entityType:"movie"|"series";
+  items:Record<string,unknown>[];
+  categories:Map<string,string>;
+  autoPublish:boolean;
+}){
+  const {account,entityType,items,categories,autoPublish}=args;
+  const prepared=items.map(raw=>{
+    const rawName=String(raw.name??raw.title??"").trim();
+    const title=normalizeCatalogTitle(rawName)||rawName||"بدون اسم";
+    const year=extractCatalogYear(raw,title);
+    const categoryName=categories.get(String(raw.category_id??""))||"";
+    const countryCode=classifyCountry(categoryName,title,raw.genre);
+    return {
+      raw,title,year,categoryName,countryCode,
+      key:identityKey(entityType,title,year),
+      externalId:String(entityType==="movie"?(raw.stream_id??""):(raw.series_id??""))
+    };
+  }).filter(x=>x.externalId);
+
+  const table=entityType==="movie"?"movies":"series";
+  const canonical=await createCanonicalRows(table,entityType,prepared,autoPublish);
+  const externalIds=[...new Set(prepared.map(x=>x.externalId))];
+
+  const existingRefs=new Map<string,any>();
+  for(let i=0;i<externalIds.length;i+=80){
+    const ids=externalIds.slice(i,i+80);
+    const {data,error}=await db.from("content_provider_refs")
+      .select("id,external_id,entity_id,identity_key,is_active")
+      .eq("provider_type","xtream").eq("provider_account_id",account.id)
+      .eq("entity_type",entityType).in("external_id",ids);
+    if(error)throw error;
+    for(const ref of data??[])existingRefs.set(String(ref.external_id),ref);
+  }
+
+  const now=new Date().toISOString();
+  const refsToInsert:any[]=[];
+  const refsToUpdate:any[]=[];
+  let createdItems=0,mergedItems=0,sourceLinks=0;
+  for(const item of prepared){
+    const entity=canonical.get(item.key);
+    if(!entity)continue;
+    const ref=existingRefs.get(item.externalId);
+    const metadata=compactXtreamMetadata(item.raw,item.categoryName);
+    if(ref){
+      refsToUpdate.push({id:ref.id,entity_id:entity.id,identity_key:item.key,is_active:true,last_seen_at:now,metadata});
+      if(String(ref.entity_id)!==String(entity.id))mergedItems++;
+    }else{
+      refsToInsert.push({
+        provider_type:"xtream",provider_account_id:account.id,entity_type:entityType,entity_id:entity.id,
+        external_id:item.externalId,identity_key:item.key,is_active:true,last_seen_at:now,metadata
+      });
+      existingRefs.set(item.externalId,{id:null,entity_id:entity.id});
+      mergedItems++;
+    }
+    if(entity.status===(autoPublish?"published":"draft")&&String(entity.external_metadata?.xtream_seed||"")==="")createdItems++;
+  }
+  if(refsToInsert.length){
+    const {data,error}=await db.from("content_provider_refs").insert(refsToInsert).select("id,external_id,entity_id");
+    if(error)throw error;
+    for(const ref of data??[])existingRefs.set(String(ref.external_id),ref);
+  }
+  for(const row of refsToUpdate){
+    const {error}=await db.from("content_provider_refs").update({
+      entity_id:row.entity_id,identity_key:row.identity_key,is_active:true,last_seen_at:row.last_seen_at,metadata:row.metadata
+    }).eq("id",row.id);
+    if(error)throw error;
+  }
+
+  if(entityType==="movie"){
+    const existingSources=new Map<string,any>();
+    for(let i=0;i<externalIds.length;i+=80){
+      const ids=externalIds.slice(i,i+80);
+      const {data,error}=await db.from("playback_sources")
+        .select("id,external_stream_id,entity_id,is_active")
+        .eq("source_type","xtream").eq("xtream_account_id",account.id)
+        .eq("entity_type","movie").in("external_stream_id",ids);
+      if(error)throw error;
+      for(const src of data??[])existingSources.set(String(src.external_stream_id),src);
+    }
+    const sourcesToInsert:any[]=[];
+    for(const item of prepared){
+      const entity=canonical.get(item.key);if(!entity)continue;
+      const current=existingSources.get(item.externalId);
+      const payload:any={
+        entity_type:"movie",entity_id:entity.id,source_type:"xtream",
+        xtream_account_id:account.id,provider_ref_id:existingRefs.get(item.externalId)?.id||null,
+        external_stream_id:item.externalId,container_extension:String(item.raw.container_extension??""),
+        quality:qualityFromName(item.raw.name,item.raw.container_extension),
+        country_code:item.countryCode||null,priority:Number(account.priority||50),is_active:true,
+        health_status:"unknown",consecutive_failures:0,last_seen_at:now,
+        metadata:{category_name:item.categoryName,stream_icon:String(item.raw.stream_icon??"")}
+      };
+      if(current){
+        const {error}=await db.from("playback_sources").update(payload).eq("id",current.id);
+        if(error)throw error;
+      }else{
+        sourcesToInsert.push(payload);sourceLinks++;
+      }
+    }
+    if(sourcesToInsert.length){
+      const {error}=await db.from("playback_sources").insert(sourcesToInsert);
+      if(error)throw error;
+    }
+  }
+
+  return {processed:prepared.length,createdItems,mergedItems,sourceLinks};
+}
+
+async function syncXtreamBatch(accountId:string,startedBy:number){
+  const account=await xtreamAccountWithSecret(accountId);
+  if(!account.is_enabled)throw new Error("حساب Xtream متوقف.");
+  const credentials=await xtreamCredentials(account);
+  const settings=await xtreamSettingsValue();
+  const {data:run,error:runError}=await db.from("xtream_sync_runs").insert({
+    account_id:account.id,mode:"incremental",status:"running",started_by:startedBy
+  }).select("id").single();
+  if(runError)throw runError;
+  const runId=String(run.id);
+  try{
+    const snapshot=await xtreamSnapshot(credentials);
+    const movieCategories=categoryMap(snapshot.vodCategories);
+    const seriesCategories=categoryMap(snapshot.seriesCategories);
+    const cursorRaw=(account.metadata as any)?.sync_cursor||{};
+    let movieCursor=Math.max(0,Number(cursorRaw.movie||0));
+    let seriesCursor=Math.max(0,Number(cursorRaw.series||0));
+    const batch=settings.sync_batch_size;
+
+    const movieEnabled=account.sync_movies!==false&&settings.sync_movies;
+    const seriesEnabled=account.sync_series!==false&&settings.sync_series;
+    let movieTake=movieEnabled?Math.min(Math.ceil(batch/2),Math.max(0,snapshot.movies.length-movieCursor)):0;
+    let seriesTake=seriesEnabled?Math.min(batch-movieTake,Math.max(0,snapshot.series.length-seriesCursor)):0;
+    if(movieTake+seriesTake<batch&&movieEnabled){
+      movieTake+=Math.min(batch-movieTake-seriesTake,Math.max(0,snapshot.movies.length-(movieCursor+movieTake)));
+    }
+    if(movieTake+seriesTake<batch&&seriesEnabled){
+      seriesTake+=Math.min(batch-movieTake-seriesTake,Math.max(0,snapshot.series.length-(seriesCursor+seriesTake)));
+    }
+
+    const movieBatch=snapshot.movies.slice(movieCursor,movieCursor+movieTake);
+    const seriesBatch=snapshot.series.slice(seriesCursor,seriesCursor+seriesTake);
+    const movieResult=movieBatch.length
+      ?await syncXtreamRefsAndSources({account,entityType:"movie",items:movieBatch,categories:movieCategories,autoPublish:settings.auto_publish})
+      :{processed:0,createdItems:0,mergedItems:0,sourceLinks:0};
+    const seriesResult=seriesBatch.length
+      ?await syncXtreamRefsAndSources({account,entityType:"series",items:seriesBatch,categories:seriesCategories,autoPublish:settings.auto_publish})
+      :{processed:0,createdItems:0,mergedItems:0,sourceLinks:0};
+
+    movieCursor+=movieTake;seriesCursor+=seriesTake;
+    const movieDone=!movieEnabled||movieCursor>=snapshot.movies.length;
+    const seriesDone=!seriesEnabled||seriesCursor>=snapshot.series.length;
+    const cycleComplete=movieDone&&seriesDone;
+    const nextCursor=cycleComplete?{movie:0,series:0}:{movie:movieCursor,series:seriesCursor};
+    const now=new Date().toISOString();
+    const metadata={
+      ...((account.metadata&&typeof account.metadata==="object")?account.metadata:{}),
+      sync_cursor:nextCursor,
+      last_cycle_completed_at:cycleComplete?now:(account.metadata as any)?.last_cycle_completed_at||null,
+      auth_status:String(snapshot.auth?.user_info?.status||"Active"),
+      max_connections:Number(snapshot.auth?.user_info?.max_connections||0)||null,
+    };
+    const {error:updateAccountError}=await db.from("xtream_accounts").update({
+      status:"active",last_error:null,last_checked_at:now,last_sync_at:now,
+      movie_count:snapshot.movies.length,series_count:snapshot.series.length,metadata
+    }).eq("id",account.id);
+    if(updateAccountError)throw updateAccountError;
+
+    const summary={
+      movies_seen:movieResult.processed,series_seen:seriesResult.processed,
+      created_items:movieResult.createdItems+seriesResult.createdItems,
+      merged_items:movieResult.mergedItems+seriesResult.mergedItems,
+      source_links_created:movieResult.sourceLinks,
+      details:{
+        cycle_complete:cycleComplete,next_cursor:nextCursor,
+        total_movies:snapshot.movies.length,total_series:snapshot.series.length,
+        auto_publish:settings.auto_publish
+      }
+    };
+    await db.from("xtream_sync_runs").update({
+      status:"completed",...summary,completed_at:now
+    }).eq("id",runId);
+    return summary;
+  }catch(error){
+    const message=error instanceof Error?error.message:String(error);
+    await db.from("xtream_accounts").update({
+      status:"degraded",last_error:message,last_checked_at:new Date().toISOString()
+    }).eq("id",accountId);
+    await db.from("xtream_sync_runs").update({
+      status:"failed",errors_count:1,error:message,completed_at:new Date().toISOString()
+    }).eq("id",runId);
+    throw error;
+  }
+}
+
+async function sendXtreamSettings(chatId:string|number){
+  let accounts:any[]=[];
+  try{accounts=await xtreamAccounts();}catch(error){
+    return send(chatId,"جداول Xtream غير مفعلة بعد في قاعدة البيانات. طبّق schema.sql ثم أعد المحاولة.");
+  }
+  const lines=accounts.map((x:any,index:number)=>{
+    const enabled=x.is_enabled?"مفعل":"متوقف";
+    return `${index+1}. ${x.name} — ${enabled} — أفلام ${Number(x.movie_count||0).toLocaleString("ar-IQ")} — مسلسلات ${Number(x.series_count||0).toLocaleString("ar-IQ")}`;
+  });
+  const rows:any[][]=accounts.slice(0,10).map((x:any)=>[
+    {text:`مزامنة ${String(x.name).slice(0,20)}`,callback_data:`xtream_sync|${x.id}`},
+    {text:x.is_enabled?"إيقاف":"تفعيل",callback_data:`xtream_toggle|${x.id}`}
+  ]);
+  rows.push([{text:"إضافة حساب Xtream",callback_data:"xtream_add"}]);
+  rows.push([{text:"رجوع",callback_data:"menu"}]);
+  return send(chatId,
+    `Xtream متعدد المصادر\n\n${lines.length?lines.join("\n"):"لا توجد حسابات مضافة."}\n\nالمحتوى المكرر يُدمج في سجل واحد، وكل حساب يبقى مصدر تشغيل مستقل.`,
+    {inline_keyboard:rows}
+  );
+}
+
 async function tmdbSetting(){
   const {data,error}=await db.from("app_settings").select("value,updated_at").eq("key","tmdb").maybeSingle();
   if(error)throw error;
