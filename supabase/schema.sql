@@ -906,7 +906,7 @@ create table if not exists public.playback_sources (
   probe_status text not null default 'unknown'
     check (probe_status in ('unknown','queued','probing','compatible','needs_audio_transcode','needs_full_transcode','failed')),
   compatibility_mode text not null default 'direct'
-    check (compatibility_mode in ('direct','audio_aac','full_h264_aac')),
+    check (compatibility_mode in ('direct','hls_remux','audio_aac','full_h264_aac')),
   quality text not null default '',
   language text not null default '',
   country_code text,
@@ -933,6 +933,10 @@ alter table public.playback_sources
   add column if not exists audio_channels integer,
   add column if not exists probe_status text not null default 'unknown',
   add column if not exists compatibility_mode text not null default 'direct';
+
+alter table public.playback_sources drop constraint if exists playback_sources_compatibility_mode_check;
+alter table public.playback_sources add constraint playback_sources_compatibility_mode_check
+  check (compatibility_mode in ('direct','hls_remux','audio_aac','full_h264_aac'));
 
 create unique index if not exists playback_sources_xtream_unique_idx
   on public.playback_sources(xtream_account_id,entity_type,external_stream_id)
