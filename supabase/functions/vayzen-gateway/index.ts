@@ -211,7 +211,7 @@ async function saveXtreamAccount(input:{
   if(error)throw error;return data;
 }
 
-function splitGenres(value:unknown){
+function xtreamSplitGenres(value:unknown){
   return String(value??"").split(/[,|/]/).map(x=>x.trim()).filter(Boolean).slice(0,12);
 }
 
@@ -257,7 +257,7 @@ async function createCanonicalRows(
         original_title:item.title,
         description:String(item.raw.plot??item.raw.description??"").trim().slice(0,5000),
         release_year:item.year,
-        genres:splitGenres(item.raw.genre??item.raw.genres),
+        genres:xtreamSplitGenres(item.raw.genre??item.raw.genres),
         language:"",
         country:item.countryCode?(COUNTRY_NAMES[item.countryCode]||item.countryCode):"",
         country_code:item.countryCode||null,
