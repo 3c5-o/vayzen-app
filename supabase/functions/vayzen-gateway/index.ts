@@ -3664,31 +3664,64 @@ async function callback(q:any){
     const id=a.split("|")[1]||"";
     if(!/^[0-9a-f-]{36}$/i.test(id))return sendXtreamSettings(chatId);
     const row:any=await xtreamAccountWithSecret(id);
-    await send(chatId,"بدأت مزامنة دفعة من "+row.name+". لن يتم تكرار المحتوى الموجود.");
+    return send(chatId,
+      "اختر عدد المحتوى لهذه المزامنة من "+row.name+".\n\n"+
+      "العدد هو إجمالي الأفلام + المسلسلات في العملية. الأحجام الكبيرة تعمل كـJob بالخلفية، وTMDb والإعلانات يكملون تلقائيًا.",
+      {inline_keyboard:[
+        [{text:"10",callback_data:"xtream_sync_run|"+id+"|10"},{text:"50",callback_data:"xtream_sync_run|"+id+"|50"},{text:"100",callback_data:"xtream_sync_run|"+id+"|100"}],
+        [{text:"500",callback_data:"xtream_sync_run|"+id+"|500"},{text:"1000",callback_data:"xtream_sync_run|"+id+"|1000"}],
+        [{text:"حالة المزامنة",callback_data:"xtream_sync_status|"+id},{text:"رجوع",callback_data:"xtream_settings"}]
+      ]}
+    );
+  }
+
+  if(a.startsWith("xtream_sync_run|")){
+    if(admin.role!=="owner")return send(chatId,"مزامنة Xtream متاحة للمالك فقط.");
+    const parts=a.split("|");
+    const id=parts[1]||"",size=Number(parts[2]||0);
+    if(!/^[0-9a-f-]{36}$/i.test(id)||![10,50,100,500,1000].includes(size))return sendXtreamSettings(chatId);
     try{
-      const result:any=await syncXtreamBatch(id,userId);
-      const details=result?.details||{};
-      await adminLog(userId,"xtream_sync_batch","settings",undefined,id,result);
-      const buttons:any[][]=[];
-      if(!details.cycle_complete)buttons.push([{text:"متابعة مزامنة Xtream",callback_data:"xtream_sync|"+id}]);
-      buttons.push([{text:"مزامنة معلومات TMDb",callback_data:"tmdb_sync_content"}]);
-      buttons.push([{text:"رجوع إلى Xtream",callback_data:"xtream_settings"}]);
-      const mc=Number(details?.next_cursor?.movie||0),sc=Number(details?.next_cursor?.series||0);
-      const mt=Number(details?.total_movies||0),st=Number(details?.total_series||0);
-      const done=mc+sc,total=mt+st;
-      const pct=total?Math.min(100,Math.round(done/total*100)):0;
+      const row:any=await xtreamAccountWithSecret(id);
+      const queued:any=await queueXtreamCatalogJob(id,size,userId);
+      await adminLog(userId,"xtream_sync_job_queue","settings",undefined,id,{requested_items:size,existing:queued.existing,job_id:queued.job?.id});
       return send(chatId,
-        "اكتملت دفعة Xtream.\n"+
-        "هذه الدفعة: "+Number(result.movies_seen||0).toLocaleString("ar-IQ")+" فيلم • "+Number(result.series_seen||0).toLocaleString("ar-IQ")+" مسلسل\n"+
-        "تقدم المصدر: "+done.toLocaleString("ar-IQ")+" / "+total.toLocaleString("ar-IQ")+" ("+pct+"%)\n"+
-        "مصادر تشغيل جديدة: "+Number(result.source_links_created||0).toLocaleString("ar-IQ")+"\n"+
-        "حالة الدورة: "+(details.cycle_complete?"مكتملة":"مستمرة")+"\n\n"+
-        "اضغط «مزامنة معلومات TMDb» لإكمال الوصف والصور والتقييم والتصنيفات للمحتوى الموجود.",
-        {inline_keyboard:buttons}
+        (queued.existing?"توجد عملية مزامنة شغالة لهذا المصدر.\n\n":"تمت إضافة المزامنة للطابور.\n\n")+
+        "المصدر: "+row.name+"\n"+
+        "المطلوب: "+Number(queued.job?.requested_items||size).toLocaleString("ar-IQ")+"\n"+
+        "المعالج حاليًا: "+Number(queued.job?.processed_items||0).toLocaleString("ar-IQ")+"\n\n"+
+        "TMDb يبدأ تلقائيًا على المحتوى الداخل، وقوائم المحتوى الجديد تُرسل لقنوات الأفلام والمسلسلات بالخلفية.",
+        {inline_keyboard:[
+          [{text:"تحديث الحالة",callback_data:"xtream_sync_status|"+id}],
+          [{text:"Xtream",callback_data:"xtream_settings"},{text:"TMDb",callback_data:"tmdb_settings"}]
+        ]}
       );
     }catch(err){
-      return send(chatId,"فشلت مزامنة Xtream.\n"+adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:"xtream_settings"}]]});
+      return send(chatId,"تعذر بدء مزامنة Xtream.\n"+adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:"xtream_settings"}]]});
     }
+  }
+
+  if(a.startsWith("xtream_sync_status|")){
+    if(admin.role!=="owner")return send(chatId,"مزامنة Xtream متاحة للمالك فقط.");
+    const id=a.split("|")[1]||"";
+    if(!/^[0-9a-f-]{36}$/i.test(id))return sendXtreamSettings(chatId);
+    const row:any=await xtreamAccountWithSecret(id);
+    const job:any=await latestXtreamCatalogJob(id);
+    if(!job)return send(chatId,"ماكو مهمة مزامنة سابقة لهذا المصدر.",{inline_keyboard:[[{text:"بدء مزامنة",callback_data:"xtream_sync|"+id},{text:"رجوع",callback_data:"xtream_settings"}]]});
+    const requested=Number(job.requested_items||0),processed=Number(job.processed_items||0);
+    const pct=requested?Math.min(100,Math.round(processed/requested*100)):0;
+    return send(chatId,
+      "حالة مزامنة "+row.name+"\n\n"+
+      "الحالة: "+String(job.status||"—")+"\n"+
+      "التقدم: "+processed.toLocaleString("ar-IQ")+" / "+requested.toLocaleString("ar-IQ")+" ("+pct+"%)\n"+
+      "أفلام: "+Number(job.movies_seen||0).toLocaleString("ar-IQ")+"\n"+
+      "مسلسلات: "+Number(job.series_seen||0).toLocaleString("ar-IQ")+"\n"+
+      "محتوى جديد: "+Number(job.created_items||0).toLocaleString("ar-IQ")+
+      (job.last_error?"\n\nآخر خطأ: "+String(job.last_error).slice(0,300):""),
+      {inline_keyboard:[
+        ...(job.status==="pending"||job.status==="running"?[[{text:"تحديث",callback_data:"xtream_sync_status|"+id}]]:[]),
+        [{text:"مزامنة جديدة",callback_data:"xtream_sync|"+id},{text:"رجوع",callback_data:"xtream_settings"}]
+      ]}
+    );
   }
 
   if(a==="tmdb_sync_content"){
@@ -3696,30 +3729,25 @@ async function callback(q:any){
     const status=await tmdbStatus();
     if(!status.configured){
       return send(chatId,
-        "TMDb غير مربوط بالمشروع الجديد حاليًا.\n\nأضف API Read Access Token أولًا، وبعدها زر المزامنة يكمل معلومات المحتوى الموجود.",
+        "TMDb غير مربوط بالمشروع الجديد حاليًا.\n\nأضف API Read Access Token أولًا، وبعدها المزامنة تعمل تلقائيًا على كل المحتوى الموجود والجديد.",
         {inline_keyboard:[[{text:"ربط TMDb الآن",callback_data:"tmdb_token_set"}],[{text:"رجوع إلى Xtream",callback_data:"xtream_settings"}]]}
       );
     }
-    await send(chatId,"بدأت مزامنة معلومات TMDb للمحتوى الموجود. تتم المطابقة بالاسم والسنة بدون تغيير مصدر الفيديو.");
     try{
-      const result:any=await syncTmdbMetadataBatch(userId);
-      const stats:any=result.stats||{};
-      const pending=Number(stats.movies_pending||0)+Number(stats.series_pending||0);
-      const buttons:any[][]=[];
-      if(pending>0)buttons.push([{text:"متابعة مزامنة TMDb",callback_data:"tmdb_sync_content"}]);
-      buttons.push([{text:"Xtream",callback_data:"xtream_settings"},{text:"TMDb",callback_data:"tmdb_settings"}]);
+      const queued=await enqueuePendingTmdbBacklog(10000);
+      const stats:any=await tmdbEnrichmentStats();
+      const {count:queueCount}=await db.from("metadata_sync_queue").select("id",{count:"exact",head:true}).in("status",["pending","failed","processing"]);
       return send(chatId,
-        "اكتملت دفعة TMDb.\n"+
-        "تم فحص: "+Number(result.processed||0).toLocaleString("ar-IQ")+"\n"+
-        "تمت المطابقة والتحديث: "+Number(result.matched||0).toLocaleString("ar-IQ")+"\n"+
-        "لم تتم مطابقتها تلقائيًا: "+Number(result.not_found||0).toLocaleString("ar-IQ")+"\n"+
-        "أخطاء مؤقتة: "+Number(result.failed||0).toLocaleString("ar-IQ")+"\n"+
-        "المتبقي: "+pending.toLocaleString("ar-IQ")+
-        (Array.isArray(result.examples)&&result.examples.length?"\n\nأمثلة:\n"+result.examples.join("\n"):""),
-        {inline_keyboard:buttons}
+        "تم تجهيز مزامنة TMDb بالخلفية.\n\n"+
+        "تمت مراجعة/إضافة: "+Number(queued||0).toLocaleString("ar-IQ")+"\n"+
+        "بالطابور الآن: "+Number(queueCount||0).toLocaleString("ar-IQ")+"\n"+
+        "مطابق ومحدّث: "+Number((stats.movies_matched||0)+(stats.series_matched||0)).toLocaleString("ar-IQ")+"\n"+
+        "غير مطابق تلقائيًا: "+Number((stats.movies_not_found||0)+(stats.series_not_found||0)).toLocaleString("ar-IQ")+"\n\n"+
+        "العامل الخلفي يكمل الوصف والصور والتقييم والدولة والتصنيفات والمواسم والحلقات بدون ما تحتاج تضغط دفعات صغيرة.",
+        {inline_keyboard:[[{text:"تحديث حالة TMDb",callback_data:"tmdb_settings"}],[{text:"Xtream",callback_data:"xtream_settings"},{text:"القائمة",callback_data:"menu"}]]}
       );
     }catch(err){
-      return send(chatId,"فشلت مزامنة TMDb.\n"+adminErrorText(err),{inline_keyboard:[[{text:"إعدادات TMDb",callback_data:"tmdb_settings"},{text:"رجوع",callback_data:"xtream_settings"}]]});
+      return send(chatId,"فشلت تهيئة مزامنة TMDb.\n"+adminErrorText(err),{inline_keyboard:[[{text:"إعدادات TMDb",callback_data:"tmdb_settings"}]]});
     }
   }
 
@@ -4731,6 +4759,7 @@ async function message(m:any){
     if(!token)return send(chatId,"أرسل Access Token كنص.");
     try{
       const saved=await saveTmdbAccessToken(token);
+      await enqueuePendingTmdbBacklog(10000).catch(()=>0);
       await clearSession(userId);
       await adminLog(userId,"tmdb_connect","settings",undefined,"tmdb",{token_hint:saved.token_hint});
       return sendTmdbSettings(chatId);
@@ -5948,6 +5977,7 @@ Deno.serve(async(req:Request)=>{
       for(let i=0;i<raw.length;i++)bytes[i]=raw.charCodeAt(i);
       return new Response(bytes,{status:200,headers:{...cors,"Content-Type":"image/png","Cache-Control":"public, max-age=31536000, immutable"}});
     }
+    if(action==="pipeline_worker"&&req.method==="POST") return pipelineWorkerTick(req);
     if(action==="catalog"&&req.method==="GET") return catalog();
     if(action==="series_content"&&req.method==="GET") return seriesContent(url);
     if(action==="media_variants"&&req.method==="GET") return publicMediaVariants(url);
