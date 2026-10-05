@@ -406,10 +406,12 @@ async function syncXtreamRefsAndSources(args:{
     for(const item of prepared){
       const entity=canonical.get(item.key);if(!entity)continue;
       const current=existingSources.get(item.externalId);
+      const ext=String(item.raw.container_extension??"").replace(/[^a-zA-Z0-9]/g,"").toLowerCase();
       const payload:any={
         entity_type:"movie",entity_id:entity.id,source_type:"xtream",
         xtream_account_id:account.id,provider_ref_id:existingRefs.get(item.externalId)?.id||null,
-        external_stream_id:item.externalId,container_extension:String(item.raw.container_extension??""),
+        external_stream_id:item.externalId,container_extension:ext,
+        probe_status:"queued",compatibility_mode:ext==="mkv"?"audio_aac":"direct",
         quality:qualityFromName(item.raw.name,item.raw.container_extension),
         country_code:item.countryCode||null,priority:Number(account.priority||50),is_active:true,
         health_status:"unknown",consecutive_failures:0,last_seen_at:now,
@@ -418,13 +420,15 @@ async function syncXtreamRefsAndSources(args:{
       if(current){
         const {error}=await db.from("playback_sources").update(payload).eq("id",current.id);
         if(error)throw error;
+        await queueMediaProbeSource(String(current.id)).catch(()=>false);
       }else{
         sourcesToInsert.push(payload);sourceLinks++;
       }
     }
     if(sourcesToInsert.length){
-      const {error}=await db.from("playback_sources").insert(sourcesToInsert);
+      const {data:createdSources,error}=await db.from("playback_sources").insert(sourcesToInsert).select("id");
       if(error)throw error;
+      for(const source of createdSources??[])await queueMediaProbeSource(String(source.id)).catch(()=>false);
     }
   }
 
@@ -937,7 +941,7 @@ async function processMediaProbeQueue(){
 
   try{
     const {data:source,error:sourceError}=await db.from("playback_sources")
-      .select("id,entity_type,entity_id,xtream_account_id,external_stream_id,container_extension")
+      .select("id,entity_type,entity_id,xtream_account_id,external_stream_id,container_extension,metadata")
       .eq("id",job.playback_source_id).maybeSingle();
     if(sourceError)throw sourceError;
     if(!source)throw new Error("Playback source not found");
