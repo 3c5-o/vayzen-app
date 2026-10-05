@@ -309,6 +309,7 @@ create table if not exists public.content_requests (
   id uuid primary key default gen_random_uuid(),
   request_code text unique not null default ('REQ-' || lpad(nextval('public.request_code_seq')::text, 6, '0')),
   requester_key text not null,
+  user_id uuid references auth.users(id) on delete set null,
   request_type text not null check (request_type in ('movie','series')),
   title text not null check (char_length(btrim(title)) between 1 and 160),
   note text not null default '',
@@ -324,6 +325,7 @@ create table if not exists public.reports (
   id uuid primary key default gen_random_uuid(),
   report_code text unique not null default ('REP-' || lpad(nextval('public.report_code_seq')::text, 6, '0')),
   reporter_key text not null,
+  user_id uuid references auth.users(id) on delete set null,
   entity_type text not null check (entity_type in ('movie','series','episode','other')),
   entity_public_id text not null default '',
   reason text not null,
@@ -333,6 +335,12 @@ create table if not exists public.reports (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.content_requests add column if not exists user_id uuid references auth.users(id) on delete set null;
+alter table public.reports add column if not exists user_id uuid references auth.users(id) on delete set null;
+
+create index if not exists content_requests_user_recent_idx on public.content_requests(user_id,created_at desc) where user_id is not null;
+create index if not exists reports_user_recent_idx on public.reports(user_id,created_at desc) where user_id is not null;
 
 create table if not exists public.admin_logs (
   id uuid primary key default gen_random_uuid(),
@@ -1189,6 +1197,12 @@ values('xtream',jsonb_build_object(
   'series_details_on_demand',true,
   'auto_publish',true,
   'sync_batch_size',100
+))
+on conflict (key) do nothing;
+
+insert into public.app_settings(key,value)
+values('public_app',jsonb_build_object(
+  'url','https://vayzen-gateway-production.up.railway.app'
 ))
 on conflict (key) do nothing;
 
