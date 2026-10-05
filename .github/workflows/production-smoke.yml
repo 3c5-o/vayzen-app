@@ -2,7 +2,9 @@ name: VAYZEN Production Smoke
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - vayzen-full-hardening-20261005
     paths:
       - RELEASE_SMOKE_TRIGGER
   workflow_dispatch:
@@ -13,18 +15,110 @@ permissions:
 jobs:
   production-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    env:
+      API_URL: https://kmhzagrxkdprqlkeqwrc.supabase.co/functions/v1/vayzen-gateway
+      GATEWAY_URL: https://vayzen-gateway-production.up.railway.app
+      MEDIA_WORKER_URL: https://vayzen-media-worker-production.up.railway.app
+      XTREAM_SERIES_ID: cf600a3b-067f-4523-9c09-bf648fa8a39e
+      XTREAM_SERIES_EXPECTED_EPISODES: "30"
+      MKV_MOVIE_ID: 9e4b33ac-88c5-4ebc-9b7e-18c451e8f4ce
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Gateway health and Range load smoke
+      - name: Service health
+        shell: bash
         run: |
-          python scripts/load_test.py \
-            --health "https://vayzen-gateway-production.up.railway.app/health" \
-            --api "https://kmhzagrxkdprqlkeqwrc.supabase.co/functions/v1/vayzen-gateway" \
-            --concurrency 6 \
-            --requests 24 \
-            --range-kb 256 \
-            --timeout 20 \
-            --max-error-rate 0.10 \
-            --max-p95 12
+          set -euo pipefail
+          curl -fsS --max-time 20 "$GATEWAY_URL/health" | tee /tmp/gateway-health.json
+          curl -fsS --max-time 20 "$MEDIA_WORKER_URL/health" | tee /tmp/media-worker-health.json
+          curl -fsS --max-time 20 "$API_URL?health=1" | tee /tmp/edge-health.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          for path in (
+              "/tmp/gateway-health.json",
+              "/tmp/media-worker-health.json",
+              "/tmp/edge-health.json",
+          ):
+              data=json.loads(Path(path).read_text())
+              if not data.get("ok"):
+                  raise SystemExit(f"{path}: ok=false")
+          print("All service health checks: OK")
+          PY
+
+      - name: Xtream full-series integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          api=os.environ["API_URL"]
+          series_id=os.environ["XTREAM_SERIES_ID"]
+          expected=int(os.environ["XTREAM_SERIES_EXPECTED_EPISODES"])
+          url=api+"?"+urllib.parse.urlencode({"action":"series_content","id":series_id})
+          req=urllib.request.Request(url,headers={"User-Agent":"VAYZEN-Preproduction-Smoke/1.0"})
+          with urllib.request.urlopen(req,timeout=30) as res:
+              data=json.loads(res.read().decode("utf-8"))
+          seasons=data.get("seasons") or []
+          episodes=[ep for season in seasons for ep in (season.get("episodes") or [])]
+          state=data.get("ingestion") or data.get("ingestion_status") or {}
+          if len(episodes)!=expected:
+              raise SystemExit(f"Expected {expected} episodes, received {len(episodes)}")
+          missing=[ep.get("id") for ep in episodes if not ep.get("id")]
+          if missing:
+              raise SystemExit("Episode without id detected")
+          print(json.dumps({
+              "series_id":series_id,
+              "seasons":len(seasons),
+              "episodes":len(episodes),
+              "expected":expected,
+              "state":state,
+          },ensure_ascii=False))
+          PY
+
+      - name: MKV AC3 to AAC playback smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          MEDIA_URL="$API_URL?media=movie_video&id=$MKV_MOVIE_ID&source=xtream"
+          EFFECTIVE_URL="$(curl -fLsS --max-time 70 -o /tmp/vayzen-index.m3u8 -w '%{url_effective}' "$MEDIA_URL")"
+          test -s /tmp/vayzen-index.m3u8
+          grep -q '^#EXTM3U' /tmp/vayzen-index.m3u8
+          SEGMENT="$(grep -v '^#' /tmp/vayzen-index.m3u8 | sed '/^[[:space:]]*$/d' | head -n 1)"
+          test -n "$SEGMENT"
+          export EFFECTIVE_URL SEGMENT
+          SEGMENT_URL="$(python - <<'PY'
+          import os
+          from urllib.parse import urljoin
+          print(urljoin(os.environ["EFFECTIVE_URL"],os.environ["SEGMENT"]))
+          PY
+          )"
+          curl -fLsS --max-time 70 -o /tmp/vayzen-segment.ts "$SEGMENT_URL"
+          test -s /tmp/vayzen-segment.ts
+          ffprobe -v error -select_streams a:0             -show_entries stream=codec_name,channels             -of json /tmp/vayzen-segment.ts > /tmp/audio.json
+          cat /tmp/audio.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path("/tmp/audio.json").read_text())
+          streams=data.get("streams") or []
+          if not streams:
+              raise SystemExit("No audio stream found in compatibility HLS segment")
+          codec=str(streams[0].get("codec_name") or "").lower()
+          channels=int(streams[0].get("channels") or 0)
+          if codec!="aac":
+              raise SystemExit(f"Expected AAC compatibility audio, got {codec!r}")
+          if channels<1:
+              raise SystemExit("AAC stream has no audio channels")
+          print(f"MKV compatibility audio: OK ({codec}, {channels} channels)")
+          PY
+
+      - name: Gateway Range load smoke
+        run: |
+          python scripts/load_test.py             --health "$GATEWAY_URL/health"             --api "$API_URL"             --concurrency 6             --requests 24             --range-kb 256             --timeout 20             --max-error-rate 0.10             --max-p95 12
