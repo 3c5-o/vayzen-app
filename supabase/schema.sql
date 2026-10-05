@@ -931,6 +931,12 @@ create unique index if not exists content_provider_refs_unique_idx
     external_id
   );
 
+alter table public.content_provider_refs
+  drop constraint if exists content_provider_refs_upsert_unique;
+alter table public.content_provider_refs
+  add constraint content_provider_refs_upsert_unique
+  unique(provider_type,provider_account_id,entity_type,external_id);
+
 create index if not exists content_provider_refs_entity_idx
   on public.content_provider_refs(entity_type,entity_id,is_active);
 
@@ -990,6 +996,12 @@ alter table public.playback_sources add constraint playback_sources_compatibilit
 create unique index if not exists playback_sources_xtream_unique_idx
   on public.playback_sources(xtream_account_id,entity_type,external_stream_id)
   where source_type='xtream';
+
+alter table public.playback_sources
+  drop constraint if exists playback_sources_xtream_upsert_unique;
+alter table public.playback_sources
+  add constraint playback_sources_xtream_upsert_unique
+  unique(xtream_account_id,entity_type,external_stream_id);
 
 create unique index if not exists playback_sources_telegram_unique_idx
   on public.playback_sources(telegram_asset_id)
