@@ -587,10 +587,18 @@ function tmdbMap(type:"movie"|"series",bundle:any){
   const genres=(Array.isArray(ar.genres)&&ar.genres.length?ar.genres:en.genres||[]).map((g:any)=>String(g.name||"").trim()).filter(Boolean).slice(0,12);
   const spoken=Array.isArray(ar.spoken_languages)&&ar.spoken_languages.length?ar.spoken_languages:(en.spoken_languages||[]);
   const lang=String(spoken.find((x:any)=>x.iso_639_1===ar.original_language)?.name||spoken[0]?.name||ar.original_language||en.original_language||"");
-  const countries=(Array.isArray(ar.production_countries)&&ar.production_countries.length?ar.production_countries:en.production_countries||[]).map((x:any)=>String(x.name||"").trim()).filter(Boolean).slice(0,3);
+  const countryRows=(Array.isArray(ar.production_countries)&&ar.production_countries.length?ar.production_countries:en.production_countries||[]);
+  const countries=countryRows.map((x:any)=>String(x.name||"").trim()).filter(Boolean).slice(0,3);
+  const originCodes=(isMovie
+    ?countryRows.map((x:any)=>String(x.iso_3166_1||"").toUpperCase())
+    :(Array.isArray(ar.origin_country)&&ar.origin_country.length?ar.origin_country:en.origin_country||[]).map((x:any)=>String(x||"").toUpperCase())
+  ).filter((x:string)=>/^[A-Z]{2}$/.test(x)).slice(0,6);
+  const primaryCountryCode=originCodes[0]||classifyCountry(...countries);
+  const originalLanguageCode=String(ar.original_language||en.original_language||"").toLowerCase().slice(0,8);
   const overview=String(ar.overview||en.overview||"").trim();
   return {
     title,original_title:original,description:overview,release_year:year,genres,language:lang,country:countries.join(" • "),
+    country_code:primaryCountryCode||null,origin_country_codes:originCodes,original_language_code:originalLanguageCode||null,
     duration_minutes:isMovie?(Number(ar.runtime||en.runtime)||null):null,quality:"",
     external_source:"tmdb",external_id:Number(ar.id||en.id),external_metadata:{primary:ar,fallback:en},
     rating:Number(ar.vote_average||en.vote_average)||null,rating_count:Number(ar.vote_count||en.vote_count)||null,
