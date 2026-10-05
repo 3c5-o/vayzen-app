@@ -21,7 +21,7 @@ jobs:
         run: |
           python scripts/load_test.py \
             --health "https://vayzen-gateway-production.up.railway.app/health" \
-            --api "https://aszcgivlsaldcgocljwe.supabase.co/functions/v1/vayzen-gateway" \
+            --api "https://kmhzagrxkdprqlkeqwrc.supabase.co/functions/v1/vayzen-gateway" \
             --concurrency 6 \
             --requests 24 \
             --range-kb 256 \
