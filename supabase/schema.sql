@@ -81,6 +81,83 @@ alter table public.series
 create index if not exists series_ingestion_status_idx
   on public.series(ingestion_status,status,updated_at desc);
 
+create or replace function public.vayzen_catalog_facets(p_type text)
+returns jsonb
+language plpgsql
+security invoker
+set search_path=public
+as $
+declare
+  result jsonb;
+begin
+  if p_type not in ('movie','series') then
+    raise exception 'invalid catalog type';
+  end if;
+
+  if p_type='movie' then
+    select jsonb_build_object(
+      'genres',coalesce((
+        select jsonb_agg(jsonb_build_object('value',genre,'count',cnt) order by cnt desc,genre)
+        from (
+          select genre,count(*)::int cnt
+          from public.movies m, unnest(m.genres) genre
+          where m.status='published' and btrim(genre)<>''
+          group by genre order by cnt desc,genre limit 40
+        ) g
+      ),'[]'::jsonb),
+      'years',coalesce((
+        select jsonb_agg(jsonb_build_object('value',release_year,'count',cnt) order by release_year desc)
+        from (
+          select release_year,count(*)::int cnt from public.movies
+          where status='published' and release_year is not null
+          group by release_year order by release_year desc limit 150
+        ) y
+      ),'[]'::jsonb),
+      'countries',coalesce((
+        select jsonb_agg(jsonb_build_object('value',country_code,'label',country,'count',cnt) order by cnt desc,country)
+        from (
+          select country_code,max(country) country,count(*)::int cnt from public.movies
+          where status='published' and country_code is not null
+          group by country_code order by cnt desc,country_code limit 80
+        ) c
+      ),'[]'::jsonb)
+    ) into result;
+  else
+    select jsonb_build_object(
+      'genres',coalesce((
+        select jsonb_agg(jsonb_build_object('value',genre,'count',cnt) order by cnt desc,genre)
+        from (
+          select genre,count(*)::int cnt
+          from public.series s, unnest(s.genres) genre
+          where s.status='published' and s.ingestion_status='ready' and btrim(genre)<>''
+          group by genre order by cnt desc,genre limit 40
+        ) g
+      ),'[]'::jsonb),
+      'years',coalesce((
+        select jsonb_agg(jsonb_build_object('value',release_year,'count',cnt) order by release_year desc)
+        from (
+          select release_year,count(*)::int cnt from public.series
+          where status='published' and ingestion_status='ready' and release_year is not null
+          group by release_year order by release_year desc limit 150
+        ) y
+      ),'[]'::jsonb),
+      'countries',coalesce((
+        select jsonb_agg(jsonb_build_object('value',country_code,'label',country,'count',cnt) order by cnt desc,country)
+        from (
+          select country_code,max(country) country,count(*)::int cnt from public.series
+          where status='published' and ingestion_status='ready' and country_code is not null
+          group by country_code order by cnt desc,country_code limit 80
+        ) c
+      ),'[]'::jsonb)
+    ) into result;
+  end if;
+  return result;
+end;
+$;
+
+revoke all on function public.vayzen_catalog_facets(text) from public,anon,authenticated;
+grant execute on function public.vayzen_catalog_facets(text) to service_role;
+
 create table if not exists public.seasons (
   id uuid primary key default gen_random_uuid(),
   series_id uuid not null references public.series(id) on delete cascade,
