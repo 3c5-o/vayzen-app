@@ -306,6 +306,15 @@ async function syncXtreamRefsAndSources(args:{
   const canonicalResult=await createCanonicalRows(table,entityType,prepared,autoPublish);
   const canonical=canonicalResult.map;
   const createdKeys=canonicalResult.createdKeys;
+  if(autoPublish){
+    const ids=[...new Set([...canonical.values()].map((x:any)=>String(x.id)).filter(Boolean))];
+    if(ids.length){
+      const {error:publishExistingError}=await db.from(table)
+        .update({status:"published",updated_at:new Date().toISOString()})
+        .in("id",ids).eq("status","draft");
+      if(publishExistingError)throw publishExistingError;
+    }
+  }
   const externalIds=[...new Set(prepared.map(x=>x.externalId))];
 
   const existingRefs=new Map<string,any>();
