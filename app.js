@@ -528,20 +528,128 @@ function renderMyList(){
   bindCards(grid);renderWatchHistory();
 }
 
+
+function catalogParams(type,page){
+  const movie=type==="movie";
+  return {
+    type,
+    page:String(page),
+    limit:"40",
+    genre:String(movie?state.movieGenre:state.seriesGenre),
+    year:String(movie?state.movieYear:state.seriesYear),
+    country:String(movie?state.movieCountry:state.seriesCountry),
+    sort:String(movie?state.movieSort:state.seriesSort)
+  };
+}
+async function loadCatalogType(type,{reset=false}={}){
+  if(state.catalogLoading[type])return;
+  state.catalogLoading[type]=true;
+  const movie=type==="movie";
+  const nextPage=reset?1:(movie?state.moviePage:state.seriesPage)+1;
+  const grid=$(movie?"#moviesGrid":"#seriesGrid");
+  if(reset&&grid)grid.innerHTML=skeletonCards(8);
+  try{
+    const j=await rawApi("catalog_page",{params:catalogParams(type,nextPage)});
+    const items=Array.isArray(j.items)?j.items:[];
+    mergeCatalogCache(type,items);
+    const listKey=movie?"moviePageItems":"seriesPageItems";
+    const current=reset?[]:state[listKey];
+    const map=new Map(current.map(x=>[x.id,x]));
+    for(const item of items)map.set(item.id,item);
+    state[listKey]=[...map.values()];
+    if(movie){
+      state.moviePage=Number(j.page||nextPage);
+      state.movieTotal=Number(j.total||0);
+      state.movieHasMore=Boolean(j.has_more);
+    }else{
+      state.seriesPage=Number(j.page||nextPage);
+      state.seriesTotal=Number(j.total||0);
+      state.seriesHasMore=Boolean(j.has_more);
+    }
+  }catch(e){
+    showToast("تعذر تحميل "+(movie?"الأفلام":"المسلسلات"));
+  }finally{
+    state.catalogLoading[type]=false;
+    renderCatalog();
+  }
+}
+async function loadCatalogFacets(type){
+  try{
+    const j=await rawApi("catalog_facets",{params:{type}});
+    state.facets[type]=j.facets||{genres:[],years:[],countries:[]};
+  }catch{
+    state.facets[type]={genres:[],years:[],countries:[]};
+  }
+}
+let searchRequestSeq=0;
+async function runSearch({reset=false}={}){
+  const q=state.query.trim();
+  if(q.length<2){
+    state.searchResults=[];state.searchTotal=0;state.searchHasMore=false;state.searchPage=1;
+    renderCatalog();return;
+  }
+  if(state.catalogLoading.search)return;
+  state.catalogLoading.search=true;
+  const seq=++searchRequestSeq;
+  const page=reset?1:state.searchPage+1;
+  if(reset)$("#searchResultsGrid").innerHTML=skeletonCards(8);
+  try{
+    const j=await rawApi("search_catalog",{params:{q,page:String(page),limit:"20"}});
+    if(seq!==searchRequestSeq)return;
+    const rows=Array.isArray(j.items)?j.items:[];
+    for(const row of rows)if(row?.item?.id)mergeCatalogCache(row.type,[row.item]);
+    const current=reset?[]:state.searchResults;
+    const map=new Map(current.map(x=>[x.type+":"+x.item.id,x]));
+    for(const row of rows)if(row?.item?.id)map.set(row.type+":"+row.item.id,row);
+    state.searchResults=[...map.values()];
+    state.searchPage=Number(j.page||page);
+    state.searchTotal=Number(j.total||0);
+    state.searchHasMore=Boolean(j.has_more);
+  }catch{
+    if(reset)state.searchResults=[];
+    showToast("تعذر البحث حاليًا");
+  }finally{
+    if(seq===searchRequestSeq){
+      state.catalogLoading.search=false;
+      renderCatalog();
+    }
+  }
+}
 async function loadCatalog(){
   const skeleton=skeletonCards(8);
-  ["latestMovies","latestSeries","recommendedRail","trendingRail","topRatedRail","moviesGrid","seriesGrid"].forEach(id=>{const el=$("#"+id);if(el)el.innerHTML=skeleton});
+  ["latestMovies","latestSeries","recommendedRail","trendingRail","topRatedRail","moviesGrid","seriesGrid"].forEach(id=>{
+    const el=$("#"+id);if(el)el.innerHTML=skeleton;
+  });
   try{
-    const j=await rawApi("catalog");
-    state.movies=j.movies||[];state.series=j.series||[];
+    const [home,movies,series]=await Promise.all([
+      rawApi("catalog"),
+      rawApi("catalog_page",{params:catalogParams("movie",1)}),
+      rawApi("catalog_page",{params:catalogParams("series",1)})
+    ]);
+    state.movies=[];state.series=[];
+    mergeCatalogCache("movie",home.movies||[]);
+    mergeCatalogCache("series",home.series||[]);
+    mergeCatalogCache("movie",movies.items||[]);
+    mergeCatalogCache("series",series.items||[]);
+    state.moviePageItems=movies.items||[];
+    state.seriesPageItems=series.items||[];
+    state.moviePage=1;state.seriesPage=1;
+    state.movieTotal=Number(movies.total??home.totals?.movies??0);
+    state.seriesTotal=Number(series.total??home.totals?.series??0);
+    state.movieHasMore=Boolean(movies.has_more);
+    state.seriesHasMore=Boolean(series.has_more);
+    await Promise.all([loadCatalogFacets("movie"),loadCatalogFacets("series")]);
     renderCatalog();
   }catch(e){
     showToast("تعذر تحميل المحتوى");
     $("#moviesGrid").innerHTML='<div class="empty-state">تعذر تحميل المحتوى حاليًا.</div>';
     $("#seriesGrid").innerHTML='<div class="empty-state">تعذر تحميل المحتوى حاليًا.</div>';
-    ["recommendedRail","trendingRail","topRatedRail","latestMovies","latestSeries"].forEach(id=>{const el=$("#"+id);if(el)el.innerHTML='<div class="empty-card">تعذر تحميل المحتوى.</div>'});
+    ["recommendedRail","trendingRail","topRatedRail","latestMovies","latestSeries"].forEach(id=>{
+      const el=$("#"+id);if(el)el.innerHTML='<div class="empty-card">تعذر تحميل المحتوى.</div>';
+    });
   }
 }
+
 async function loadUserState(){
   if(!state.session?.access_token){state.user=null;state.favorites=[];state.progress=[];state.watchHistory=[];renderAccount();renderCatalog();return}
   try{
