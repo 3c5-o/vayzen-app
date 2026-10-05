@@ -6,7 +6,7 @@ const GUEST_PROGRESS_KEY="vayzen.guest.progress";
 
 const state={
   movies:[],series:[],favorites:[],progress:[],watchHistory:[],user:null,session:null,
-  query:"",movieGenre:"",seriesGenre:"",movieYear:"",seriesYear:"",currentPage:"home",detail:null,detailVariant:"",player:null,nextEpisode:null,searchReturnPage:"home",
+  query:"",movieGenre:"",seriesGenre:"",movieYear:"",seriesYear:"",movieCountry:"",seriesCountry:"",currentPage:"home",detail:null,detailVariant:"",player:null,nextEpisode:null,searchReturnPage:"home",
   heroItems:[],heroIndex:0,
   prefs:{autoplayNext:true,saveProgress:true}
 };
@@ -139,10 +139,25 @@ function mixedCatalog(){
     ...state.series.map(item=>({item,type:"series"}))
   ];
 }
+const COUNTRY_LABELS={
+  IQ:"عراقي",TR:"تركي",SY:"سوري",EG:"مصري",LB:"لبناني",SA:"سعودي",KW:"كويتي",AE:"إماراتي",
+  QA:"قطري",BH:"بحريني",OM:"عماني",JO:"أردني",PS:"فلسطيني",MA:"مغربي",DZ:"جزائري",TN:"تونسي",
+  KR:"كوري",JP:"ياباني",IN:"هندي",US:"أمريكي",GB:"بريطاني",ES:"إسباني",FR:"فرنسي",DE:"ألماني",
+  IT:"إيطالي",MX:"مكسيكي",CN:"صيني"
+};
+function countryKey(item){
+  const code=String(item?.country_code||"").trim().toUpperCase();
+  if(code)return code;
+  return String(item?.country||"").trim();
+}
+function countryLabel(itemOrKey){
+  const key=typeof itemOrKey==="string"?itemOrKey:countryKey(itemOrKey);
+  return COUNTRY_LABELS[key]||String(typeof itemOrKey==="string"?key:(itemOrKey?.country||key)||"");
+}
 function contentMatches(item,q){
   if(!q)return true;
   const t=q.toLowerCase();
-  return [item.title,item.original_title,item.description,...genreList(item),item.release_year,item.country,item.language]
+  return [item.title,item.original_title,item.description,...genreList(item),item.release_year,item.country,item.country_code,item.language]
     .filter(Boolean).join(" ").toLowerCase().includes(t);
 }
 function skeletonCards(n=6){
@@ -201,11 +216,14 @@ function bindCards(root=document){
 
 function renderCatalog(){
   const q=state.query.trim().toLowerCase();
-  const filter=(arr,genre,year)=>arr.filter(x=>
-    contentMatches(x,q)&&(!genre||genreList(x).includes(genre))&&(!year||String(x.release_year||"")===String(year))
+  const filter=(arr,genre,year,country)=>arr.filter(x=>
+    contentMatches(x,q)&&
+    (!genre||genreList(x).includes(genre))&&
+    (!year||String(x.release_year||"")===String(year))&&
+    (!country||countryKey(x)===country)
   );
-  const movies=filter(state.movies,state.movieGenre,state.movieYear);
-  const series=filter(state.series,state.seriesGenre,state.seriesYear);
+  const movies=filter(state.movies,state.movieGenre,state.movieYear,state.movieCountry);
+  const series=filter(state.series,state.seriesGenre,state.seriesYear,state.seriesCountry);
   const mixed=mixedCatalog();
   const recent=[...mixed].sort((a,b)=>createdValue(b.item)-createdValue(a.item));
   const trending=[...mixed].sort((a,b)=>(Number(b.item.view_count)||0)-(Number(a.item.view_count)||0)||createdValue(b.item)-createdValue(a.item));
@@ -229,6 +247,8 @@ function renderCatalog(){
 
   renderGenreChips("movieChips",state.movies,"movieGenre");
   renderGenreChips("seriesChips",state.series,"seriesGenre");
+  renderCountryFilter("movieCountryFilter",state.movies,"movieCountry");
+  renderCountryFilter("seriesCountryFilter",state.series,"seriesCountry");
   renderYearFilter("movieYearFilter",state.movies,"movieYear");
   renderYearFilter("seriesYearFilter",state.series,"seriesYear");
   renderHomeGenres();
@@ -263,6 +283,16 @@ function renderGenreChips(id,items,key){
   $("#"+id).innerHTML=`<button class="chip ${!state[key]?"active":""}" data-genre="">الكل</button>`+
     genres.map(g=>`<button class="chip ${state[key]===g?"active":""}" data-genre="${esc(g)}">${esc(g)}</button>`).join("");
   $("#"+id).querySelectorAll(".chip").forEach(b=>b.onclick=()=>{state[key]=b.dataset.genre||"";renderCatalog()});
+}
+function renderCountryFilter(id,items,key){
+  const el=$("#"+id);if(!el)return;
+  const options=[...new Map(items.map(item=>[countryKey(item),countryLabel(item)]).filter(([value])=>Boolean(value))).entries()]
+    .sort((a,b)=>String(a[1]).localeCompare(String(b[1]),"ar"));
+  const current=String(state[key]||"");
+  const html='<option value="">كل الدول</option>'+options.map(([value,label])=>`<option value="${esc(value)}">${esc(label)}</option>`).join("");
+  if(el.innerHTML!==html)el.innerHTML=html;
+  el.value=current;
+  el.onchange=()=>{state[key]=el.value||"";renderCatalog()};
 }
 function renderYearFilter(id,items,key){
   const el=$("#"+id);if(!el)return;
