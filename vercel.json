@@ -5,7 +5,7 @@
   "rewrites": [
     {
       "source": "/api",
-      "destination": "https://aszcgivlsaldcgocljwe.supabase.co/functions/v1/vayzen-gateway"
+      "destination": "https://kmhzagrxkdprqlkeqwrc.supabase.co/functions/v1/vayzen-gateway"
     }
   ]
 }
