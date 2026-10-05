@@ -19,6 +19,9 @@ from telethon import TelegramClient, utils
 API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+EDGE_SHARED_SECRET = os.environ.get("VAYZEN_EDGE_SHARED_SECRET", "").encode()
+TELEGRAM_WEBHOOK_URL = os.environ.get("TELEGRAM_WEBHOOK_URL", "").strip()
+TELEGRAM_BOT_SECRET = os.environ.get("TELEGRAM_BOT_SECRET", "").strip()
 STREAM_SIGNING_SECRET = os.environ.get("STREAM_SIGNING_SECRET", "").encode()
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 VAYZEN_API_TARGET = os.environ.get("VAYZEN_API_TARGET", "").rstrip("/")
@@ -65,10 +68,32 @@ async def refresh_channel_cache():
         pass
 
 
+async def configure_bot_webhook():
+    if not TELEGRAM_WEBHOOK_URL or not TELEGRAM_BOT_SECRET:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as http:
+            response = await http.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
+                json={
+                    "url": TELEGRAM_WEBHOOK_URL,
+                    "secret_token": TELEGRAM_BOT_SECRET,
+                    "allowed_updates": ["message", "callback_query"],
+                    "drop_pending_updates": False,
+                },
+            )
+            payload = response.json()
+            if not response.is_success or not payload.get("ok"):
+                print("Telegram webhook configuration failed:", payload)
+    except Exception as exc:
+        print("Telegram webhook configuration error:", repr(exc))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await client.start(bot_token=BOT_TOKEN)
     await refresh_channel_cache()
+    await configure_bot_webhook()
     yield
     await client.disconnect()
 
@@ -78,10 +103,83 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "HEAD", "OPTIONS"],
+    allow_methods=["GET", "HEAD", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["Content-Length", "Content-Range", "Accept-Ranges", "Content-Type"],
 )
+  
+
+def verify_edge_bridge(request: Request):
+    if not EDGE_SHARED_SECRET:
+        raise HTTPException(status_code=503, detail="Edge bridge is not configured")
+    supplied = (request.headers.get("x-vayzen-edge-secret") or "").encode()
+    if not hmac.compare_digest(EDGE_SHARED_SECRET, supplied):
+        raise HTTPException(status_code=401, detail="Invalid edge bridge secret")
+
+
+@app.post("/telegram/{method}")
+async def telegram_api_proxy(method: str, request: Request):
+    verify_edge_bridge(request)
+    if not re.fullmatch(r"[A-Za-z0-9_]+", method):
+        raise HTTPException(status_code=400, detail="Invalid Telegram method")
+    raw = await request.body()
+    headers = {}
+    content_type = request.headers.get("content-type")
+    if content_type:
+        headers["Content-Type"] = content_type
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as http:
+        upstream = await http.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+            content=raw,
+            headers=headers,
+        )
+    out_headers = {}
+    if upstream.headers.get("content-type"):
+        out_headers["Content-Type"] = upstream.headers["content-type"]
+    return Response(content=upstream.content, status_code=upstream.status_code, headers=out_headers)
+
+
+@app.api_route("/telegram/file/{file_path:path}", methods=["GET", "HEAD"])
+async def telegram_file_proxy(file_path: str, request: Request):
+    verify_edge_bridge(request)
+    if not file_path or ".." in file_path:
+        raise HTTPException(status_code=400, detail="Invalid Telegram file path")
+    http = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=15.0), follow_redirects=True)
+    try:
+        upstream_request = http.build_request(
+            request.method,
+            f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}",
+        )
+        upstream = await http.send(upstream_request, stream=True)
+    except Exception as exc:
+        await http.aclose()
+        raise HTTPException(status_code=502, detail="Telegram file proxy failed") from exc
+
+    out_headers = {
+        "Cache-Control": "private, max-age=300",
+        "X-Content-Type-Options": "nosniff",
+    }
+    for key in ("content-length", "content-range", "accept-ranges", "content-disposition"):
+        value = upstream.headers.get(key)
+        if value:
+            out_headers[key.title()] = value
+    content_type = upstream.headers.get("content-type") or "application/octet-stream"
+
+    if request.method == "HEAD":
+        status = upstream.status_code
+        await upstream.aclose()
+        await http.aclose()
+        return Response(status_code=status, headers=out_headers, media_type=content_type)
+
+    async def body():
+        try:
+            async for chunk in upstream.aiter_bytes():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await http.aclose()
+
+    return StreamingResponse(body(), status_code=upstream.status_code, headers=out_headers, media_type=content_type)
 
 
 def parse_range(value: str | None, total: int):
