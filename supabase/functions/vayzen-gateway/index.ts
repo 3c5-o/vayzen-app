@@ -799,8 +799,9 @@ async function processMetadataSyncQueue(limitOverride?:number){
       const fields=type==="movie"
         ?"id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,duration_minutes,rating,rating_count,external_source,external_id,external_metadata,release_date,status"
         :"id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,rating,rating_count,external_source,external_id,external_metadata,first_air_date,status,ingestion_status";
-      const {data:row,error:rowError}=await db.from(table).select(fields).eq("id",item.entity_id).maybeSingle();
+      const {data:rowData,error:rowError}=await db.from(table).select(fields).eq("id",item.entity_id).maybeSingle();
       if(rowError)throw rowError;
+      const row:any=rowData;
       if(!row){
         await db.from("metadata_sync_queue").update({
           status:"permanent_failed",completed_at:new Date().toISOString(),updated_at:new Date().toISOString(),
@@ -981,10 +982,10 @@ async function syncXtreamBatch(accountId:string,startedBy:number,batchOverride?:
     const seriesBatch=snapshot.series.slice(seriesCursor,seriesCursor+seriesTake);
     const movieResult=movieBatch.length
       ?await syncXtreamRefsAndSources({account,entityType:"movie",items:movieBatch,categories:movieCategories,autoPublish:settings.auto_publish,parentCatalogJobId})
-      :{processed:0,createdItems:0,mergedItems:0,sourceLinks:0};
+      :{processed:0,createdItems:0,mergedItems:0,sourceLinks:0,entities:[],createdEntities:[],seriesJobsQueued:0};
     const seriesResult=seriesBatch.length
       ?await syncXtreamRefsAndSources({account,entityType:"series",items:seriesBatch,categories:seriesCategories,autoPublish:false,parentCatalogJobId})
-      :{processed:0,createdItems:0,mergedItems:0,sourceLinks:0};
+      :{processed:0,createdItems:0,mergedItems:0,sourceLinks:0,entities:[],createdEntities:[],seriesJobsQueued:0};
 
     movieCursor+=movieTake;seriesCursor+=seriesTake;
     const movieDone=!movieEnabled||movieCursor>=snapshot.movies.length;
@@ -6010,7 +6011,7 @@ async function ingestXtreamSeriesJob(job:any){
   if(!seriesId||!accountId||!externalSeriesId)throw new Error("Series ingest job is incomplete");
 
   const {data:seriesRow,error:seriesError}=await db.from("series")
-    .select("id,public_id,title,release_year,status,ingestion_status,external_metadata")
+    .select("id,public_id,title,release_year,status,ingestion_status,external_metadata,ready_at")
     .eq("id",seriesId).maybeSingle();
   if(seriesError)throw seriesError;
   if(!seriesRow)throw new Error("Series not found");
@@ -6193,7 +6194,7 @@ async function ingestXtreamSeriesJob(job:any){
 async function processSeriesIngestJob(){
   const now=new Date().toISOString();
   const {data:job,error}=await db.from("series_ingest_jobs")
-    .select("id,series_id,provider_account_id,provider_ref_id,external_series_id,parent_catalog_job_id,status,attempts,max_attempts,priority")
+    .select("id,series_id,provider_account_id,provider_ref_id,external_series_id,parent_catalog_job_id,status,attempts,max_attempts,priority,started_at")
     .in("status",["queued","partial","failed"])
     .is("completed_at",null)
     .lte("next_attempt_at",now)
