@@ -938,6 +938,8 @@ let playerRetryCount=0;
 let playerRetryTimer=0;
 let nextCountdownTimer=0;
 let nextCountdownTick=0;
+let hlsInstance=null;
+let hlsRecoveryCount=0;
 
 function formatClock(value){
   const n=Math.max(0,Math.floor(Number(value)||0));
@@ -1013,18 +1015,20 @@ async function loadPlayerQualities(o){
       const name=String(v.variant||"");
       if(!name||seen.has(name))continue;
       seen.add(name);
-      unique.push({variant:name,label:String(v.label||name)});
+      unique.push({variant:name,label:String(v.label||name),delivery:String(v.delivery||"direct"),fallback_delivery:String(v.fallback_delivery||v.delivery||"direct"),mime_type:String(v.mime_type||""),compatibility_mode:String(v.compatibility_mode||"direct"),fallback_compatibility_mode:String(v.fallback_compatibility_mode||v.compatibility_mode||"direct")});
     }
     if(!unique.length){
       select.innerHTML='<option value="default">تلقائي</option>';
       return;
     }
     select.innerHTML=unique.map(v=>"<option value=\""+esc(v.variant)+"\">"+esc(v.variant==="default"?(o.quality||v.label||"افتراضي"):v.label)+"</option>").join("");
+    o.mediaVariants=unique;
     const names=unique.map(v=>v.variant);
     const wanted=o.qualityVariant&&names.includes(o.qualityVariant)?o.qualityVariant:(names.includes("default")?"default":names[0]);
     if(wanted)select.value=wanted;
     select.classList.toggle("hidden",unique.length<=1);
   }catch{
+    o.mediaVariants=[];
     select.innerHTML='<option value="default">تلقائي</option>';
     select.classList.add("hidden");
   }
