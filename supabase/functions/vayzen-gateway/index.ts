@@ -4554,9 +4554,138 @@ async function catalog(){
   return json({ok:true,movies:m.data??[],series:s.data??[]});
 }
 
+function xtreamEpisodeDurationMinutes(raw:any){
+  const seconds=Number(raw?.info?.duration_secs??raw?.duration_secs??0);
+  if(Number.isFinite(seconds)&&seconds>0)return Math.max(1,Math.round(seconds/60));
+  const text=String(raw?.info?.duration??raw?.duration??"").trim();
+  const parts=text.split(":").map(Number);
+  if(parts.length>=2&&parts.every(Number.isFinite)){
+    const secs=parts.length===3?parts[0]*3600+parts[1]*60+parts[2]:parts[0]*60+parts[1];
+    if(secs>0)return Math.max(1,Math.round(secs/60));
+  }
+  return null;
+}
+
+function xtreamEpisodeAirDate(raw:any){
+  for(const value of [raw?.info?.releasedate,raw?.info?.air_date,raw?.release_date,raw?.added]){
+    const text=String(value??"").trim();
+    if(/^\d{4}-\d{2}-\d{2}/.test(text))return text.slice(0,10);
+  }
+  return null;
+}
+
+async function syncXtreamSeriesEpisodes(seriesId:string){
+  const {data:seriesRow,error:seriesError}=await db.from("series")
+    .select("id,status,external_metadata").eq("id",seriesId).maybeSingle();
+  if(seriesError)throw seriesError;
+  if(!seriesRow||seriesRow.status!=="published")return {synced:false,episodes:0};
+
+  const lastSync=Date.parse(String((seriesRow.external_metadata as any)?.xtream_episode_sync_at||""));
+  if(Number.isFinite(lastSync)&&Date.now()-lastSync<30*60_000)return {synced:false,episodes:0,cached:true};
+
+  const {data:refs,error:refsError}=await db.from("content_provider_refs")
+    .select("id,provider_account_id,external_id")
+    .eq("provider_type","xtream").eq("entity_type","series").eq("entity_id",seriesId).eq("is_active",true)
+    .order("last_seen_at",{ascending:false}).limit(5);
+  if(refsError){
+    if(String(refsError.message||"").includes("content_provider_refs"))return {synced:false,episodes:0};
+    throw refsError;
+  }
+  if(!(refs??[]).length)return {synced:false,episodes:0};
+
+  const now=new Date().toISOString();
+  let touched=0;
+  for(const ref of refs??[]){
+    const accountId=String(ref.provider_account_id||"");
+    if(!accountId)continue;
+    let account:any;
+    try{account=await xtreamAccountWithSecret(accountId);}catch{continue;}
+    if(!account?.is_enabled||account.status==="disabled"||account.status==="down")continue;
+    let credentials:XtreamCredentials;
+    try{credentials=await xtreamCredentials(account);}catch{continue;}
+    let details:any;
+    try{
+      details=await xtreamRequest(credentials,"get_series_info",{series_id:String(ref.external_id)},30000);
+    }catch{
+      continue;
+    }
+    const seasonGroups=details?.episodes&&typeof details.episodes==="object"?details.episodes:{};
+    for(const [seasonKey,episodeValue] of Object.entries(seasonGroups)){
+      const seasonNumber=Math.max(1,Number.parseInt(String(seasonKey),10)||1);
+      let {data:season,error:seasonError}=await db.from("seasons")
+        .select("id,season_number").eq("series_id",seriesId).eq("season_number",seasonNumber).maybeSingle();
+      if(seasonError)throw seasonError;
+      if(!season){
+        const {data:created,error:createSeasonError}=await db.from("seasons").insert({
+          series_id:seriesId,season_number:seasonNumber,title:"الموسم "+seasonNumber,status:"published",
+          external_source:"xtream",external_metadata:{created_by_xtream:true}
+        }).select("id,season_number").single();
+        if(createSeasonError)throw createSeasonError;
+        season=created;
+      }
+      const episodes=Array.isArray(episodeValue)?episodeValue:[];
+      for(let index=0;index<episodes.length;index++){
+        const raw:any=episodes[index]||{};
+        const episodeNumber=Math.max(1,Number(raw.episode_num??raw.episode_number??raw.info?.episode_num??index+1)||index+1);
+        let {data:episode,error:episodeError}=await db.from("episodes")
+          .select("id,episode_number,status").eq("season_id",season.id).eq("episode_number",episodeNumber).maybeSingle();
+        if(episodeError)throw episodeError;
+        const title=String(raw.title??raw.info?.name??("الحلقة "+episodeNumber)).trim().slice(0,240);
+        const description=String(raw.info?.plot??raw.info?.description??"").trim().slice(0,5000);
+        const quality=qualityFromName(raw.title,raw.container_extension,raw.info?.video);
+        const externalEpisodeId=String(raw.id??raw.stream_id??"").trim();
+        if(!episode){
+          const {data:created,error:createEpisodeError}=await db.from("episodes").insert({
+            season_id:season.id,episode_number:episodeNumber,title,description,
+            duration_minutes:xtreamEpisodeDurationMinutes(raw),quality,status:"published",
+            external_source:"xtream",external_metadata:{xtream_seed:true},
+            air_date:xtreamEpisodeAirDate(raw)
+          }).select("id,episode_number,status").single();
+          if(createEpisodeError)throw createEpisodeError;
+          episode=created;
+        }
+        if(!externalEpisodeId)continue;
+
+        const episodeIdentity=`${seriesId}:s${seasonNumber}:e${episodeNumber}`;
+        const {data:providerRef,error:providerRefError}=await db.from("content_provider_refs").upsert({
+          provider_type:"xtream",provider_account_id:accountId,entity_type:"episode",entity_id:episode.id,
+          external_id:externalEpisodeId,identity_key:episodeIdentity,is_active:true,last_seen_at:now,
+          metadata:{series_external_id:String(ref.external_id),season_number:seasonNumber,episode_number:episodeNumber}
+        },{onConflict:"provider_type,provider_account_id,entity_type,external_id"})
+          .select("id").single();
+        if(providerRefError)throw providerRefError;
+
+        const ext=String(raw.container_extension??"mp4").replace(/[^a-zA-Z0-9]/g,"").toLowerCase()||"mp4";
+        const {error:sourceError}=await db.from("playback_sources").upsert({
+          entity_type:"episode",entity_id:episode.id,source_type:"xtream",
+          provider_ref_id:providerRef.id,xtream_account_id:accountId,
+          external_stream_id:externalEpisodeId,external_series_id:String(ref.external_id),
+          container_extension:ext,quality:quality||normalizeVariant(String(raw.info?.quality??"default")),
+          language:"",priority:Number(account.priority||50),is_active:true,health_status:"unknown",
+          consecutive_failures:0,last_seen_at:now,
+          metadata:{season_number:seasonNumber,episode_number:episodeNumber}
+        },{onConflict:"xtream_account_id,entity_type,external_stream_id"});
+        if(sourceError)throw sourceError;
+        touched++;
+      }
+    }
+  }
+
+  const metadata={
+    ...((seriesRow.external_metadata&&typeof seriesRow.external_metadata==="object")?seriesRow.external_metadata:{}),
+    xtream_episode_sync_at:now,
+    xtream_episode_sources_touched:touched
+  };
+  await db.from("series").update({external_metadata:metadata,updated_at:now}).eq("id",seriesId);
+  return {synced:true,episodes:touched};
+}
+
 async function seriesContent(url:URL){
   const id=String(url.searchParams.get("id")||"");
   if(!/^[0-9a-f-]{36}$/i.test(id))return json({error:"invalid id"},400);
+  try{await syncXtreamSeriesEpisodes(id);}catch(error){
+    await systemLog("warning","Xtream series episode sync failed",{series_id:id,error:adminErrorText(error)});
+  }
   const {data:seasons,error}=await db.from("seasons").select("id,season_number,title").eq("series_id",id).eq("status","published").order("season_number",{ascending:true});
   if(error)throw error;
   const out=[];
@@ -4569,11 +4698,27 @@ async function seriesContent(url:URL){
       ?await db.from("media_assets").select("entity_id,variant,file_size").eq("entity_type","episode").eq("kind","video").in("entity_id",ids)
       :{data:[] as any[],error:null};
     if(assetError)throw assetError;
+    let xtreamAssets:any[]=[];
+    if(ids.length){
+      const xtreamResult=await db.from("playback_sources")
+        .select("entity_id,quality,container_extension,health_status")
+        .eq("entity_type","episode").eq("source_type","xtream").eq("is_active",true).in("entity_id",ids)
+        .neq("health_status","down");
+      if(!xtreamResult.error)xtreamAssets=xtreamResult.data??[];
+    }
     const qmap=new Map<string,any[]>();
     for(const a of assets??[]){
       const list=qmap.get(String(a.entity_id))||[];
-      list.push({variant:normalizeVariant(a.variant),label:variantLabel(a.variant),file_size:Number(a.file_size||0)});
+      list.push({variant:normalizeVariant(a.variant),label:variantLabel(a.variant),file_size:Number(a.file_size||0),source_count:1});
       qmap.set(String(a.entity_id),list);
+    }
+    for(const a of xtreamAssets){
+      const key=String(a.entity_id),variant=normalizeVariant(a.quality||"default");
+      const list=qmap.get(key)||[];
+      const existing=list.find(x=>x.variant===variant);
+      if(existing)existing.source_count=Number(existing.source_count||1)+1;
+      else list.push({variant,label:variantLabel(variant),file_size:0,source_count:1});
+      qmap.set(key,list);
     }
     const enriched=eps.map((ep:any)=>({
       ...ep,
