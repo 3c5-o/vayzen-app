@@ -158,6 +158,47 @@ $;
 revoke all on function public.vayzen_catalog_facets(text) from public,anon,authenticated;
 grant execute on function public.vayzen_catalog_facets(text) to service_role;
 
+create or replace function public.vayzen_series_playback_counts(p_series_id uuid)
+returns table(seasons bigint, episodes bigint, playable bigint)
+language sql
+security invoker
+set search_path=public
+as $
+  with s as (
+    select id from public.seasons
+    where series_id=p_series_id and status='published'
+  ),
+  e as (
+    select ep.id
+    from public.episodes ep
+    join s on s.id=ep.season_id
+    where ep.status='published'
+  )
+  select
+    (select count(*) from s)::bigint,
+    (select count(*) from e)::bigint,
+    (
+      select count(*)::bigint
+      from e
+      where exists (
+        select 1 from public.media_assets ma
+        where ma.entity_type='episode'
+          and ma.entity_id=e.id
+          and ma.kind='video'
+      )
+      or exists (
+        select 1 from public.playback_sources ps
+        where ps.entity_type='episode'
+          and ps.entity_id=e.id
+          and ps.is_active=true
+          and ps.health_status<>'down'
+      )
+    );
+$;
+
+revoke all on function public.vayzen_series_playback_counts(uuid) from public,anon,authenticated;
+grant execute on function public.vayzen_series_playback_counts(uuid) to service_role;
+
 create table if not exists public.seasons (
   id uuid primary key default gen_random_uuid(),
   series_id uuid not null references public.series(id) on delete cascade,
@@ -1090,7 +1131,9 @@ create table if not exists public.series_ingest_jobs (
   playable_episodes integer not null default 0 check (playable_episodes >= 0),
   failed_episodes integer not null default 0 check (failed_episodes >= 0),
   attempts integer not null default 0 check (attempts >= 0),
+  error_attempts integer not null default 0 check (error_attempts >= 0),
   max_attempts integer not null default 6 check (max_attempts between 1 and 20),
+  cursor_index integer not null default 0 check (cursor_index >= 0),
   priority integer not null default 50,
   next_attempt_at timestamptz not null default now(),
   last_error text,
@@ -1100,6 +1143,10 @@ create table if not exists public.series_ingest_jobs (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.series_ingest_jobs
+  add column if not exists error_attempts integer not null default 0,
+  add column if not exists cursor_index integer not null default 0;
 
 create unique index if not exists series_ingest_jobs_one_active_per_series
   on public.series_ingest_jobs(series_id)
@@ -1213,6 +1260,7 @@ values('content_sync_pipeline',jsonb_build_object(
   'tmdb_worker_batch',20,
   'tmdb_max_attempts',8,
   'series_ingest_batch',1,
+  'series_ingest_chunk_size',12,
   'series_ingest_max_attempts',6,
   'media_probe_batch',3,
   'announcement_worker_batch',2,
