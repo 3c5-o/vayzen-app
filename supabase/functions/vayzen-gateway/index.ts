@@ -4909,8 +4909,49 @@ async function callback(q:any){
   }
 
   if(a==="jobs"){
-    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة عمليات الوسائط.");
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة العمليات.");
     return sendJobCenter(chatId);
+  }
+  if(a==="jobs_transfer"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة العمليات.");
+    return sendTransferJobs(chatId);
+  }
+  if(a==="jobs_series"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة العمليات.");
+    return sendSeriesJobs(chatId);
+  }
+  if(a==="jobs_probe"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة العمليات.");
+    return sendProbeJobs(chatId);
+  }
+  if(a==="jobs_tmdb"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة العمليات.");
+    return sendTmdbJobs(chatId);
+  }
+  if(a==="jobs_tmdb_retry"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية إعادة المحاولة.");
+    try{await retryTmdbFailures();return sendTmdbJobs(chatId)}
+    catch(err){return send(chatId,"تعذر إعادة TMDb.\n"+adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:"jobs_tmdb"}]]})}
+  }
+  if(a.startsWith("sjob|")){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة العمليات.");
+    const [,id]=a.split("|");return sendSeriesJobItem(chatId,id);
+  }
+  if(a.startsWith("sjob_retry|")){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية إعادة المحاولة.");
+    const [,id]=a.split("|");
+    try{await retrySeriesIngestJob(id);return sendSeriesJobItem(chatId,id)}
+    catch(err){return send(chatId,"تعذر إعادة Job المسلسل.\n"+adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:"jobs_series"}]]})}
+  }
+  if(a.startsWith("pjob|")){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة العمليات.");
+    const [,id]=a.split("|");return sendProbeJobItem(chatId,id);
+  }
+  if(a.startsWith("pjob_retry|")){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية إعادة الفحص.");
+    const [,id]=a.split("|");
+    try{await retryProbeJob(id);return sendProbeJobItem(chatId,id)}
+    catch(err){return send(chatId,"تعذر إعادة فحص Codec.\n"+adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:"jobs_probe"}]]})}
   }
   if(a.startsWith("job|")){
     if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة عمليات الوسائط.");
