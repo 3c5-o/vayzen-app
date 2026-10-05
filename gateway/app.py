@@ -245,6 +245,44 @@ async def discover_legacy_backups(request: Request):
     return {"ok": True, "backups": found}
 
 
+
+@app.get("/legacy/backups/{chat_id}")
+async def discover_legacy_backups_in_channel(chat_id: int, request: Request):
+    verify_edge_bridge(request)
+    entity = await get_channel(chat_id)
+    title = str(
+        getattr(entity, "title", None)
+        or getattr(entity, "username", None)
+        or chat_id
+    )
+    found = []
+    try:
+        async for message in client.iter_messages(entity, limit=500):
+            filename = _document_filename(message)
+            caption = str(getattr(message, "message", "") or "")
+            if not (
+                filename.lower().startswith("vayzen-bkp-")
+                or "VAYZEN Metadata Backup" in caption
+                or "VAYZEN Backup" in caption
+            ):
+                continue
+            document = getattr(message, "document", None)
+            found.append({
+                "chat_id": int(chat_id),
+                "chat_title": title[:160],
+                "message_id": int(message.id),
+                "filename": filename[:240],
+                "date": message.date.isoformat() if getattr(message, "date", None) else None,
+                "size": int(getattr(document, "size", 0) or 0),
+            })
+            if len(found) >= 20:
+                break
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Unable to scan Telegram channel") from exc
+    found.sort(key=lambda x: x.get("date") or "", reverse=True)
+    return {"ok": True, "chat_id": chat_id, "chat_title": title, "backups": found}
+
+
 @app.get("/legacy/backup/{chat_id}/{message_id}")
 async def fetch_legacy_backup(chat_id: int, message_id: int, request: Request):
     verify_edge_bridge(request)
