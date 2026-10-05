@@ -88,3 +88,5 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args): pass
 
 HTTPServer(("0.0.0.0",PORT),Handler).serve_forever()
+
+# deployment trigger: smoke dockerfile config active
