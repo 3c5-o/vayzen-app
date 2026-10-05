@@ -267,7 +267,7 @@ async function createCanonicalRows(
         quality:qualityFromName(item.raw.name,item.raw.container_extension),
         status:autoPublish?"published":"draft",
         identity_key:item.key,
-        external_metadata:{xtream_seed:compactXtreamMetadata(item.raw,item.categoryName)},
+        external_metadata:{xtream_seed:compactXtreamMetadata(item.raw,item.categoryName),tmdb_sync_status:"pending"},
       };
       if(type==="movie"){
         base.duration_minutes=null;
@@ -2890,6 +2890,309 @@ async function tmdbMappedDetails(type:"movie"|"series",tmdbId:number){
   mapped.poster_url=await tmdbImageUrl(mapped.poster_path,"poster");
   mapped.backdrop_url=await tmdbImageUrl(mapped.backdrop_path,"backdrop");
   return {bundle,mapped};
+}
+
+
+function tmdbMatchText(value:any){
+  return String(value??"")
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[\u064b-\u065f\u0670]/g,"")
+    .replace(/[أإآ]/g,"ا").replace(/ى/g,"ي").replace(/ة/g,"ه")
+    .replace(/\((?:19|20)\d{2}\)/g," ")
+    .replace(/\b(?:19|20)\d{2}\b/g," ")
+    .replace(/(?:مترجم|مدبلج|كامل|movie|film|series|season|web[- ]?dl|bluray|blu[- ]?ray|webrip|hdrip|1080p|720p|480p|4k|uhd)/gi," ")
+    .replace(/[^\p{L}\p{N}]+/gu," ")
+    .replace(/\s+/g," ")
+    .trim();
+}
+function tmdbTokenSimilarity(a:string,b:string){
+  if(!a||!b)return 0;
+  if(a===b)return 1;
+  if(a.includes(b)||b.includes(a))return Math.min(a.length,b.length)/Math.max(a.length,b.length);
+  const aa=new Set(a.split(" ").filter(Boolean)),bb=new Set(b.split(" ").filter(Boolean));
+  let same=0;for(const x of aa)if(bb.has(x))same++;
+  return same/Math.max(aa.size,bb.size,1);
+}
+function tmdbResultTitle(type:"movie"|"series",x:any){
+  return String(type==="movie"?(x?.title||x?.original_title||""):(x?.name||x?.original_name||"")).trim();
+}
+function tmdbResultOriginalTitle(type:"movie"|"series",x:any){
+  return String(type==="movie"?(x?.original_title||x?.title||""):(x?.original_name||x?.name||"")).trim();
+}
+function tmdbResultYear(type:"movie"|"series",x:any){
+  const raw=String(type==="movie"?x?.release_date:x?.first_air_date||"");
+  return /^\d{4}/.test(raw)?Number(raw.slice(0,4)):0;
+}
+function tmdbMatchScore(type:"movie"|"series",row:any,x:any){
+  const sourceNames=[tmdbMatchText(row?.title),tmdbMatchText(row?.original_title)].filter(Boolean);
+  const resultNames=[tmdbMatchText(tmdbResultTitle(type,x)),tmdbMatchText(tmdbResultOriginalTitle(type,x))].filter(Boolean);
+  let titleScore=0;
+  for(const a of sourceNames)for(const b of resultNames){
+    const sim=tmdbTokenSimilarity(a,b);
+    titleScore=Math.max(titleScore,a===b?72:0,Math.round(sim*62));
+  }
+  const expected=Number(row?.release_year||0),actual=tmdbResultYear(type,x);
+  let yearScore=0;
+  if(expected&&actual){
+    const diff=Math.abs(expected-actual);
+    yearScore=diff===0?26:diff===1?12:diff===2?4:-18;
+  }
+  const popularity=Math.min(6,Math.max(0,Number(x?.popularity||0)/50));
+  return Math.round((titleScore+yearScore+popularity)*10)/10;
+}
+async function tmdbAutoMatch(type:"movie"|"series",row:any){
+  const directId=Number(row?.external_source==="tmdb"?row?.external_id:0);
+  if(Number.isInteger(directId)&&directId>0)return {id:directId,score:100,result:null};
+
+  const query=tmdbMatchText(row?.original_title)||tmdbMatchText(row?.title);
+  if(!query)return null;
+  const endpoint=type==="movie"?"/search/movie":"/search/tv";
+  const year=Number(row?.release_year||0);
+  const params:any={query,language:"ar-SA",include_adult:false,page:1};
+  if(year)params[type==="movie"?"year":"first_air_date_year"]=year;
+  let response:any=await tmdbApi(endpoint,params);
+  let candidates=Array.isArray(response?.results)?response.results.slice(0,10):[];
+  if(!candidates.length&&year){
+    delete params[type==="movie"?"year":"first_air_date_year"];
+    response=await tmdbApi(endpoint,params);
+    candidates=Array.isArray(response?.results)?response.results.slice(0,10):[];
+  }
+  let best:any=null,bestScore=-999;
+  for(const x of candidates){
+    const score=tmdbMatchScore(type,row,x);
+    if(score>bestScore){best=x;bestScore=score;}
+  }
+  if(!best||bestScore<58)return null;
+  return {id:Number(best.id),score:bestScore,result:best};
+}
+function tmdbCompactMetadata(type:"movie"|"series",bundle:any,mapped:any){
+  const ar=bundle?.ar||{},en=bundle?.en||{};
+  const credits=type==="movie"?(ar?.credits||{}):(ar?.aggregate_credits||{});
+  const cast=(Array.isArray(credits?.cast)?credits.cast:[]).slice(0,16).map((x:any)=>({
+    id:Number(x?.id||0)||null,
+    name:String(x?.name||x?.original_name||"").slice(0,120),
+    character:String(x?.character||x?.roles?.[0]?.character||"").slice(0,160),
+    profile_path:String(x?.profile_path||"")
+  }));
+  return {
+    id:Number(mapped?.external_id||ar?.id||en?.id)||null,
+    poster_path:String(mapped?.poster_path||ar?.poster_path||en?.poster_path||""),
+    backdrop_path:String(mapped?.backdrop_path||ar?.backdrop_path||en?.backdrop_path||""),
+    tagline:String(ar?.tagline||en?.tagline||"").slice(0,500),
+    homepage:String(ar?.homepage||en?.homepage||"").slice(0,1000),
+    status:String(ar?.status||en?.status||"").slice(0,80),
+    imdb_id:String(ar?.external_ids?.imdb_id||ar?.imdb_id||en?.imdb_id||"").slice(0,40),
+    popularity:Number(ar?.popularity||en?.popularity||0)||0,
+    cast,
+    synced_at:new Date().toISOString()
+  };
+}
+async function tmdbEnrichRow(type:"movie"|"series",row:any,tmdbId:number,confidence:number){
+  const table=type==="movie"?"movies":"series";
+  const bundle=await tmdbDetails(type,tmdbId);
+  const mapped:any=tmdbMap(type,bundle);
+  const previous=(row?.external_metadata&&typeof row.external_metadata==="object")?row.external_metadata:{};
+  const metadata={
+    ...previous,
+    tmdb_sync_status:"matched",
+    tmdb_enriched_at:new Date().toISOString(),
+    tmdb_match_confidence:confidence,
+    tmdb:tmdbCompactMetadata(type,bundle,mapped)
+  };
+  const patch:any={
+    title:mapped.title||row.title,
+    original_title:mapped.original_title||row.original_title||row.title,
+    description:mapped.description||row.description||"",
+    release_year:mapped.release_year||row.release_year||null,
+    genres:Array.isArray(mapped.genres)&&mapped.genres.length?mapped.genres:(row.genres||[]),
+    language:mapped.language||row.language||"",
+    country:mapped.country||row.country||"",
+    country_code:mapped.country_code||row.country_code||null,
+    origin_country_codes:Array.isArray(mapped.origin_country_codes)&&mapped.origin_country_codes.length?mapped.origin_country_codes:(row.origin_country_codes||[]),
+    original_language_code:mapped.original_language_code||row.original_language_code||null,
+    rating:mapped.rating||row.rating||null,
+    rating_count:mapped.rating_count||row.rating_count||null,
+    external_source:"tmdb",
+    external_id:tmdbId,
+    external_metadata:metadata,
+    updated_at:new Date().toISOString()
+  };
+  if(type==="movie"){
+    patch.duration_minutes=mapped.duration_minutes||row.duration_minutes||null;
+    patch.release_date=mapped.release_date||row.release_date||null;
+  }else{
+    patch.first_air_date=mapped.first_air_date||row.first_air_date||null;
+  }
+  const {error}=await db.from(table).update(patch).eq("id",row.id);
+  if(error)throw error;
+  return {tmdbId,title:patch.title};
+}
+async function tmdbMarkUnmatched(type:"movie"|"series",row:any){
+  const table=type==="movie"?"movies":"series";
+  const previous=(row?.external_metadata&&typeof row.external_metadata==="object")?row.external_metadata:{};
+  const metadata={...previous,tmdb_sync_status:"not_found",tmdb_checked_at:new Date().toISOString()};
+  const {error}=await db.from(table).update({external_metadata:metadata,updated_at:new Date().toISOString()}).eq("id",row.id);
+  if(error)throw error;
+}
+async function tmdbMarkRetry(type:"movie"|"series",row:any,error:any){
+  const table=type==="movie"?"movies":"series";
+  const previous=(row?.external_metadata&&typeof row.external_metadata==="object")?row.external_metadata:{};
+  const metadata={...previous,tmdb_sync_status:"pending",tmdb_last_error:adminErrorText(error),tmdb_last_error_at:new Date().toISOString()};
+  await db.from(table).update({external_metadata:metadata,updated_at:new Date().toISOString()}).eq("id",row.id);
+}
+async function tmdbPendingRows(type:"movie"|"series",limit:number){
+  const table=type==="movie"?"movies":"series";
+  const fields=type==="movie"
+    ?"id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,duration_minutes,rating,rating_count,external_source,external_id,external_metadata,release_date"
+    :"id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,rating,rating_count,external_source,external_id,external_metadata,first_air_date";
+  const {data,error}=await db.from(table).select(fields)
+    .eq("status","published")
+    .contains("external_metadata",{tmdb_sync_status:"pending"})
+    .order("updated_at",{ascending:true})
+    .limit(limit);
+  if(error)throw error;
+  return data??[];
+}
+async function tmdbCountStatus(type:"movie"|"series",status:string){
+  const table=type==="movie"?"movies":"series";
+  const {count,error}=await db.from(table).select("id",{count:"exact",head:true})
+    .eq("status","published").contains("external_metadata",{tmdb_sync_status:status});
+  if(error)throw error;
+  return Number(count||0);
+}
+async function tmdbEnrichmentStats(){
+  const [moviesTotal,seriesTotal,moviePending,seriesPending,movieMatched,seriesMatched,movieMissing,seriesMissing]=await Promise.all([
+    db.from("movies").select("id",{count:"exact",head:true}).eq("status","published"),
+    db.from("series").select("id",{count:"exact",head:true}).eq("status","published"),
+    tmdbCountStatus("movie","pending"),tmdbCountStatus("series","pending"),
+    tmdbCountStatus("movie","matched"),tmdbCountStatus("series","matched"),
+    tmdbCountStatus("movie","not_found"),tmdbCountStatus("series","not_found")
+  ]);
+  if(moviesTotal.error)throw moviesTotal.error;if(seriesTotal.error)throw seriesTotal.error;
+  return {
+    movies_total:Number(moviesTotal.count||0),series_total:Number(seriesTotal.count||0),
+    movies_pending:moviePending,series_pending:seriesPending,
+    movies_matched:movieMatched,series_matched:seriesMatched,
+    movies_not_found:movieMissing,series_not_found:seriesMissing
+  };
+}
+async function syncTmdbMetadataBatch(startedBy:number){
+  const status=await tmdbStatus();
+  if(!status.configured)throw new Error("TMDb غير مربوط. أضف Access Token أولًا من إعدادات TMDb.");
+  const [movies,series]=await Promise.all([tmdbPendingRows("movie",5),tmdbPendingRows("series",5)]);
+  const queue:any[]=[];
+  const max=Math.max(movies.length,series.length);
+  for(let i=0;i<max;i++){
+    if(movies[i])queue.push({type:"movie",row:movies[i]});
+    if(series[i])queue.push({type:"series",row:series[i]});
+    if(queue.length>=10)break;
+  }
+  let matched=0,notFound=0,failed=0;
+  const examples:string[]=[];
+  for(const item of queue){
+    try{
+      const match=await tmdbAutoMatch(item.type,item.row);
+      if(!match){await tmdbMarkUnmatched(item.type,item.row);notFound++;continue;}
+      const enriched=await tmdbEnrichRow(item.type,item.row,match.id,match.score);
+      matched++;
+      if(examples.length<4)examples.push(String(item.row.public_id)+" → "+String(enriched.title));
+    }catch(error){
+      failed++;await tmdbMarkRetry(item.type,item.row,error);
+    }
+  }
+  const stats=await tmdbEnrichmentStats();
+  await adminLog(startedBy,"tmdb_metadata_sync","settings",undefined,"tmdb",{
+    processed:queue.length,matched,not_found:notFound,failed,stats
+  });
+  return {processed:queue.length,matched,not_found:notFound,failed,examples,stats};
+}
+async function xtreamAccountSyncStats(accountId:string){
+  const [movies,series]=await Promise.all([
+    db.from("content_provider_refs").select("id",{count:"exact",head:true})
+      .eq("provider_type","xtream").eq("provider_account_id",accountId).eq("entity_type","movie").eq("is_active",true),
+    db.from("content_provider_refs").select("id",{count:"exact",head:true})
+      .eq("provider_type","xtream").eq("provider_account_id",accountId).eq("entity_type","series").eq("is_active",true)
+  ]);
+  if(movies.error)throw movies.error;if(series.error)throw series.error;
+  return {movies:Number(movies.count||0),series:Number(series.count||0)};
+}
+async function tmdbImageFallback(type:string,id:string){
+  let table="",kind:"poster"|"backdrop"|"still"="poster";
+  if(type==="movie_poster"){table="movies";kind="poster";}
+  else if(type==="movie_backdrop"){table="movies";kind="backdrop";}
+  else if(type==="series_poster"){table="series";kind="poster";}
+  else if(type==="series_backdrop"){table="series";kind="backdrop";}
+  else if(type==="episode_still"){table="episodes";kind="still";}
+  else return "";
+  const {data}=await db.from(table).select("external_metadata").eq("id",id).maybeSingle();
+  const meta:any=(data as any)?.external_metadata||{};
+  const tmdb:any=meta.tmdb||{};
+  const primary:any=meta.primary||{};
+  const path=kind==="poster"
+    ?String(tmdb.poster_path||primary.poster_path||"")
+    :kind==="backdrop"
+      ?String(tmdb.backdrop_path||primary.backdrop_path||"")
+      :String(tmdb.still_path||primary.still_path||"");
+  return path?tmdbImageUrl(path,kind):"";
+}
+async function syncTmdbSeriesEpisodeMetadata(seriesId:string){
+  const status=await tmdbStatus();if(!status.configured)return {synced:false,episodes:0};
+  const {data:series,error:seriesError}=await db.from("series")
+    .select("id,external_source,external_id,external_metadata").eq("id",seriesId).maybeSingle();
+  if(seriesError)throw seriesError;if(!series)return {synced:false,episodes:0};
+  const seriesMeta:any=series.external_metadata||{};
+  const tmdbId=Number(series.external_source==="tmdb"?series.external_id:seriesMeta?.tmdb?.id||0);
+  if(!tmdbId)return {synced:false,episodes:0};
+  const last=Date.parse(String(seriesMeta.tmdb_episode_metadata_sync_at||""));
+  if(Number.isFinite(last)&&Date.now()-last<12*60*60_000)return {synced:false,episodes:0,cached:true};
+
+  const {data:seasons,error:seasonsError}=await db.from("seasons")
+    .select("id,season_number,title,external_metadata").eq("series_id",seriesId).eq("status","published")
+    .order("season_number",{ascending:true}).limit(24);
+  if(seasonsError)throw seasonsError;
+  let touched=0;
+  for(const season of seasons??[]){
+    let details:any;
+    try{details=await tmdbApi("/tv/"+tmdbId+"/season/"+season.season_number,{language:"ar-SA"});}catch{continue;}
+    const previousSeason:any=season.external_metadata||{};
+    await db.from("seasons").update({
+      title:String(details?.name||season.title||("الموسم "+season.season_number)),
+      air_date:safeIsoDate(details?.air_date),
+      external_source:"tmdb",external_id:Number(details?.id||0)||null,
+      external_metadata:{...previousSeason,tmdb:{id:Number(details?.id||0)||null,poster_path:String(details?.poster_path||""),overview:String(details?.overview||"").slice(0,3000)},tmdb_synced_at:new Date().toISOString()},
+      updated_at:new Date().toISOString()
+    }).eq("id",season.id);
+
+    const {data:localEpisodes,error:episodeError}=await db.from("episodes")
+      .select("id,episode_number,title,description,duration_minutes,rating,rating_count,external_metadata")
+      .eq("season_id",season.id).eq("status","published");
+    if(episodeError)throw episodeError;
+    const byNumber=new Map((Array.isArray(details?.episodes)?details.episodes:[]).map((x:any)=>[Number(x?.episode_number||0),x]));
+    const updates=(localEpisodes??[]).map(async(ep:any)=>{
+      const remote:any=byNumber.get(Number(ep.episode_number));if(!remote)return;
+      const old:any=ep.external_metadata||{};
+      const patch:any={
+        title:String(remote?.name||ep.title||("الحلقة "+ep.episode_number)),
+        description:String(remote?.overview||ep.description||"").slice(0,5000),
+        air_date:safeIsoDate(remote?.air_date),
+        rating:Number(remote?.vote_average||0)||ep.rating||null,
+        rating_count:Number(remote?.vote_count||0)||ep.rating_count||null,
+        external_source:"tmdb",external_id:Number(remote?.id||0)||null,
+        external_metadata:{...old,tmdb:{id:Number(remote?.id||0)||null,still_path:String(remote?.still_path||""),production_code:String(remote?.production_code||"")},tmdb_synced_at:new Date().toISOString()},
+        updated_at:new Date().toISOString()
+      };
+      if(Number(remote?.runtime||0)>0)patch.duration_minutes=Number(remote.runtime);
+      const {error}=await db.from("episodes").update(patch).eq("id",ep.id);
+      if(error)throw error;touched++;
+    });
+    for(let i=0;i<updates.length;i+=20)await Promise.all(updates.slice(i,i+20));
+  }
+  await db.from("series").update({
+    external_metadata:{...seriesMeta,tmdb_episode_metadata_sync_at:new Date().toISOString()},
+    updated_at:new Date().toISOString()
+  }).eq("id",seriesId);
+  return {synced:true,episodes:touched};
 }
 
 async function callback(q:any){
