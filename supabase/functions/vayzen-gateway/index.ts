@@ -5949,6 +5949,48 @@ async function changePassword(req:Request){
   return json({ok:true});
 }
 
+async function publicAppUrl(){
+  const {data}=await db.from("app_settings").select("value").eq("key","public_app").maybeSingle();
+  const raw=String((data as any)?.value?.url||"https://vayzen-gateway-production.up.railway.app").trim();
+  try{
+    const u=new URL(raw);
+    if(!["http:","https:"].includes(u.protocol))throw new Error("bad protocol");
+    return u.origin+u.pathname.replace(/\/$/,"");
+  }catch{
+    return "https://vayzen-gateway-production.up.railway.app";
+  }
+}
+
+async function requestPasswordReset(req:Request){
+  const body=await req.json().catch(()=>null);
+  const email=String(body?.email||"").trim().toLowerCase();
+  if(!PUBLIC_KEY||!email.includes("@")||email.length>254)return json({error:"invalid email"},400);
+  const allowed=await consumeRateLimit("pwd:"+email,"password_reset",3,60*60);
+  if(!allowed)return json({error:"reset limit reached"},429);
+
+  const client=createClient(SUPABASE_URL,PUBLIC_KEY,{
+    auth:{persistSession:false,autoRefreshToken:false,flowType:"implicit"}
+  });
+  const redirectTo=(await publicAppUrl())+"/?recovery=1";
+  const {error}=await client.auth.resetPasswordForEmail(email,{redirectTo});
+  if(error){
+    await systemLog("warning","Password reset request failed",{message:error.message});
+  }
+  return json({ok:true,message:"إذا كان البريد مسجلًا ستصل رسالة الاستعادة."});
+}
+
+async function recoverPassword(req:Request){
+  const auth=await userFromRequest(req);
+  if(!auth)return json({error:"recovery session expired"},401);
+  const body=await req.json().catch(()=>null);
+  const next=String(body?.new_password||"");
+  if(next.length<8||next.length>128)return json({error:"كلمة المرور يجب أن تكون 8 أحرف على الأقل"},400);
+  const {error}=await db.auth.admin.updateUserById(auth.user.id,{password:next});
+  if(error)throw error;
+  await systemLog("info","Password recovered",{user_id:auth.user.id});
+  return json({ok:true});
+}
+
 async function recordView(req:Request){
   const body=await req.json().catch(()=>null);
   const type=String(body?.entity_type||"");
@@ -6772,6 +6814,8 @@ Deno.serve(async(req:Request)=>{
     if(action==="refresh"&&req.method==="POST") return authRefresh(req);
     if(action==="me"&&req.method==="GET") return me(req);
     if(action==="profile"&&req.method==="POST") return updateProfile(req);
+    if(action==="password_reset"&&req.method==="POST") return requestPasswordReset(req);
+    if(action==="recover_password"&&req.method==="POST") return recoverPassword(req);
     if(action==="change_password"&&req.method==="POST") return changePassword(req);
     if(action==="view"&&req.method==="POST") return recordView(req);
     if(action==="favorites"&&(req.method==="GET"||req.method==="POST")) return favoritesApi(req);
