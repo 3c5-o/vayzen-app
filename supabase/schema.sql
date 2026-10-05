@@ -955,8 +955,11 @@ create table if not exists public.xtream_catalog_sync_jobs (
   created_items integer not null default 0 check (created_items >= 0),
   merged_items integer not null default 0 check (merged_items >= 0),
   source_links_created integer not null default 0 check (source_links_created >= 0),
+  series_ready integer not null default 0 check (series_ready >= 0),
+  series_failed integer not null default 0 check (series_failed >= 0),
+  series_pending integer not null default 0 check (series_pending >= 0),
   status text not null default 'pending'
-    check (status in ('pending','running','completed','failed','cancelled')),
+    check (status in ('pending','running','completed','partial','failed','cancelled')),
   started_by bigint,
   last_error text,
   started_at timestamptz,
@@ -964,6 +967,15 @@ create table if not exists public.xtream_catalog_sync_jobs (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.xtream_catalog_sync_jobs
+  add column if not exists series_ready integer not null default 0,
+  add column if not exists series_failed integer not null default 0,
+  add column if not exists series_pending integer not null default 0;
+
+alter table public.xtream_catalog_sync_jobs drop constraint if exists xtream_catalog_sync_jobs_status_check;
+alter table public.xtream_catalog_sync_jobs add constraint xtream_catalog_sync_jobs_status_check
+  check (status in ('pending','running','completed','partial','failed','cancelled'));
 
 create unique index if not exists xtream_catalog_sync_jobs_one_active_per_account
   on public.xtream_catalog_sync_jobs(account_id)
