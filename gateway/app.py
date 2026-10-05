@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from telethon import TelegramClient, utils
+from telethon.errors import FloodWaitError
 
 API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
@@ -41,6 +42,8 @@ XTREAM_PROXY_CONNECT_TIMEOUT = max(3.0, float(os.environ.get("XTREAM_PROXY_CONNE
 XTREAM_PROXY_READ_TIMEOUT = max(10.0, float(os.environ.get("XTREAM_PROXY_READ_TIMEOUT_SECONDS", "45")))
 
 client = TelegramClient(None, API_ID, API_HASH)
+telegram_start_lock = asyncio.Lock()
+telegram_retry_after = 0.0
 channel_cache = {}
 media_cache = {}
 stream_slots = asyncio.Semaphore(MAX_CONCURRENT_STREAMS)
@@ -53,7 +56,45 @@ stream_rejections = 0
 bytes_served = 0
 
 
+async def ensure_telegram_client():
+    global telegram_retry_after
+    now = time.time()
+    if client.is_connected():
+        try:
+            if await client.is_user_authorized():
+                return True
+        except Exception:
+            pass
+    if now < telegram_retry_after:
+        return False
+
+    async with telegram_start_lock:
+        now = time.time()
+        if client.is_connected():
+            try:
+                if await client.is_user_authorized():
+                    return True
+            except Exception:
+                pass
+        if now < telegram_retry_after:
+            return False
+        try:
+            await client.start(bot_token=BOT_TOKEN)
+            telegram_retry_after = 0.0
+            return True
+        except FloodWaitError as exc:
+            telegram_retry_after = time.time() + max(1, int(getattr(exc, "seconds", 60)))
+            print(f"Telegram FloodWait: retry after {int(telegram_retry_after)}")
+            return False
+        except Exception as exc:
+            telegram_retry_after = time.time() + 30.0
+            print("Telegram client start error:", repr(exc))
+            return False
+
+
 async def refresh_channel_cache():
+    if not await ensure_telegram_client():
+        return
     try:
         dialogs = await client.get_dialogs(limit=None)
         for dialog in dialogs:
@@ -91,11 +132,12 @@ async def configure_bot_webhook():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await client.start(bot_token=BOT_TOKEN)
+    await ensure_telegram_client()
     await refresh_channel_cache()
     await configure_bot_webhook()
     yield
-    await client.disconnect()
+    if client.is_connected():
+        await client.disconnect()
 
 
 app = FastAPI(title="VAYZEN Telegram Streaming Gateway", lifespan=lifespan)
@@ -411,7 +453,10 @@ async def api_proxy(request: Request):
         )
 
     out_headers = {}
-    for key in ("content-type", "location", "cache-control", "content-length"):
+    # httpx may transparently decompress upstream bodies. Forwarding the
+    # original Content-Length can then make Starlette reject the response
+    # with "Response content longer than Content-Length".
+    for key in ("content-type", "location", "cache-control"):
         value = upstream.headers.get(key)
         if value:
             out_headers[key] = value
