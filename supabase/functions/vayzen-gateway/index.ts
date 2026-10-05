@@ -5814,13 +5814,118 @@ async function recordView(req:Request){
   return json({ok:true,counted:true});
 }
 
+const MOVIE_PUBLIC_FIELDS="id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,duration_minutes,quality,is_featured,view_count,rating,rating_count,created_at";
+const SERIES_PUBLIC_FIELDS="id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,quality,is_featured,view_count,rating,rating_count,created_at,expected_seasons,expected_episodes,playable_episodes";
+
+function safeCatalogSearch(value:any){
+  return String(value||"").replace(/[\u0000-\u001f,%()]/g," ").replace(/\s+/g," ").trim().slice(0,100);
+}
+function catalogSortValue(value:any){
+  const s=String(value||"latest");
+  return ["latest","popular","rating","year"].includes(s)?s:"latest";
+}
+function applyCatalogSort(query:any,sort:string){
+  if(sort==="popular")return query.order("view_count",{ascending:false}).order("created_at",{ascending:false});
+  if(sort==="rating")return query.order("rating",{ascending:false,nullsFirst:false}).order("rating_count",{ascending:false,nullsFirst:false}).order("created_at",{ascending:false});
+  if(sort==="year")return query.order("release_year",{ascending:false,nullsFirst:false}).order("created_at",{ascending:false});
+  return query.order("created_at",{ascending:false});
+}
+function applyCatalogFilters(query:any,type:"movie"|"series",url:URL){
+  const q=safeCatalogSearch(url.searchParams.get("q"));
+  const genre=String(url.searchParams.get("genre")||"").trim().slice(0,80);
+  const country=String(url.searchParams.get("country")||"").trim().slice(0,80);
+  const year=Number(url.searchParams.get("year")||0);
+  if(q)query=query.or("title.ilike.%"+q+"%,original_title.ilike.%"+q+"%");
+  if(genre)query=query.contains("genres",[genre]);
+  if(country){
+    if(/^[A-Za-z]{2}$/.test(country))query=query.eq("country_code",country.toUpperCase());
+    else query=query.ilike("country","%"+safeCatalogSearch(country)+"%");
+  }
+  if(Number.isInteger(year)&&year>=1888&&year<=2100)query=query.eq("release_year",year);
+  if(type==="series")query=query.eq("ingestion_status","ready");
+  return query;
+}
+
 async function catalog(){
-  const [m,s]=await Promise.all([
-    db.from("movies").select("id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,duration_minutes,quality,is_featured,view_count,rating,rating_count,created_at").eq("status","published").order("created_at",{ascending:false}),
-    db.from("series").select("id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,quality,is_featured,view_count,rating,rating_count,created_at").eq("status","published").order("created_at",{ascending:false})
+  const settings=await pipelineSettingsValue().catch(()=>({catalog_page_size:40} as any));
+  const homeLimit=Math.max(40,Math.min(100,Number(settings.catalog_page_size||40)+20));
+  const [m,s,mc,sc]=await Promise.all([
+    db.from("movies").select(MOVIE_PUBLIC_FIELDS).eq("status","published").order("created_at",{ascending:false}).limit(homeLimit),
+    db.from("series").select(SERIES_PUBLIC_FIELDS).eq("status","published").eq("ingestion_status","ready").order("created_at",{ascending:false}).limit(homeLimit),
+    db.from("movies").select("id",{count:"exact",head:true}).eq("status","published"),
+    db.from("series").select("id",{count:"exact",head:true}).eq("status","published").eq("ingestion_status","ready")
   ]);
   if(m.error)throw m.error;if(s.error)throw s.error;
-  return json({ok:true,movies:m.data??[],series:s.data??[]});
+  return json({
+    ok:true,
+    movies:m.data??[],
+    series:s.data??[],
+    totals:{movies:Number(mc.count||0),series:Number(sc.count||0)},
+    page_size:homeLimit
+  });
+}
+
+async function catalogPage(url:URL){
+  const type=String(url.searchParams.get("type")||"");
+  if(!["movie","series"].includes(type))return json({error:"invalid catalog type"},400);
+  const entityType=type as "movie"|"series";
+  const settings=await pipelineSettingsValue();
+  const page=Math.max(1,Math.min(100000,Number(url.searchParams.get("page")||1)||1));
+  const limit=Math.max(20,Math.min(100,Number(url.searchParams.get("limit")||settings.catalog_page_size)||settings.catalog_page_size));
+  const from=(page-1)*limit,to=from+limit-1;
+  const table=entityType==="movie"?"movies":"series";
+  const fields=entityType==="movie"?MOVIE_PUBLIC_FIELDS:SERIES_PUBLIC_FIELDS;
+  let query:any=db.from(table).select(fields,{count:"exact"}).eq("status","published");
+  query=applyCatalogFilters(query,entityType,url);
+  query=applyCatalogSort(query,catalogSortValue(url.searchParams.get("sort")));
+  const {data,error,count}=await query.range(from,to);
+  if(error)throw error;
+  const total=Number(count||0);
+  return json({
+    ok:true,type:entityType,items:data??[],page,limit,total,
+    has_more:from+(data??[]).length<total
+  });
+}
+
+async function searchCatalog(url:URL){
+  const q=safeCatalogSearch(url.searchParams.get("q"));
+  if(q.length<2)return json({ok:true,items:[],total:0,page:1,has_more:false});
+  const page=Math.max(1,Math.min(10000,Number(url.searchParams.get("page")||1)||1));
+  const limit=Math.max(10,Math.min(40,Number(url.searchParams.get("limit")||20)||20));
+  const from=(page-1)*limit,to=from+limit-1;
+
+  const movieUrl=new URL(url.toString());movieUrl.searchParams.set("q",q);
+  const seriesUrl=new URL(url.toString());seriesUrl.searchParams.set("q",q);
+  let mq:any=db.from("movies").select(MOVIE_PUBLIC_FIELDS,{count:"exact"}).eq("status","published");
+  mq=applyCatalogFilters(mq,"movie",movieUrl).order("created_at",{ascending:false}).range(from,to);
+  let sq:any=db.from("series").select(SERIES_PUBLIC_FIELDS,{count:"exact"}).eq("status","published");
+  sq=applyCatalogFilters(sq,"series",seriesUrl).order("created_at",{ascending:false}).range(from,to);
+
+  const [m,s]=await Promise.all([mq,sq]);
+  if(m.error)throw m.error;if(s.error)throw s.error;
+  const items=[
+    ...(m.data??[]).map((item:any)=>({type:"movie",item})),
+    ...(s.data??[]).map((item:any)=>({type:"series",item}))
+  ].sort((a:any,b:any)=>{
+    const aq=String(a.item.title||"").toLowerCase(),bq=String(b.item.title||"").toLowerCase(),needle=q.toLowerCase();
+    const ae=aq===needle?1:aq.startsWith(needle)?0.5:0;
+    const be=bq===needle?1:bq.startsWith(needle)?0.5:0;
+    if(be!==ae)return be-ae;
+    return Date.parse(String(b.item.created_at||""))-Date.parse(String(a.item.created_at||""));
+  });
+  const total=Number(m.count||0)+Number(s.count||0);
+  return json({
+    ok:true,q,items,total,page,limit,
+    has_more:(from+(m.data??[]).length<Number(m.count||0))||(from+(s.data??[]).length<Number(s.count||0))
+  });
+}
+
+async function catalogFacets(url:URL){
+  const type=String(url.searchParams.get("type")||"");
+  if(!["movie","series"].includes(type))return json({error:"invalid catalog type"},400);
+  const {data,error}=await db.rpc("vayzen_catalog_facets",{p_type:type});
+  if(error)throw error;
+  return json({ok:true,type,facets:data||{genres:[],years:[],countries:[]}});
 }
 
 function xtreamEpisodeDurationMinutes(raw:any){
@@ -6479,6 +6584,9 @@ Deno.serve(async(req:Request)=>{
     }
     if(action==="pipeline_worker"&&req.method==="POST") return pipelineWorkerTick(req);
     if(action==="catalog"&&req.method==="GET") return catalog();
+    if(action==="catalog_page"&&req.method==="GET") return catalogPage(url);
+    if(action==="search_catalog"&&req.method==="GET") return searchCatalog(url);
+    if(action==="catalog_facets"&&req.method==="GET") return catalogFacets(url);
     if(action==="series_content"&&req.method==="GET") return seriesContent(url);
     if(action==="media_variants"&&req.method==="GET") return publicMediaVariants(url);
     if(action==="subtitles"&&req.method==="GET") return publicSubtitles(url);
