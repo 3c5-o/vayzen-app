@@ -1222,12 +1222,12 @@ video.addEventListener("loadedmetadata",syncPlayerUI);
 video.addEventListener("durationchange",syncPlayerUI);
 video.addEventListener("play",()=>{updatePlayIcon();scheduleControlsHide()});
 video.addEventListener("pause",()=>{updatePlayIcon();showPlayerControls(true);saveCurrentProgress()});
-function retryCurrentPlayer(auto=false){
+async function retryCurrentPlayer(auto=false){
   const o=state.player;if(!o)return;
   const t=video.currentTime||0,paused=video.paused;
   $("#playerError").classList.add("hidden");$("#playerLoader").classList.remove("hidden");
   o.src=freshSourceForPlayer(o,o.qualityVariant||"default");
-  video.src=o.src;video.load();
+  await attachPlayerSource(o,o.src,o.qualityVariant||"default");
   video.addEventListener("loadedmetadata",()=>{
     if(t>0&&t<video.duration)video.currentTime=t;
     if(!paused||auto)video.play().catch(()=>{});
@@ -1339,13 +1339,13 @@ $("#playerBack").onclick=()=>closePlayer();
 $("#playPauseBtn").onclick=togglePlayback;
 $("#rewindBtn").onclick=()=>seekBy(-10);
 $("#forwardBtn").onclick=()=>seekBy(10);
-$("#qualitySelect").onchange=()=>{
+$("#qualitySelect").onchange=async()=>{
   const o=state.player;if(!o)return;
   const t=video.currentTime||0,paused=video.paused;
   o.qualityVariant=$("#qualitySelect").value||"default";
   o.src=freshSourceForPlayer(o,o.qualityVariant);
   $("#playerLoader").classList.remove("hidden");
-  video.src=o.src;video.load();
+  await attachPlayerSource(o,o.src,o.qualityVariant);
   video.addEventListener("loadedmetadata",()=>{
     if(t>0&&t<video.duration)video.currentTime=t;
     if(!paused)video.play().catch(()=>{});
