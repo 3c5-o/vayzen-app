@@ -4615,10 +4615,17 @@ async function media(type:string,id:string,req?:Request){
         const legacy=await legacyGatewayUrl();
         if(legacy){
           const suffix=(type.endsWith("_subtitle")&&quality)?`&quality=${encodeURIComponent(quality)}`:"";
-          return Response.redirect(
-            `${legacy}?media=${encodeURIComponent(type)}&id=${encodeURIComponent(id)}${suffix}`,
-            307
-          );
+          const legacyUrl=`${legacy}?media=${encodeURIComponent(type)}&id=${encodeURIComponent(id)}${suffix}`;
+          if(["movie_poster","movie_backdrop","series_poster","series_backdrop"].includes(type)){
+            const upstream=await fetch(legacyUrl);
+            if(upstream.ok){
+              const headers=new Headers(cors);
+              headers.set("Content-Type",upstream.headers.get("content-type")?.startsWith("image/")?String(upstream.headers.get("content-type")):"image/jpeg");
+              headers.set("Cache-Control","public, max-age=3600");
+              return new Response(upstream.body,{status:200,headers});
+            }
+          }
+          return Response.redirect(legacyUrl,307);
         }
       }
     }
