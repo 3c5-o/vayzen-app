@@ -136,7 +136,7 @@ async def pipeline_worker_loop():
     # secret. Long syncs are split inside the Edge function, so the public API
     # and Telegram webhook remain responsive.
     await asyncio.sleep(5.0)
-    timeout = httpx.Timeout(180.0, connect=20.0)
+    timeout = httpx.Timeout(120.0, connect=20.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
         while True:
             delay = PIPELINE_WORKER_INTERVAL
@@ -160,11 +160,15 @@ async def pipeline_worker_loop():
                     else:
                         try:
                             payload = response.json()
+                            series_ingest = payload.get("seriesIngest") or {}
+                            media_probe = payload.get("mediaProbe") or {}
                             xtream = payload.get("xtream") or {}
                             tmdb = payload.get("tmdb") or {}
                             announcements = payload.get("announcements") or {}
                             busy = bool(
-                                xtream.get("worked")
+                                series_ingest.get("worked")
+                                or media_probe.get("worked")
+                                or xtream.get("worked")
                                 or tmdb.get("worked")
                                 or announcements.get("worked")
                             )
