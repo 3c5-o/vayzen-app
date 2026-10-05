@@ -4399,8 +4399,10 @@ async function hmacHex(payload:string,secret:string){
 }
 
 async function media(type:string,id:string,req?:Request){
-  const quality=req?new URL(req.url).searchParams.get("quality")||"default":"default";
-  let a:any=await asset(type,id,quality);
+  const requestUrl=req?new URL(req.url):null;
+  const quality=requestUrl?.searchParams.get("quality")||"default";
+  const sourceMode=String(requestUrl?.searchParams.get("source")||"auto");
+  let a:any=sourceMode==="xtream"&&["movie_video","episode_video"].includes(type)?null:await asset(type,id,quality);
 
   if(type==="movie_video"||type==="episode_video"){
     const entityType=type==="movie_video"?"movie":"episode";
