@@ -649,7 +649,7 @@ async function loadSeriesContent(series){
           ?e.qualities.map(q=>q.label||q.variant).filter(Boolean).join(" / ")
           :(e.quality||"");
         return `<article class="episode-row ${stateName==="completed"?"watched":stateName==="progress"?"watching":""}">
-        <div class="episode-thumb" style="background-image:url('${mediaUrl("series_backdrop",series.id)}')"><span class="episode-index">${String(e.episode_number).padStart(2,"0")}</span><span class="episode-thumb-play"><svg><use href="#i-play"/></svg></span></div>
+        <div class="episode-thumb" style="background-image:url('${mediaUrl("episode_still",e.id)}'),url('${mediaUrl("series_backdrop",series.id)}')"><span class="episode-index">${String(e.episode_number).padStart(2,"0")}</span><span class="episode-thumb-play"><svg><use href="#i-play"/></svg></span></div>
         <div class="episode-copy"><b>${esc(e.title||("الحلقة "+e.episode_number))}</b><small>${e.duration_minutes?e.duration_minutes+" دقيقة":""}${qualityText?" • "+esc(qualityText):""}${Number(e.rating)>0?" • ★ "+Number(e.rating).toFixed(1):""}</small><p>${esc(e.description||"")}</p></div>
         <span class="episode-watch-state ${stateName}">${watchLabel}</span>
         <button class="episode-play" data-e="${n}" aria-label="تشغيل الحلقة"><svg><use href="#i-play"/></svg></button>
