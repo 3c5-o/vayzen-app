@@ -4670,14 +4670,77 @@ async function authSignup(req:Request){
 }
 
 
+async function migrateLegacyUserOnLogin(email:string,password:string){
+  const legacy=await legacyGatewayUrl();
+  if(!legacy||!SERVICE_KEY||!email||password.length<8)return false;
+  const allowed=await consumeRateLimit("legacy:"+email.toLowerCase(),"legacy_auth_migration",8,60*60);
+  if(!allowed)return false;
+
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),12000);
+  try{
+    const loginResponse=await fetch(`${legacy}?action=login`,{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({email,password}),
+      signal:controller.signal,
+    });
+    const oldLogin=await loginResponse.json().catch(()=>null);
+    if(!loginResponse.ok||!oldLogin?.ok||!oldLogin?.session?.access_token)return false;
+
+    let displayName="";
+    let avatarUrl="";
+    try{
+      const meResponse=await fetch(`${legacy}?action=me`,{
+        headers:{Authorization:`Bearer ${oldLogin.session.access_token}`},
+        signal:controller.signal,
+      });
+      const oldMe=await meResponse.json().catch(()=>null);
+      if(meResponse.ok&&oldMe?.ok){
+        displayName=String(oldMe?.user?.display_name||"").trim().slice(0,40);
+        avatarUrl=String(oldMe?.user?.avatar_url||"").trim().slice(0,500);
+      }
+    }catch{}
+
+    const {data:created,error:createError}=await db.auth.admin.createUser({
+      email,
+      password,
+      email_confirm:true,
+      user_metadata:{
+        display_name:displayName||email.split("@")[0].slice(0,40),
+        avatar_url:avatarUrl,
+        migrated_from:"legacy_vayzen",
+      },
+    });
+    if(createError||!created.user)return false;
+    await systemLog("info","Legacy VAYZEN account migrated",{user_id:created.user.id});
+    return true;
+  }catch{
+    return false;
+  }finally{
+    clearTimeout(timer);
+  }
+}
+
 async function authLogin(req:Request){
   const body=await req.json().catch(()=>null);
-  const email=String(body?.email||"").trim();
+  const email=String(body?.email||"").trim().toLowerCase();
   const password=String(body?.password||"");
   if(!PUBLIC_KEY)return json({error:"auth unavailable"},503);
+  if(!email.includes("@")||password.length<8)return json({error:"بيانات الدخول غير صحيحة"},401);
+
   const client=createClient(SUPABASE_URL,PUBLIC_KEY,{auth:{persistSession:false,autoRefreshToken:false}});
-  const {data,error}=await client.auth.signInWithPassword({email,password});
-  if(error)return json({error:"بيانات الدخول غير صحيحة"},401);
+  let {data,error}=await client.auth.signInWithPassword({email,password});
+
+  if(error){
+    const migrated=await migrateLegacyUserOnLogin(email,password);
+    if(!migrated)return json({error:"بيانات الدخول غير صحيحة"},401);
+    const retry=await client.auth.signInWithPassword({email,password});
+    data=retry.data;
+    error=retry.error;
+  }
+
+  if(error||!data.user||!data.session)return json({error:"بيانات الدخول غير صحيحة"},401);
   const {data:profile}=await db.from("profiles").select("is_disabled").eq("id",data.user.id).maybeSingle();
   if(profile?.is_disabled)return json({error:"هذا الحساب معطّل حاليًا"},403);
   return json({ok:true,user:{id:data.user.id,email:data.user.email},session:{access_token:data.session.access_token,refresh_token:data.session.refresh_token,expires_at:data.session.expires_at}});
