@@ -533,14 +533,23 @@ async function ensureSeriesRepairSeeded(){
   const {data,error}=await db.from("app_settings").select("value").eq("key","content_sync_pipeline").maybeSingle();
   if(error)throw error;
   const value:any=(data as any)?.value||{};
-  if(value.series_repair_seeded_at)return {seeded:false,queued:0};
-  const queued=await enqueueSeriesRepairBacklog(2000);
+  if(value.series_repair_seeded_at)return {seeded:false,queued:0,complete:true};
+
+  const batchSize=20;
+  const queued=await enqueueSeriesRepairBacklog(batchSize);
+  const totalQueued=Number(value.series_repair_seeded_count||0)+queued;
+  const complete=queued===0;
   await db.from("app_settings").upsert({
     key:"content_sync_pipeline",
-    value:{...value,series_repair_seeded_at:new Date().toISOString(),series_repair_seeded_count:queued},
+    value:{
+      ...value,
+      series_repair_seeded_count:totalQueued,
+      series_repair_last_batch_at:new Date().toISOString(),
+      ...(complete?{series_repair_seeded_at:new Date().toISOString()}:{})
+    },
     updated_at:new Date().toISOString()
   });
-  return {seeded:true,queued};
+  return {seeded:queued>0,queued,total_queued:totalQueued,complete};
 }
 
 async function seriesEpisodeIds(seriesId:string){
