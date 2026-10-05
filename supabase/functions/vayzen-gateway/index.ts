@@ -250,6 +250,7 @@ async function createCanonicalRows(
   for(const item of items)if(item.key&&!unique.has(item.key))unique.set(item.key,item);
   const existing=await canonicalMap(table,[...unique.keys()]);
   const missing=[...unique.values()].filter(x=>!existing.has(x.key));
+  const createdKeys=new Set(missing.map(x=>x.key));
   if(missing.length){
     const rows=missing.map(item=>{
       const base:any={
@@ -277,7 +278,7 @@ async function createCanonicalRows(
     if(error)throw error;
     for(const row of data??[])if(row.identity_key)existing.set(row.identity_key,row);
   }
-  return existing;
+  return {map:existing,createdKeys};
 }
 
 async function syncXtreamRefsAndSources(args:{
@@ -302,7 +303,9 @@ async function syncXtreamRefsAndSources(args:{
   }).filter(x=>x.externalId);
 
   const table=entityType==="movie"?"movies":"series";
-  const canonical=await createCanonicalRows(table,entityType,prepared,autoPublish);
+  const canonicalResult=await createCanonicalRows(table,entityType,prepared,autoPublish);
+  const canonical=canonicalResult.map;
+  const createdKeys=canonicalResult.createdKeys;
   const externalIds=[...new Set(prepared.map(x=>x.externalId))];
 
   const existingRefs=new Map<string,any>();
@@ -319,7 +322,7 @@ async function syncXtreamRefsAndSources(args:{
   const now=new Date().toISOString();
   const refsToInsert:any[]=[];
   const refsToUpdate:any[]=[];
-  let createdItems=0,mergedItems=0,sourceLinks=0;
+  let createdItems=createdKeys.size,mergedItems=0,sourceLinks=0;
   for(const item of prepared){
     const entity=canonical.get(item.key);
     if(!entity)continue;
@@ -334,9 +337,8 @@ async function syncXtreamRefsAndSources(args:{
         external_id:item.externalId,identity_key:item.key,is_active:true,last_seen_at:now,metadata
       });
       existingRefs.set(item.externalId,{id:null,entity_id:entity.id});
-      mergedItems++;
+      if(!createdKeys.has(item.key))mergedItems++;
     }
-    if(entity.status===(autoPublish?"published":"draft")&&String(entity.external_metadata?.xtream_seed||"")==="")createdItems++;
   }
   if(refsToInsert.length){
     const {data,error}=await db.from("content_provider_refs").insert(refsToInsert).select("id,external_id,entity_id");
