@@ -232,7 +232,7 @@ async function canonicalMap(table:"movies"|"series",keys:string[]){
   for(let i=0;i<unique.length;i+=80){
     const part=unique.slice(i,i+80);
     const {data,error}=await db.from(table)
-      .select("id,public_id,identity_key,title,release_year,status,external_source,external_id")
+      .select("id,public_id,identity_key,title,release_year,status,external_source,external_id,ingestion_status")
       .in("identity_key",part);
     if(error)throw error;
     for(const row of data??[])if(row.identity_key&&!map.has(row.identity_key))map.set(row.identity_key,row);
@@ -265,7 +265,12 @@ async function createCanonicalRows(
         origin_country_codes:item.countryCode?[item.countryCode]:[],
         original_language_code:null,
         quality:qualityFromName(item.raw.name,item.raw.container_extension),
-        status:autoPublish?"published":"draft",
+        status:type==="series"?"draft":(autoPublish?"published":"draft"),
+        ...(type==="series"?{
+          ingestion_status:"queued",
+          expected_seasons:0,expected_episodes:0,synced_episodes:0,playable_episodes:0,failed_episodes:0,
+          last_ingestion_error:{}
+        }:{}),
         identity_key:item.key,
         external_metadata:{xtream_seed:compactXtreamMetadata(item.raw,item.categoryName),tmdb_sync_status:"pending"},
       };
@@ -287,8 +292,9 @@ async function syncXtreamRefsAndSources(args:{
   items:Record<string,unknown>[];
   categories:Map<string,string>;
   autoPublish:boolean;
+  parentCatalogJobId?:string|null;
 }){
-  const {account,entityType,items,categories,autoPublish}=args;
+  const {account,entityType,items,categories,autoPublish,parentCatalogJobId=null}=args;
   const prepared=items.map(raw=>{
     const rawName=String(raw.name??raw.title??"").trim();
     const title=normalizeCatalogTitle(rawName)||rawName||"بدون اسم";
@@ -306,7 +312,7 @@ async function syncXtreamRefsAndSources(args:{
   const canonicalResult=await createCanonicalRows(table,entityType,prepared,autoPublish);
   const canonical=canonicalResult.map;
   const createdKeys=canonicalResult.createdKeys;
-  if(autoPublish){
+  if(autoPublish&&entityType==="movie"){
     const ids=[...new Set([...canonical.values()].map((x:any)=>String(x.id)).filter(Boolean))];
     if(ids.length){
       const {error:publishExistingError}=await db.from(table)
@@ -361,6 +367,30 @@ async function syncXtreamRefsAndSources(args:{
     if(error)throw error;
   }
 
+  let seriesJobsQueued=0;
+  if(entityType==="series"){
+    for(const item of prepared){
+      const entity=canonical.get(item.key);
+      const ref=existingRefs.get(item.externalId);
+      if(!entity||!ref?.id)continue;
+      const queued=await queueSeriesIngestJob({
+        seriesId:String(entity.id),
+        accountId:String(account.id),
+        providerRefId:String(ref.id),
+        externalSeriesId:item.externalId,
+        parentCatalogJobId:parentCatalogJobId||null,
+        priority:createdKeys.has(item.key)?80:50,
+      });
+      if(queued)seriesJobsQueued++;
+      if(createdKeys.has(item.key)){
+        const {error:stateError}=await db.from("series").update({
+          status:"draft",ingestion_status:"queued",last_ingestion_error:{},updated_at:now
+        }).eq("id",entity.id);
+        if(stateError)throw stateError;
+      }
+    }
+  }
+
   if(entityType==="movie"){
     const existingSources=new Map<string,any>();
     for(let i=0;i<externalIds.length;i+=80){
@@ -376,10 +406,12 @@ async function syncXtreamRefsAndSources(args:{
     for(const item of prepared){
       const entity=canonical.get(item.key);if(!entity)continue;
       const current=existingSources.get(item.externalId);
+      const ext=String(item.raw.container_extension??"").replace(/[^a-zA-Z0-9]/g,"").toLowerCase();
       const payload:any={
         entity_type:"movie",entity_id:entity.id,source_type:"xtream",
         xtream_account_id:account.id,provider_ref_id:existingRefs.get(item.externalId)?.id||null,
-        external_stream_id:item.externalId,container_extension:String(item.raw.container_extension??""),
+        external_stream_id:item.externalId,container_extension:ext,
+        probe_status:"queued",compatibility_mode:ext==="mkv"?"audio_aac":"direct",
         quality:qualityFromName(item.raw.name,item.raw.container_extension),
         country_code:item.countryCode||null,priority:Number(account.priority||50),is_active:true,
         health_status:"unknown",consecutive_failures:0,last_seen_at:now,
@@ -388,13 +420,15 @@ async function syncXtreamRefsAndSources(args:{
       if(current){
         const {error}=await db.from("playback_sources").update(payload).eq("id",current.id);
         if(error)throw error;
+        await queueMediaProbeSource(String(current.id)).catch(()=>false);
       }else{
         sourcesToInsert.push(payload);sourceLinks++;
       }
     }
     if(sourcesToInsert.length){
-      const {error}=await db.from("playback_sources").insert(sourcesToInsert);
+      const {data:createdSources,error}=await db.from("playback_sources").insert(sourcesToInsert).select("id");
       if(error)throw error;
+      for(const source of createdSources??[])await queueMediaProbeSource(String(source.id)).catch(()=>false);
     }
   }
 
@@ -410,9 +444,123 @@ async function syncXtreamRefsAndSources(args:{
     const key=[...canonical.entries()].find(([,v]:any)=>String(v.id)===String(x.id))?.[0];
     return key?createdKeys.has(String(key)):false;
   });
-  return {processed:prepared.length,createdItems,mergedItems,sourceLinks,entities,createdEntities};
+  return {processed:prepared.length,createdItems,mergedItems,sourceLinks,entities,createdEntities,seriesJobsQueued};
 }
 
+
+async function queueSeriesIngestJob(args:{
+  seriesId:string;accountId:string;providerRefId:string;externalSeriesId:string;
+  parentCatalogJobId?:string|null;priority?:number;force?:boolean;
+}){
+  const {data:active,error:activeError}=await db.from("series_ingest_jobs")
+    .select("id,status,completed_at").eq("series_id",args.seriesId)
+    .in("status",["queued","running","partial","failed"]).is("completed_at",null)
+    .limit(1).maybeSingle();
+  if(activeError)throw activeError;
+  if(active)return false;
+
+  const {data:recent}=await db.from("series_ingest_jobs")
+    .select("id,status,completed_at").eq("series_id",args.seriesId)
+    .eq("provider_account_id",args.accountId)
+    .order("created_at",{ascending:false}).limit(1).maybeSingle();
+  if(!args.force&&recent?.completed_at){
+    if(recent.status==="failed")return false;
+    if(recent.status==="completed"){
+      const {data:seriesRow}=await db.from("series")
+        .select("ingestion_status,playable_episodes").eq("id",args.seriesId).maybeSingle();
+      if(seriesRow?.ingestion_status==="ready"&&Number(seriesRow.playable_episodes||0)>0)return false;
+    }
+  }
+
+  const settings=await pipelineSettingsValue();
+  const {error}=await db.from("series_ingest_jobs").insert({
+    series_id:args.seriesId,
+    provider_account_id:args.accountId,
+    provider_ref_id:args.providerRefId,
+    external_series_id:args.externalSeriesId,
+    parent_catalog_job_id:args.parentCatalogJobId||null,
+    status:"queued",
+    priority:Number(args.priority||50),
+    max_attempts:settings.series_ingest_max_attempts,
+    next_attempt_at:new Date().toISOString(),
+    last_error:null,
+    last_error_detail:{}
+  });
+  if(error){
+    if(String((error as any)?.code||"")==="23505")return false;
+    throw error;
+  }
+  return true;
+}
+
+async function enqueueSeriesRepairBacklog(limit=250){
+  const max=Math.max(1,Math.min(2000,Number(limit||250)));
+  const {data:rows,error}=await db.from("series")
+    .select("id,status,ingestion_status")
+    .in("status",["published","draft"])
+    .order("updated_at",{ascending:true})
+    .limit(max);
+  if(error)throw error;
+  let queued=0;
+  for(const row of rows??[]){
+    const {data:refs,error:refsError}=await db.from("content_provider_refs")
+      .select("id,provider_account_id,external_id")
+      .eq("provider_type","xtream").eq("entity_type","series").eq("entity_id",row.id).eq("is_active",true)
+      .order("last_seen_at",{ascending:false}).limit(1);
+    if(refsError)throw refsError;
+    const ref:any=(refs??[])[0];
+    if(!ref)continue;
+    const counts=await seriesPlaybackCounts(String(row.id)).catch(()=>({seasons:0,episodes:0,playable:0}));
+    if(Number(counts.playable||0)>0&&row.ingestion_status==="ready")continue;
+    const did=await queueSeriesIngestJob({
+      seriesId:String(row.id),accountId:String(ref.provider_account_id),
+      providerRefId:String(ref.id),externalSeriesId:String(ref.external_id),priority:70
+    });
+    if(did){
+      queued++;
+      await db.from("series").update({
+        ingestion_status:"queued",
+        synced_episodes:Number(counts.episodes||0),
+        playable_episodes:Number(counts.playable||0),
+        updated_at:new Date().toISOString()
+      }).eq("id",row.id);
+    }
+  }
+  return queued;
+}
+
+async function ensureSeriesRepairSeeded(){
+  const {data,error}=await db.from("app_settings").select("value").eq("key","content_sync_pipeline").maybeSingle();
+  if(error)throw error;
+  const value:any=(data as any)?.value||{};
+  if(value.series_repair_seeded_at)return {seeded:false,queued:0,complete:true};
+
+  const batchSize=20;
+  const queued=await enqueueSeriesRepairBacklog(batchSize);
+  const totalQueued=Number(value.series_repair_seeded_count||0)+queued;
+  const complete=queued===0;
+  await db.from("app_settings").upsert({
+    key:"content_sync_pipeline",
+    value:{
+      ...value,
+      series_repair_seeded_count:totalQueued,
+      series_repair_last_batch_at:new Date().toISOString(),
+      ...(complete?{series_repair_seeded_at:new Date().toISOString()}:{})
+    },
+    updated_at:new Date().toISOString()
+  });
+  return {seeded:queued>0,queued,total_queued:totalQueued,complete};
+}
+
+async function seriesEpisodeIds(seriesId:string){
+  const {data:seasons,error}=await db.from("seasons").select("id").eq("series_id",seriesId);
+  if(error)throw error;
+  const seasonIds=(seasons??[]).map((x:any)=>String(x.id));
+  if(!seasonIds.length)return [] as string[];
+  const {data:episodes,error:episodeError}=await db.from("episodes").select("id").in("season_id",seasonIds);
+  if(episodeError)throw episodeError;
+  return (episodes??[]).map((x:any)=>String(x.id));
+}
 
 async function pipelineSettingsValue(){
   const {data}=await db.from("app_settings").select("value").eq("key","content_sync_pipeline").maybeSingle();
@@ -420,20 +568,29 @@ async function pipelineSettingsValue(){
   return {
     tmdb_auto_enrich:v.tmdb_auto_enrich!==false,
     tmdb_worker_batch:Math.max(1,Math.min(20,Number(v.tmdb_worker_batch||12))),
+    tmdb_max_attempts:Math.max(1,Math.min(20,Number(v.tmdb_max_attempts||8))),
+    series_ingest_batch:Math.max(1,Math.min(2,Number(v.series_ingest_batch||1))),
+    series_ingest_chunk_size:Math.max(4,Math.min(30,Number(v.series_ingest_chunk_size||12))),
+    series_ingest_max_attempts:Math.max(1,Math.min(20,Number(v.series_ingest_max_attempts||6))),
+    media_probe_batch:Math.max(1,Math.min(5,Number(v.media_probe_batch||3))),
     announcement_worker_batch:Math.max(1,Math.min(5,Number(v.announcement_worker_batch||2))),
     announcement_list_chunk:Math.max(10,Math.min(35,Number(v.announcement_list_chunk||35))),
+    ready_only_catalog:v.ready_only_catalog!==false,
+    catalog_page_size:Math.max(20,Math.min(100,Number(v.catalog_page_size||40))),
     xtream_batch_choices:Array.isArray(v.xtream_batch_choices)?v.xtream_batch_choices:[10,50,100,500,1000],
   };
 }
 
 async function queueTmdbEntities(entityType:"movie"|"series",entities:any[]){
   if(!entities.length)return 0;
+  const settings=await pipelineSettingsValue();
   const rows=entities.filter((x:any)=>x?.id).map((x:any)=>({
     provider:"tmdb",
     entity_type:entityType,
     entity_id:String(x.id),
     status:"pending",
     priority:60,
+    max_attempts:settings.tmdb_max_attempts,
     next_attempt_at:new Date().toISOString(),
     updated_at:new Date().toISOString(),
   }));
@@ -488,11 +645,12 @@ async function enqueuePendingTmdbBacklog(limit=5000){
   let queued=0;
   for(const entityType of ["movie","series"] as const){
     const table=entityType==="movie"?"movies":"series";
-    const {data,error}=await db.from(table)
+    let query=db.from(table)
       .select("id")
       .eq("status","published")
-      .contains("external_metadata",{tmdb_sync_status:"pending"})
-      .limit(max);
+      .contains("external_metadata",{tmdb_sync_status:"pending"});
+    if(entityType==="series")query=query.eq("ingestion_status","ready");
+    const {data,error}=await query.limit(max);
     if(error)throw error;
     queued+=await queueTmdbEntities(entityType,(data??[]).map((x:any)=>({id:x.id})));
   }
@@ -522,9 +680,53 @@ async function latestXtreamCatalogJob(accountId:string){
   return data??null;
 }
 
+async function catalogChildSeriesStats(catalogJobId:string){
+  const {data,error}=await db.from("series_ingest_jobs")
+    .select("status,completed_at").eq("parent_catalog_job_id",catalogJobId);
+  if(error)throw error;
+  let ready=0,failed=0,pending=0;
+  for(const row of data??[]){
+    if(row.status==="completed")ready++;
+    else if(row.status==="failed"&&row.completed_at)failed++;
+    else pending++;
+  }
+  return {ready,failed,pending,total:(data??[]).length};
+}
+
+async function finalizeCatalogJob(job:any,baseUpdate:any={}){
+  const child=await catalogChildSeriesStats(String(job.id));
+  const done=child.pending===0;
+  const finalStatus=done?(child.failed>0?"partial":"completed"):"running";
+  const update:any={
+    ...baseUpdate,
+    series_ready:child.ready,
+    series_failed:child.failed,
+    series_pending:child.pending,
+    status:finalStatus,
+    updated_at:new Date().toISOString(),
+  };
+  if(done)update.completed_at=new Date().toISOString();
+  const {error}=await db.from("xtream_catalog_sync_jobs").update(update).eq("id",job.id);
+  if(error)throw error;
+  if(done&&Number(job.started_by||0)>0){
+    try{
+      await send(Number(job.started_by),
+        (finalStatus==="partial"?"اكتملت مزامنة Xtream مع عناصر تحتاج مراجعة.":"اكتملت مزامنة Xtream بالكامل.")+"\n\n"+
+        "المطلوب: "+Number(job.requested_items||0).toLocaleString("ar-IQ")+"\n"+
+        "تم اكتشافه: "+Number(update.processed_items??job.processed_items??0).toLocaleString("ar-IQ")+"\n"+
+        "أفلام: "+Number(update.movies_seen??job.movies_seen??0).toLocaleString("ar-IQ")+"\n"+
+        "مسلسلات جاهزة: "+child.ready.toLocaleString("ar-IQ")+"\n"+
+        "مسلسلات فاشلة: "+child.failed.toLocaleString("ar-IQ"),
+        {inline_keyboard:[[{text:"حالة Xtream",callback_data:"xtream_settings"},{text:"TMDb",callback_data:"tmdb_settings"}]]}
+      );
+    }catch{}
+  }
+  return {done,status:finalStatus,...child};
+}
+
 async function processXtreamCatalogJob(){
   const {data:job,error}=await db.from("xtream_catalog_sync_jobs")
-    .select("id,account_id,requested_items,processed_items,movies_seen,series_seen,created_items,merged_items,source_links_created,status,started_by")
+    .select("id,account_id,requested_items,processed_items,movies_seen,series_seen,created_items,merged_items,source_links_created,series_ready,series_failed,series_pending,status,started_by")
     .in("status",["pending","running"]).order("created_at",{ascending:true}).limit(1).maybeSingle();
   if(error)throw error;
   if(!job)return {worked:false};
@@ -539,13 +741,13 @@ async function processXtreamCatalogJob(){
 
   const remaining=Math.max(0,Number(job.requested_items||0)-Number(job.processed_items||0));
   if(!remaining){
-    await db.from("xtream_catalog_sync_jobs").update({status:"completed",completed_at:now,updated_at:now}).eq("id",job.id);
-    return {worked:true,completed:true,job_id:job.id};
+    const final=await finalizeCatalogJob(job);
+    return {worked:true,waiting_series:!final.done,completed:final.done,job_id:job.id,...final};
   }
 
   const internalChunk=Math.min(200,remaining);
   try{
-    const result:any=await syncXtreamBatch(String(job.account_id),Number(job.started_by||0),internalChunk);
+    const result:any=await syncXtreamBatch(String(job.account_id),Number(job.started_by||0),internalChunk,String(job.id));
     const processed=Number(result.movies_seen||0)+Number(result.series_seen||0);
     const totals={
       processed_items:Number(job.processed_items||0)+processed,
@@ -556,26 +758,18 @@ async function processXtreamCatalogJob(){
       source_links_created:Number(job.source_links_created||0)+Number(result.source_links_created||0),
     };
     const cycleComplete=Boolean(result?.details?.cycle_complete);
-    const complete=cycleComplete||totals.processed_items>=Number(job.requested_items||0)||processed===0;
-    const update:any={...totals,status:complete?"completed":"running",updated_at:new Date().toISOString(),last_error:null};
-    if(complete)update.completed_at=new Date().toISOString();
-    const {error:updateError}=await db.from("xtream_catalog_sync_jobs").update(update).eq("id",job.id);
-    if(updateError)throw updateError;
-    if(complete&&Number(job.started_by||0)>0){
-      try{
-        await send(Number(job.started_by),
-          "اكتملت مزامنة Xtream.\n"+
-          "المطلوب: "+Number(job.requested_items||0).toLocaleString("ar-IQ")+"\n"+
-          "تمت المعالجة: "+totals.processed_items.toLocaleString("ar-IQ")+"\n"+
-          "أفلام: "+totals.movies_seen.toLocaleString("ar-IQ")+"\n"+
-          "مسلسلات: "+totals.series_seen.toLocaleString("ar-IQ")+"\n"+
-          "محتوى جديد: "+totals.created_items.toLocaleString("ar-IQ")+"\n\n"+
-          "مزامنة TMDb والإعلانات تستمر تلقائيًا بالخلفية.",
-          {inline_keyboard:[[{text:"حالة Xtream",callback_data:"xtream_settings"},{text:"TMDb",callback_data:"tmdb_settings"}]]}
-        );
-      }catch{}
+    const discoveryComplete=cycleComplete||totals.processed_items>=Number(job.requested_items||0)||processed===0;
+    const baseUpdate:any={...totals,updated_at:new Date().toISOString(),last_error:null};
+    if(discoveryComplete){
+      const final=await finalizeCatalogJob({...job,...totals},baseUpdate);
+      return {worked:true,completed:final.done,waiting_series:!final.done,job_id:job.id,processed,...final};
     }
-    return {worked:true,completed:complete,job_id:job.id,processed};
+    const child=await catalogChildSeriesStats(String(job.id));
+    const {error:updateError}=await db.from("xtream_catalog_sync_jobs").update({
+      ...baseUpdate,series_ready:child.ready,series_failed:child.failed,series_pending:child.pending,status:"running"
+    }).eq("id",job.id);
+    if(updateError)throw updateError;
+    return {worked:true,completed:false,job_id:job.id,processed,...child};
   }catch(error){
     const message=adminErrorText(error);
     await db.from("xtream_catalog_sync_jobs").update({
@@ -599,7 +793,7 @@ async function processMetadataSyncQueue(limitOverride?:number){
   const limit=Math.max(1,Math.min(20,Number(limitOverride||settings.tmdb_worker_batch)));
   const now=new Date().toISOString();
   const {data:items,error}=await db.from("metadata_sync_queue")
-    .select("id,entity_type,entity_id,attempts")
+    .select("id,entity_type,entity_id,attempts,max_attempts,last_error_detail")
     .in("status",["pending","failed"])
     .lte("next_attempt_at",now)
     .order("priority",{ascending:false})
@@ -618,12 +812,24 @@ async function processMetadataSyncQueue(limitOverride?:number){
       const table=type==="movie"?"movies":"series";
       const fields=type==="movie"
         ?"id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,duration_minutes,rating,rating_count,external_source,external_id,external_metadata,release_date,status"
-        :"id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,rating,rating_count,external_source,external_id,external_metadata,first_air_date,status";
-      const {data:row,error:rowError}=await db.from(table).select(fields).eq("id",item.entity_id).maybeSingle();
+        :"id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,rating,rating_count,external_source,external_id,external_metadata,first_air_date,status,ingestion_status";
+      const {data:rowData,error:rowError}=await db.from(table).select(fields).eq("id",item.entity_id).maybeSingle();
       if(rowError)throw rowError;
-      if(!row||row.status!=="published"){
+      const row:any=rowData;
+      if(!row){
         await db.from("metadata_sync_queue").update({
-          status:"completed",completed_at:new Date().toISOString(),updated_at:new Date().toISOString(),last_error:null
+          status:"permanent_failed",completed_at:new Date().toISOString(),updated_at:new Date().toISOString(),
+          last_error:"Content row no longer exists",last_error_detail:{code:"CONTENT_MISSING"}
+        }).eq("id",item.id);
+        processed++;failed++;
+        continue;
+      }
+      if(row.status!=="published"||(type==="series"&&String((row as any).ingestion_status||"ready")!=="ready")){
+        await db.from("metadata_sync_queue").update({
+          status:"pending",
+          next_attempt_at:new Date(Date.now()+5*60_000).toISOString(),
+          updated_at:new Date().toISOString(),
+          last_error:null,last_error_detail:{}
         }).eq("id",item.id);
         processed++;
         continue;
@@ -642,17 +848,33 @@ async function processMetadataSyncQueue(limitOverride?:number){
         try{await syncTmdbSeriesEpisodeMetadata(String(row.id));}catch{}
       }
       await db.from("metadata_sync_queue").update({
-        status:"completed",completed_at:new Date().toISOString(),updated_at:new Date().toISOString(),last_error:null
+        status:"completed",completed_at:new Date().toISOString(),updated_at:new Date().toISOString(),last_error:null,last_error_detail:{}
       }).eq("id",item.id);
       matched++;processed++;
     }catch(error){
       const attempts=Number(item.attempts||0)+1;
+      const settings=await pipelineSettingsValue();
+      const maxAttempts=Math.max(1,Number(item.max_attempts||settings.tmdb_max_attempts||8));
+      const exhausted=attempts>=maxAttempts;
       const delay=queueBackoffSeconds(attempts);
       const next=new Date(Date.now()+delay*1000).toISOString();
-      const message=adminErrorText(error).slice(0,1000);
+      const detail=errorDetail(error);
       await db.from("metadata_sync_queue").update({
-        status:"failed",attempts,next_attempt_at:next,last_error:message,locked_at:null,updated_at:new Date().toISOString()
+        status:exhausted?"manual_review":"failed",
+        attempts,
+        max_attempts:maxAttempts,
+        next_attempt_at:next,
+        last_error:String(detail.message||"TMDb sync failed").slice(0,1000),
+        last_error_detail:detail,
+        locked_at:null,
+        updated_at:new Date().toISOString(),
+        ...(exhausted?{completed_at:new Date().toISOString()}:{})
       }).eq("id",item.id);
+      if(exhausted){
+        await systemLog("warning","TMDb metadata moved to manual review",{
+          entity_type:item.entity_type,entity_id:item.entity_id,attempts,error:detail
+        });
+      }
       failed++;processed++;
     }
   }
@@ -677,6 +899,126 @@ function announcementText(row:any){
     return (i+1)+". "+String(x.title||"بدون اسم").slice(0,90)+year+pid;
   });
   return [...header,...lines].join("\n").slice(0,4000);
+}
+
+async function exactXtreamUpstream(source:any){
+  const accountId=String(source?.xtream_account_id||"");
+  if(!accountId)throw new Error("Xtream source account is missing");
+  const account:any=await xtreamAccountWithSecret(accountId);
+  if(!account?.is_enabled||account.status==="disabled"||account.status==="down")throw new Error("Xtream account is unavailable");
+  const credentials=await xtreamCredentials(account);
+  const entityType=String(source.entity_type||"");
+  const path=entityType==="movie"?"movie":"series";
+  if(!["movie","episode"].includes(entityType))throw new Error("Unsupported Xtream media type");
+  const extension=String(source.container_extension||"mp4").replace(/[^a-zA-Z0-9]/g,"").toLowerCase()||"mp4";
+  return credentials.server.replace(/\/+$/,"")+"/"+path+"/"+
+    encodeURIComponent(credentials.username)+"/"+encodeURIComponent(credentials.password)+"/"+
+    encodeURIComponent(String(source.external_stream_id||""))+"."+extension;
+}
+
+async function ensureMediaProbeSeeded(){
+  const {data:settingsRow,error:settingsError}=await db.from("app_settings").select("value").eq("key","content_sync_pipeline").maybeSingle();
+  if(settingsError)throw settingsError;
+  const value:any=(settingsRow as any)?.value||{};
+  if(value.media_probe_seeded_at)return {seeded:false,queued:0};
+  const {data:sources,error}=await db.from("playback_sources")
+    .select("id").eq("source_type","xtream").eq("is_active",true).limit(10000);
+  if(error)throw error;
+  let queued=0;
+  for(const source of sources??[])if(await queueMediaProbeSource(String(source.id)).catch(()=>false))queued++;
+  await db.from("app_settings").upsert({
+    key:"content_sync_pipeline",
+    value:{...value,media_probe_seeded_at:new Date().toISOString(),media_probe_seeded_count:queued},
+    updated_at:new Date().toISOString()
+  });
+  return {seeded:true,queued};
+}
+
+async function processMediaProbeQueue(){
+  const gateway=await mediaCompatibilityGateway();
+  if(!gateway)return {worked:false,configured:false};
+  const {data:job,error}=await db.from("media_probe_jobs")
+    .select("id,playback_source_id,status,attempts,max_attempts")
+    .in("status",["queued","failed"]).lte("next_attempt_at",new Date().toISOString())
+    .order("created_at",{ascending:true}).limit(1).maybeSingle();
+  if(error)throw error;
+  if(!job)return {worked:false,configured:true};
+
+  const attempts=Number(job.attempts||0)+1;
+  await db.from("media_probe_jobs").update({
+    status:"probing",attempts,started_at:new Date().toISOString(),last_error:null,last_error_detail:{}
+  }).eq("id",job.id);
+
+  try{
+    const {data:source,error:sourceError}=await db.from("playback_sources")
+      .select("id,entity_type,entity_id,xtream_account_id,external_stream_id,container_extension,metadata")
+      .eq("id",job.playback_source_id).maybeSingle();
+    if(sourceError)throw sourceError;
+    if(!source)throw new Error("Playback source not found");
+    const upstream=await exactXtreamUpstream(source);
+    const token=await xtreamProxyToken(upstream);
+    const bridge=await telegramBridgeConfig();
+    if(!bridge.secret)throw new Error("Worker shared secret is not configured");
+
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),45_000);
+    let response:Response;
+    try{
+      response=await fetch(gateway+"/probe/"+encodeURIComponent(token),{
+        method:"POST",
+        headers:{"x-vayzen-edge-secret":bridge.secret,"accept":"application/json"},
+        signal:controller.signal
+      });
+    }finally{clearTimeout(timer);}
+    const payload:any=await response.json().catch(()=>({}));
+    if(!response.ok||!payload?.ok)throw new Error(String(payload?.detail||payload?.error||("Media probe HTTP "+response.status)));
+
+    const mode=["direct","hls_remux","audio_aac","full_h264_aac"].includes(String(payload.recommended_mode))
+      ?String(payload.recommended_mode):"audio_aac";
+    const probeStatus=mode==="direct"?"compatible":mode==="full_h264_aac"?"needs_full_transcode":"needs_audio_transcode";
+    const {error:updateSourceError}=await db.from("playback_sources").update({
+      video_codec:String(payload.video_codec||"").slice(0,40),
+      audio_codec:String(payload.audio_codec||"").slice(0,40),
+      audio_channels:Number(payload.audio_channels||0)||null,
+      probe_status:probeStatus,
+      compatibility_mode:mode,
+      metadata:{
+        ...(source as any).metadata,
+        probe:{
+          format:String(payload.format||"").slice(0,120),
+          duration_seconds:Number(payload.duration_seconds||0)||null,
+          probed_at:new Date().toISOString()
+        }
+      },
+      last_checked_at:new Date().toISOString()
+    }).eq("id",source.id);
+    if(updateSourceError)throw updateSourceError;
+    await db.from("media_probe_jobs").update({
+      status:"completed",last_error:null,last_error_detail:{},completed_at:new Date().toISOString()
+    }).eq("id",job.id);
+    return {worked:true,configured:true,completed:true,source_id:source.id,mode};
+  }catch(err){
+    const detail=errorDetail(err);
+    const maxAttempts=Math.max(1,Number(job.max_attempts||5));
+    const exhausted=attempts>=maxAttempts;
+    const next=new Date(Date.now()+queueBackoffSeconds(attempts)*1000).toISOString();
+    await db.from("media_probe_jobs").update({
+      status:exhausted?"permanent_failed":"failed",
+      last_error:detail.message,last_error_detail:detail,next_attempt_at:next,
+      ...(exhausted?{completed_at:new Date().toISOString()}:{})
+    }).eq("id",job.id);
+    if(exhausted){
+      const {data:source}=await db.from("playback_sources")
+        .select("id,container_extension").eq("id",job.playback_source_id).maybeSingle();
+      if(source){
+        await db.from("playback_sources").update({
+          probe_status:"failed",
+          compatibility_mode:String(source.container_extension||"").toLowerCase()==="mkv"?"audio_aac":"direct"
+        }).eq("id",source.id);
+      }
+    }
+    return {worked:true,configured:true,completed:false,failed:true,exhausted,error:detail.message};
+  }
 }
 
 async function processAnnouncementOutbox(limitOverride?:number){
@@ -727,14 +1069,20 @@ async function internalWorkerAuthorized(req:Request){
 
 async function pipelineWorkerTick(req:Request){
   if(!(await internalWorkerAuthorized(req)))return json({error:"unauthorized"},401);
+  const repairSeed=await ensureSeriesRepairSeeded().catch(error=>({seeded:false,queued:0,error:adminErrorText(error)}));
+  const mediaProbeSeed=await ensureMediaProbeSeeded().catch(error=>({seeded:false,queued:0,error:adminErrorText(error)}));
   await enqueuePendingTmdbBacklog(1000).catch(()=>0);
-  const xtream=await processXtreamCatalogJob();
-  const tmdb=await processMetadataSyncQueue(xtream?.worked?6:undefined);
+  const mediaProbe=await processMediaProbeQueue();
+  const seriesIngest=await processSeriesIngestJob();
+  const xtream=seriesIngest?.worked
+    ?{worked:false,blocked_by_series:true}
+    :await processXtreamCatalogJob();
+  const tmdb=await processMetadataSyncQueue((seriesIngest?.worked||xtream?.worked)?6:undefined);
   const announcements=await processAnnouncementOutbox();
-  return json({ok:true,xtream,tmdb,announcements});
+  return json({ok:true,repairSeed,mediaProbeSeed,mediaProbe,seriesIngest,xtream,tmdb,announcements});
 }
 
-async function syncXtreamBatch(accountId:string,startedBy:number,batchOverride?:number){
+async function syncXtreamBatch(accountId:string,startedBy:number,batchOverride?:number,parentCatalogJobId?:string|null){
   const account=await xtreamAccountWithSecret(accountId);
   if(!account.is_enabled)throw new Error("حساب Xtream متوقف.");
   const credentials=await xtreamCredentials(account);
@@ -769,11 +1117,11 @@ async function syncXtreamBatch(accountId:string,startedBy:number,batchOverride?:
     const movieBatch=snapshot.movies.slice(movieCursor,movieCursor+movieTake);
     const seriesBatch=snapshot.series.slice(seriesCursor,seriesCursor+seriesTake);
     const movieResult=movieBatch.length
-      ?await syncXtreamRefsAndSources({account,entityType:"movie",items:movieBatch,categories:movieCategories,autoPublish:settings.auto_publish})
-      :{processed:0,createdItems:0,mergedItems:0,sourceLinks:0};
+      ?await syncXtreamRefsAndSources({account,entityType:"movie",items:movieBatch,categories:movieCategories,autoPublish:settings.auto_publish,parentCatalogJobId})
+      :{processed:0,createdItems:0,mergedItems:0,sourceLinks:0,entities:[],createdEntities:[],seriesJobsQueued:0};
     const seriesResult=seriesBatch.length
-      ?await syncXtreamRefsAndSources({account,entityType:"series",items:seriesBatch,categories:seriesCategories,autoPublish:settings.auto_publish})
-      :{processed:0,createdItems:0,mergedItems:0,sourceLinks:0};
+      ?await syncXtreamRefsAndSources({account,entityType:"series",items:seriesBatch,categories:seriesCategories,autoPublish:false,parentCatalogJobId})
+      :{processed:0,createdItems:0,mergedItems:0,sourceLinks:0,entities:[],createdEntities:[],seriesJobsQueued:0};
 
     movieCursor+=movieTake;seriesCursor+=seriesTake;
     const movieDone=!movieEnabled||movieCursor>=snapshot.movies.length;
@@ -796,15 +1144,9 @@ async function syncXtreamBatch(accountId:string,startedBy:number,batchOverride?:
 
     const pipelineSettings=await pipelineSettingsValue();
     if(pipelineSettings.tmdb_auto_enrich){
-      await Promise.all([
-        queueTmdbEntities("movie",movieResult.entities||[]),
-        queueTmdbEntities("series",seriesResult.entities||[])
-      ]);
+      await queueTmdbEntities("movie",movieResult.entities||[]);
     }
-    await Promise.all([
-      queueXtreamAnnouncementChunks(runId,String(account.name||"Xtream"),"movie",movieResult.createdEntities||[]),
-      queueXtreamAnnouncementChunks(runId,String(account.name||"Xtream"),"series",seriesResult.createdEntities||[])
-    ]);
+    await queueXtreamAnnouncementChunks(runId,String(account.name||"Xtream"),"movie",movieResult.createdEntities||[]);
 
     const summary={
       movies_seen:movieResult.processed,series_seen:seriesResult.processed,
@@ -817,8 +1159,9 @@ async function syncXtreamBatch(accountId:string,startedBy:number,batchOverride?:
         auto_publish:settings.auto_publish,
         run_id:runId,
         batch_size:batch,
-        tmdb_queued:(movieResult.entities||[]).length+(seriesResult.entities||[]).length,
-        announcements_queued:(movieResult.createdEntities||[]).length+(seriesResult.createdEntities||[]).length
+        tmdb_queued:(movieResult.entities||[]).length,
+        announcements_queued:(movieResult.createdEntities||[]).length,
+        series_jobs_queued:Number(seriesResult.seriesJobsQueued||0)
       }
     };
     await db.from("xtream_sync_runs").update({
@@ -1869,8 +2212,38 @@ async function recoverStalePublishSession(userId:number,flow:string,session:any)
   return true;
 }
 
+function errorDetail(err:any){
+  if(err instanceof Error){
+    const anyErr:any=err;
+    return {
+      name:String(err.name||"Error").slice(0,80),
+      message:String(err.message||"خطأ غير معروف").slice(0,1200),
+      code:anyErr.code??null,
+      status:anyErr.status??anyErr.statusCode??null,
+      details:anyErr.details??null,
+      hint:anyErr.hint??null,
+    };
+  }
+  if(err&&typeof err==="object"){
+    const obj:any=err;
+    let message=String(obj.message??obj.error_description??obj.error??"").trim();
+    if(!message){
+      try{message=JSON.stringify(obj);}catch{message="خطأ غير معروف";}
+    }
+    return {
+      name:String(obj.name||"ObjectError").slice(0,80),
+      message:message.slice(0,1200),
+      code:obj.code??null,
+      status:obj.status??obj.statusCode??null,
+      details:obj.details??null,
+      hint:obj.hint??null,
+    };
+  }
+  return {name:"Error",message:String(err??"خطأ غير معروف").slice(0,1200),code:null,status:null,details:null,hint:null};
+}
 function adminErrorText(err:any){
-  const raw=err instanceof Error?err.message:String(err||"خطأ غير معروف");
+  const detail=errorDetail(err);
+  const raw=detail.message||"خطأ غير معروف";
   if(raw.includes("chat not found"))return "تعذر الوصول إلى قناة التخزين. تحقق أن البوت مشرف في القناة.";
   if(raw.includes("file exceeds"))return "حجم الملف أكبر من الحد المسموح.";
   if(raw.includes("Series not found"))return "المسلسل غير موجود أو غير منشور.";
@@ -2745,22 +3118,186 @@ async function sendTrashManager(chatId:number,admin:Admin){
   return send(chatId,`سلة المحذوفات\nالاحتفاظ: 14 يومًا\n\n${lines||"السلة فارغة."}`,{inline_keyboard:rows});
 }
 
+async function jobStatusCounts(table:string,statuses:string[]){
+  const out:Record<string,number>={};
+  for(const status of statuses){
+    const {count,error}=await db.from(table).select("id",{head:true,count:"exact"}).eq("status",status);
+    if(error)throw error;
+    out[status]=Number(count||0);
+  }
+  return out;
+}
+
 async function sendJobCenter(chatId:number){
-  const {data,error}=await db.from("media_transfer_jobs")
-    .select("id,status,entity_type,entity_public_id,kind,variant,file_size,attempts,max_attempts,last_error,updated_at")
-    .order("updated_at",{ascending:false}).limit(20);
-  if(error)throw error;
-  const jobs:any[]=data??[];
-  const counts=jobs.reduce((m:any,j:any)=>(m[j.status]=(m[j.status]||0)+1,m),{});
-  const rows:any[]=jobs.slice(0,10).map((j:any)=>[{text:
-    `${j.status==="completed"?"✓":j.status==="failed"?"!":j.status==="processing"?"…":"○"} ${j.entity_public_id||j.kind||"Job"} • ${sizeLabel(j.file_size)}`,
-    callback_data:`job|${j.id}`
-  }]);
-  rows.push([{text:"تحديث",callback_data:"jobs"},{text:"رجوع",callback_data:"menu"}]);
+  const [transfer,seriesJobs,probeJobs,tmdbJobs]=await Promise.all([
+    jobStatusCounts("media_transfer_jobs",["pending","processing","completed","failed","rolled_back"]),
+    jobStatusCounts("series_ingest_jobs",["queued","running","partial","completed","failed"]),
+    jobStatusCounts("media_probe_jobs",["queued","probing","completed","failed","permanent_failed"]),
+    jobStatusCounts("metadata_sync_queue",["pending","processing","completed","not_found","failed","manual_review","permanent_failed"])
+  ]);
   return send(chatId,
-    `مركز عمليات الوسائط\n\nمكتمل: ${counts.completed||0}\nقيد التنفيذ: ${counts.processing||0}\nبانتظار: ${counts.pending||0}\nفشل: ${counts.failed||0}\n\nآخر العمليات:`,
+    "مركز العمليات\n\n"+
+    "رفع Telegram\n"+
+    "• انتظار: "+transfer.pending+" • تنفيذ: "+transfer.processing+" • فشل: "+(transfer.failed+transfer.rolled_back)+"\n\n"+
+    "تجهيز المسلسلات\n"+
+    "• انتظار: "+seriesJobs.queued+" • تنفيذ: "+seriesJobs.running+" • جزئي: "+seriesJobs.partial+" • مكتمل: "+seriesJobs.completed+" • فشل: "+seriesJobs.failed+"\n\n"+
+    "فحص الصوت وCodec\n"+
+    "• انتظار: "+probeJobs.queued+" • فحص: "+probeJobs.probing+" • مكتمل: "+probeJobs.completed+" • فشل: "+(probeJobs.failed+probeJobs.permanent_failed)+"\n\n"+
+    "TMDb\n"+
+    "• انتظار: "+tmdbJobs.pending+" • تنفيذ: "+tmdbJobs.processing+" • مكتمل: "+tmdbJobs.completed+" • مراجعة: "+(tmdbJobs.manual_review+tmdbJobs.permanent_failed),
+    {inline_keyboard:[
+      [{text:"رفع Telegram",callback_data:"jobs_transfer"},{text:"المسلسلات",callback_data:"jobs_series"}],
+      [{text:"الصوت وCodec",callback_data:"jobs_probe"},{text:"TMDb",callback_data:"jobs_tmdb"}],
+      [{text:"تحديث",callback_data:"jobs"},{text:"رجوع",callback_data:"menu"}]
+    ]}
+  );
+}
+
+async function sendTransferJobs(chatId:number){
+  const {data,error}=await db.from("media_transfer_jobs")
+    .select("id,status,entity_public_id,kind,file_size,updated_at")
+    .order("updated_at",{ascending:false}).limit(12);
+  if(error)throw error;
+  const rows:any[]=(data??[]).map((j:any)=>[{
+    text:(j.status==="completed"?"✓ ":j.status==="failed"?"! ":j.status==="processing"?"… ":"○ ")+(j.entity_public_id||j.kind||"Job")+" • "+sizeLabel(j.file_size),
+    callback_data:"job|"+j.id
+  }]);
+  rows.push([{text:"رجوع للعمليات",callback_data:"jobs"}]);
+  return send(chatId,"آخر عمليات رفع Telegram",{inline_keyboard:rows});
+}
+
+async function sendSeriesJobs(chatId:number){
+  const {data,error}=await db.from("series_ingest_jobs")
+    .select("id,series_id,status,attempts,max_attempts,cursor_index,expected_episodes,playable_episodes,last_error,updated_at")
+    .neq("status","completed").order("updated_at",{ascending:false}).limit(12);
+  if(error)throw error;
+  const rows:any[]=[];
+  const lines:string[]=[];
+  for(const j of data??[]){
+    const {data:s}=await db.from("series").select("public_id,title").eq("id",j.series_id).maybeSingle();
+    const done=Number(j.playable_episodes||0),total=Number(j.expected_episodes||0);
+    lines.push("• "+String(s?.public_id||"—")+" • "+String(s?.title||"مسلسل").slice(0,50)+" • "+j.status+" • "+done+"/"+(total||"؟"));
+    rows.push([{text:(s?.public_id||"مسلسل")+" • "+j.status,callback_data:"sjob|"+j.id}]);
+  }
+  rows.push([{text:"تحديث",callback_data:"jobs_series"},{text:"رجوع",callback_data:"jobs"}]);
+  return send(chatId,"Jobs المسلسلات\n\n"+(lines.join("\n")||"لا توجد عمليات معلقة."),{inline_keyboard:rows});
+}
+
+async function sendSeriesJobItem(chatId:number,id:string){
+  const {data:j,error}=await db.from("series_ingest_jobs").select("*").eq("id",id).maybeSingle();
+  if(error)throw error;
+  if(!j)return sendSeriesJobs(chatId);
+  const {data:s}=await db.from("series").select("public_id,title,ingestion_status").eq("id",j.series_id).maybeSingle();
+  const rows:any[]=[];
+  if(["partial","failed"].includes(j.status)||Number(j.failed_episodes||0)>0){
+    rows.push([{text:"إعادة من البداية",callback_data:"sjob_retry|"+j.id}]);
+  }
+  rows.push([{text:"رجوع لمسلسلات Jobs",callback_data:"jobs_series"}]);
+  return send(chatId,
+    "Job مسلسل\n\n"+
+    "المحتوى: "+String(s?.public_id||"—")+" • "+String(s?.title||"—")+"\n"+
+    "حالة المسلسل: "+String(s?.ingestion_status||"—")+"\n"+
+    "حالة Job: "+j.status+"\n"+
+    "التقدم: "+Number(j.playable_episodes||0)+"/"+(Number(j.expected_episodes||0)||"؟")+"\n"+
+    "Cursor: "+Number(j.cursor_index||0)+"\n"+
+    "المحاولات: "+Number(j.attempts||0)+"/"+Number(j.max_attempts||0)+"\n"+
+    "آخر خطأ: "+(j.last_error?String(j.last_error).slice(0,300):"—"),
     {inline_keyboard:rows}
   );
+}
+
+async function retrySeriesIngestJob(id:string){
+  const {data:j,error}=await db.from("series_ingest_jobs").select("id,series_id").eq("id",id).maybeSingle();
+  if(error||!j)throw error??new Error("Job غير موجود");
+  const now=new Date().toISOString();
+  const {error:updateError}=await db.from("series_ingest_jobs").update({
+    status:"queued",attempts:0,error_attempts:0,cursor_index:0,
+    next_attempt_at:now,completed_at:null,last_error:null,last_error_detail:{},updated_at:now
+  }).eq("id",id);
+  if(updateError)throw updateError;
+  await db.from("series").update({ingestion_status:"queued",last_ingestion_error:{},updated_at:now}).eq("id",j.series_id);
+}
+
+async function sendProbeJobs(chatId:number){
+  const {data,error}=await db.from("media_probe_jobs")
+    .select("id,playback_source_id,status,attempts,max_attempts,last_error,updated_at")
+    .neq("status","completed").order("updated_at",{ascending:false}).limit(12);
+  if(error)throw error;
+  const rows:any[]=[];
+  const lines:string[]=[];
+  for(const j of data??[]){
+    const {data:s}=await db.from("playback_sources")
+      .select("entity_type,entity_id,container_extension,video_codec,audio_codec,compatibility_mode,probe_status")
+      .eq("id",j.playback_source_id).maybeSingle();
+    lines.push("• "+String(s?.entity_type||"media")+" • "+String(s?.container_extension||"—").toUpperCase()+" • "+j.status+" • "+String(s?.audio_codec||"غير مفحوص"));
+    rows.push([{text:String(s?.entity_type||"Media")+" • "+j.status,callback_data:"pjob|"+j.id}]);
+  }
+  rows.push([{text:"تحديث",callback_data:"jobs_probe"},{text:"رجوع",callback_data:"jobs"}]);
+  return send(chatId,"Jobs الصوت وCodec\n\n"+(lines.join("\n")||"لا توجد عمليات معلقة."),{inline_keyboard:rows});
+}
+
+async function sendProbeJobItem(chatId:number,id:string){
+  const {data:j,error}=await db.from("media_probe_jobs").select("*").eq("id",id).maybeSingle();
+  if(error)throw error;
+  if(!j)return sendProbeJobs(chatId);
+  const {data:s}=await db.from("playback_sources")
+    .select("entity_type,container_extension,video_codec,audio_codec,audio_channels,probe_status,compatibility_mode")
+    .eq("id",j.playback_source_id).maybeSingle();
+  const rows:any[]=[];
+  if(["failed","permanent_failed"].includes(j.status))rows.push([{text:"إعادة الفحص",callback_data:"pjob_retry|"+j.id}]);
+  rows.push([{text:"رجوع لفحص Codec",callback_data:"jobs_probe"}]);
+  return send(chatId,
+    "فحص مصدر وسائط\n\n"+
+    "الحالة: "+j.status+"\n"+
+    "النوع: "+String(s?.entity_type||"—")+"\n"+
+    "الحاوية: "+String(s?.container_extension||"—").toUpperCase()+"\n"+
+    "Video: "+String(s?.video_codec||"—")+"\n"+
+    "Audio: "+String(s?.audio_codec||"—")+" • "+String(s?.audio_channels||"—")+"ch\n"+
+    "المعالجة: "+String(s?.compatibility_mode||"—")+"\n"+
+    "المحاولات: "+Number(j.attempts||0)+"/"+Number(j.max_attempts||0)+"\n"+
+    "آخر خطأ: "+(j.last_error?String(j.last_error).slice(0,300):"—"),
+    {inline_keyboard:rows}
+  );
+}
+
+async function retryProbeJob(id:string){
+  const {data:j,error}=await db.from("media_probe_jobs").select("id,playback_source_id").eq("id",id).maybeSingle();
+  if(error||!j)throw error??new Error("Probe Job غير موجود");
+  const now=new Date().toISOString();
+  await db.from("media_probe_jobs").update({
+    status:"queued",attempts:0,next_attempt_at:now,completed_at:null,
+    last_error:null,last_error_detail:{},updated_at:now
+  }).eq("id",id);
+  await db.from("playback_sources").update({probe_status:"queued",updated_at:now}).eq("id",j.playback_source_id);
+}
+
+async function sendTmdbJobs(chatId:number){
+  const counts=await jobStatusCounts("metadata_sync_queue",["pending","processing","completed","not_found","failed","manual_review","permanent_failed"]);
+  const {data,error}=await db.from("metadata_sync_queue")
+    .select("id,entity_type,entity_id,status,attempts,max_attempts,last_error,updated_at")
+    .in("status",["failed","manual_review","permanent_failed"])
+    .order("updated_at",{ascending:false}).limit(8);
+  if(error)throw error;
+  const lines=(data??[]).map((j:any)=>"• "+j.entity_type+" • "+j.status+" • "+j.attempts+"/"+j.max_attempts+" • "+(j.last_error?String(j.last_error).slice(0,100):"—"));
+  return send(chatId,
+    "TMDb Jobs\n\n"+
+    "انتظار: "+counts.pending+" • تنفيذ: "+counts.processing+" • مكتمل: "+counts.completed+"\n"+
+    "غير موجود: "+counts.not_found+" • فشل مؤقت: "+counts.failed+" • مراجعة: "+(counts.manual_review+counts.permanent_failed)+"\n\n"+
+    (lines.join("\n")||"لا توجد أخطاء تحتاج مراجعة."),
+    {inline_keyboard:[
+      [{text:"إعادة أخطاء TMDb",callback_data:"jobs_tmdb_retry"}],
+      [{text:"تحديث",callback_data:"jobs_tmdb"},{text:"رجوع",callback_data:"jobs"}]
+    ]}
+  );
+}
+
+async function retryTmdbFailures(){
+  const now=new Date().toISOString();
+  const {error}=await db.from("metadata_sync_queue").update({
+    status:"pending",attempts:0,next_attempt_at:now,completed_at:null,
+    last_error:null,last_error_detail:{},locked_at:null,updated_at:now
+  }).in("status",["failed","manual_review","permanent_failed"]);
+  if(error)throw error;
 }
 
 async function sendJobItem(chatId:number,id:string){
@@ -4372,8 +4909,49 @@ async function callback(q:any){
   }
 
   if(a==="jobs"){
-    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة عمليات الوسائط.");
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة العمليات.");
     return sendJobCenter(chatId);
+  }
+  if(a==="jobs_transfer"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة العمليات.");
+    return sendTransferJobs(chatId);
+  }
+  if(a==="jobs_series"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة العمليات.");
+    return sendSeriesJobs(chatId);
+  }
+  if(a==="jobs_probe"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة العمليات.");
+    return sendProbeJobs(chatId);
+  }
+  if(a==="jobs_tmdb"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة العمليات.");
+    return sendTmdbJobs(chatId);
+  }
+  if(a==="jobs_tmdb_retry"){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية إعادة المحاولة.");
+    try{await retryTmdbFailures();return sendTmdbJobs(chatId)}
+    catch(err){return send(chatId,"تعذر إعادة TMDb.\n"+adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:"jobs_tmdb"}]]})}
+  }
+  if(a.startsWith("sjob|")){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة العمليات.");
+    const [,id]=a.split("|");return sendSeriesJobItem(chatId,id);
+  }
+  if(a.startsWith("sjob_retry|")){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية إعادة المحاولة.");
+    const [,id]=a.split("|");
+    try{await retrySeriesIngestJob(id);return sendSeriesJobItem(chatId,id)}
+    catch(err){return send(chatId,"تعذر إعادة Job المسلسل.\n"+adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:"jobs_series"}]]})}
+  }
+  if(a.startsWith("pjob|")){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة العمليات.");
+    const [,id]=a.split("|");return sendProbeJobItem(chatId,id);
+  }
+  if(a.startsWith("pjob_retry|")){
+    if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية إعادة الفحص.");
+    const [,id]=a.split("|");
+    try{await retryProbeJob(id);return sendProbeJobItem(chatId,id)}
+    catch(err){return send(chatId,"تعذر إعادة فحص Codec.\n"+adminErrorText(err),{inline_keyboard:[[{text:"رجوع",callback_data:"jobs_probe"}]]})}
   }
   if(a.startsWith("job|")){
     if(!can(admin,"system"))return send(chatId,"لا تملك صلاحية متابعة عمليات الوسائط.");
@@ -5194,7 +5772,7 @@ async function xtreamStreamSource(entityType:"movie"|"episode",id:string,variant
   if(!/^[0-9a-f-]{36}$/i.test(id))return null;
   const requested=normalizeVariant(variant);
   let query=db.from("playback_sources")
-    .select("id,xtream_account_id,external_stream_id,container_extension,quality,priority,health_status,metadata")
+    .select("id,xtream_account_id,external_stream_id,container_extension,quality,priority,health_status,probe_status,compatibility_mode,video_codec,audio_codec,audio_channels,metadata")
     .eq("entity_type",entityType).eq("entity_id",id)
     .eq("source_type","xtream").eq("is_active",true)
     .neq("health_status","down")
@@ -5252,7 +5830,7 @@ async function publicMediaVariants(url:URL){
 
   let xtream:any[]=[];
   const xtreamResult=await db.from("playback_sources")
-    .select("quality,container_extension,priority,health_status")
+    .select("quality,container_extension,priority,health_status,probe_status,compatibility_mode,video_codec,audio_codec")
     .eq("entity_type",type).eq("entity_id",id).eq("source_type","xtream").eq("is_active",true)
     .neq("health_status","down");
   if(!xtreamResult.error)xtream=xtreamResult.data??[];
@@ -5268,10 +5846,16 @@ async function publicMediaVariants(url:URL){
   for(const row of xtream){
     const variant=normalizeVariant(row.quality||"default");
     const current=byVariant.get(variant);
-    if(current){current.source_count=Number(current.source_count||1)+1;continue;}
     const ext=String(row.container_extension||"").toLowerCase();
+    const xtreamDelivery=((row.compatibility_mode&&row.compatibility_mode!=="direct")||ext==="m3u8")?"hls":"direct";
+    if(current){
+      current.source_count=Number(current.source_count||1)+1;
+      current.fallback_delivery=xtreamDelivery;
+      current.fallback_compatibility_mode=row.compatibility_mode||"direct";
+      continue;
+    }
     const mime=ext==="m3u8"?"application/vnd.apple.mpegurl":ext==="ts"?"video/mp2t":ext==="webm"?"video/webm":ext==="mkv"?"video/x-matroska":"video/mp4";
-    byVariant.set(variant,{variant,label:variantLabel(variant),file_size:null,mime_type:mime,source_count:1});
+    byVariant.set(variant,{variant,label:variantLabel(variant),file_size:null,mime_type:mime,source_count:1,probe_status:row.probe_status||"unknown",compatibility_mode:row.compatibility_mode||"direct",video_codec:row.video_codec||"",audio_codec:row.audio_codec||"",delivery:xtreamDelivery,fallback_delivery:xtreamDelivery});
   }
   const variants=[...byVariant.values()].sort((a:any,b:any)=>qualityRank(b.variant)-qualityRank(a.variant));
   if(!variants.length)return json({error:"not found"},404);
@@ -5335,6 +5919,13 @@ async function streamGateway(){
   return dbUrl||STREAM_GATEWAY.replace(/\/$/,"");
 }
 
+async function mediaCompatibilityGateway(){
+  const {data}=await db.from("app_settings").select("value").eq("key","media_compat_gateway").maybeSingle();
+  const value:any=(data as any)?.value||{};
+  if(value.enabled===false)return "";
+  return String(value.url||"").replace(/\/$/,"");
+}
+
 async function hmacHex(payload:string,secret:string){
   const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(secret),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
   const sig=await crypto.subtle.sign("HMAC",key,new TextEncoder().encode(payload));
@@ -5364,6 +5955,14 @@ async function media(type:string,id:string,req?:Request){
     const xtream=await xtreamStreamSource(entityType,id,quality);
     if(!xtream)return json({error:"not found"},404);
     const token=await xtreamProxyToken(xtream.upstream);
+    const compatibilityMode=String(xtream.source?.compatibility_mode||"direct");
+    if(compatibilityMode!=="direct"){
+      const compatBase=await mediaCompatibilityGateway();
+      if(compatBase){
+        const mode=["hls_remux","audio_aac","full_h264_aac"].includes(compatibilityMode)?compatibilityMode:"audio_aac";
+        return Response.redirect(compatBase+"/hls/"+encodeURIComponent(token)+"/index.m3u8?mode="+encodeURIComponent(mode),307);
+      }
+    }
     return Response.redirect(`${gatewayBase}/xtream/${encodeURIComponent(token)}`,307);
   }
 
@@ -5565,6 +6164,48 @@ async function changePassword(req:Request){
   return json({ok:true});
 }
 
+async function publicAppUrl(){
+  const {data}=await db.from("app_settings").select("value").eq("key","public_app").maybeSingle();
+  const raw=String((data as any)?.value?.url||"https://vayzen-gateway-production.up.railway.app").trim();
+  try{
+    const u=new URL(raw);
+    if(!["http:","https:"].includes(u.protocol))throw new Error("bad protocol");
+    return u.origin+u.pathname.replace(/\/$/,"");
+  }catch{
+    return "https://vayzen-gateway-production.up.railway.app";
+  }
+}
+
+async function requestPasswordReset(req:Request){
+  const body=await req.json().catch(()=>null);
+  const email=String(body?.email||"").trim().toLowerCase();
+  if(!PUBLIC_KEY||!email.includes("@")||email.length>254)return json({error:"invalid email"},400);
+  const allowed=await consumeRateLimit("pwd:"+email,"password_reset",3,60*60);
+  if(!allowed)return json({error:"reset limit reached"},429);
+
+  const client=createClient(SUPABASE_URL,PUBLIC_KEY,{
+    auth:{persistSession:false,autoRefreshToken:false,flowType:"implicit"}
+  });
+  const redirectTo=(await publicAppUrl())+"/?recovery=1";
+  const {error}=await client.auth.resetPasswordForEmail(email,{redirectTo});
+  if(error){
+    await systemLog("warning","Password reset request failed",{message:error.message});
+  }
+  return json({ok:true,message:"إذا كان البريد مسجلًا ستصل رسالة الاستعادة."});
+}
+
+async function recoverPassword(req:Request){
+  const auth=await userFromRequest(req);
+  if(!auth)return json({error:"recovery session expired"},401);
+  const body=await req.json().catch(()=>null);
+  const next=String(body?.new_password||"");
+  if(next.length<8||next.length>128)return json({error:"كلمة المرور يجب أن تكون 8 أحرف على الأقل"},400);
+  const {error}=await db.auth.admin.updateUserById(auth.user.id,{password:next});
+  if(error)throw error;
+  await systemLog("info","Password recovered",{user_id:auth.user.id});
+  return json({ok:true});
+}
+
 async function recordView(req:Request){
   const body=await req.json().catch(()=>null);
   const type=String(body?.entity_type||"");
@@ -5578,13 +6219,118 @@ async function recordView(req:Request){
   return json({ok:true,counted:true});
 }
 
+const MOVIE_PUBLIC_FIELDS="id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,duration_minutes,quality,is_featured,view_count,rating,rating_count,created_at";
+const SERIES_PUBLIC_FIELDS="id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,quality,is_featured,view_count,rating,rating_count,created_at,expected_seasons,expected_episodes,playable_episodes";
+
+function safeCatalogSearch(value:any){
+  return String(value||"").replace(/[\u0000-\u001f,%()]/g," ").replace(/\s+/g," ").trim().slice(0,100);
+}
+function catalogSortValue(value:any){
+  const s=String(value||"latest");
+  return ["latest","popular","rating","year"].includes(s)?s:"latest";
+}
+function applyCatalogSort(query:any,sort:string){
+  if(sort==="popular")return query.order("view_count",{ascending:false}).order("created_at",{ascending:false});
+  if(sort==="rating")return query.order("rating",{ascending:false,nullsFirst:false}).order("rating_count",{ascending:false,nullsFirst:false}).order("created_at",{ascending:false});
+  if(sort==="year")return query.order("release_year",{ascending:false,nullsFirst:false}).order("created_at",{ascending:false});
+  return query.order("created_at",{ascending:false});
+}
+function applyCatalogFilters(query:any,type:"movie"|"series",url:URL){
+  const q=safeCatalogSearch(url.searchParams.get("q"));
+  const genre=String(url.searchParams.get("genre")||"").trim().slice(0,80);
+  const country=String(url.searchParams.get("country")||"").trim().slice(0,80);
+  const year=Number(url.searchParams.get("year")||0);
+  if(q)query=query.or("title.ilike.%"+q+"%,original_title.ilike.%"+q+"%");
+  if(genre)query=query.contains("genres",[genre]);
+  if(country){
+    if(/^[A-Za-z]{2}$/.test(country))query=query.eq("country_code",country.toUpperCase());
+    else query=query.ilike("country","%"+safeCatalogSearch(country)+"%");
+  }
+  if(Number.isInteger(year)&&year>=1888&&year<=2100)query=query.eq("release_year",year);
+  if(type==="series")query=query.eq("ingestion_status","ready");
+  return query;
+}
+
 async function catalog(){
-  const [m,s]=await Promise.all([
-    db.from("movies").select("id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,duration_minutes,quality,is_featured,view_count,rating,rating_count,created_at").eq("status","published").order("created_at",{ascending:false}),
-    db.from("series").select("id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,quality,is_featured,view_count,rating,rating_count,created_at").eq("status","published").order("created_at",{ascending:false})
+  const settings=await pipelineSettingsValue().catch(()=>({catalog_page_size:40} as any));
+  const homeLimit=Math.max(40,Math.min(100,Number(settings.catalog_page_size||40)+20));
+  const [m,s,mc,sc]=await Promise.all([
+    db.from("movies").select(MOVIE_PUBLIC_FIELDS).eq("status","published").order("created_at",{ascending:false}).limit(homeLimit),
+    db.from("series").select(SERIES_PUBLIC_FIELDS).eq("status","published").eq("ingestion_status","ready").order("created_at",{ascending:false}).limit(homeLimit),
+    db.from("movies").select("id",{count:"exact",head:true}).eq("status","published"),
+    db.from("series").select("id",{count:"exact",head:true}).eq("status","published").eq("ingestion_status","ready")
   ]);
   if(m.error)throw m.error;if(s.error)throw s.error;
-  return json({ok:true,movies:m.data??[],series:s.data??[]});
+  return json({
+    ok:true,
+    movies:m.data??[],
+    series:s.data??[],
+    totals:{movies:Number(mc.count||0),series:Number(sc.count||0)},
+    page_size:homeLimit
+  });
+}
+
+async function catalogPage(url:URL){
+  const type=String(url.searchParams.get("type")||"");
+  if(!["movie","series"].includes(type))return json({error:"invalid catalog type"},400);
+  const entityType=type as "movie"|"series";
+  const settings=await pipelineSettingsValue();
+  const page=Math.max(1,Math.min(100000,Number(url.searchParams.get("page")||1)||1));
+  const limit=Math.max(20,Math.min(100,Number(url.searchParams.get("limit")||settings.catalog_page_size)||settings.catalog_page_size));
+  const from=(page-1)*limit,to=from+limit-1;
+  const table=entityType==="movie"?"movies":"series";
+  const fields=entityType==="movie"?MOVIE_PUBLIC_FIELDS:SERIES_PUBLIC_FIELDS;
+  let query:any=db.from(table).select(fields,{count:"exact"}).eq("status","published");
+  query=applyCatalogFilters(query,entityType,url);
+  query=applyCatalogSort(query,catalogSortValue(url.searchParams.get("sort")));
+  const {data,error,count}=await query.range(from,to);
+  if(error)throw error;
+  const total=Number(count||0);
+  return json({
+    ok:true,type:entityType,items:data??[],page,limit,total,
+    has_more:from+(data??[]).length<total
+  });
+}
+
+async function searchCatalog(url:URL){
+  const q=safeCatalogSearch(url.searchParams.get("q"));
+  if(q.length<2)return json({ok:true,items:[],total:0,page:1,has_more:false});
+  const page=Math.max(1,Math.min(10000,Number(url.searchParams.get("page")||1)||1));
+  const limit=Math.max(10,Math.min(40,Number(url.searchParams.get("limit")||20)||20));
+  const from=(page-1)*limit,to=from+limit-1;
+
+  const movieUrl=new URL(url.toString());movieUrl.searchParams.set("q",q);
+  const seriesUrl=new URL(url.toString());seriesUrl.searchParams.set("q",q);
+  let mq:any=db.from("movies").select(MOVIE_PUBLIC_FIELDS,{count:"exact"}).eq("status","published");
+  mq=applyCatalogFilters(mq,"movie",movieUrl).order("created_at",{ascending:false}).range(from,to);
+  let sq:any=db.from("series").select(SERIES_PUBLIC_FIELDS,{count:"exact"}).eq("status","published");
+  sq=applyCatalogFilters(sq,"series",seriesUrl).order("created_at",{ascending:false}).range(from,to);
+
+  const [m,s]=await Promise.all([mq,sq]);
+  if(m.error)throw m.error;if(s.error)throw s.error;
+  const items=[
+    ...(m.data??[]).map((item:any)=>({type:"movie",item})),
+    ...(s.data??[]).map((item:any)=>({type:"series",item}))
+  ].sort((a:any,b:any)=>{
+    const aq=String(a.item.title||"").toLowerCase(),bq=String(b.item.title||"").toLowerCase(),needle=q.toLowerCase();
+    const ae=aq===needle?1:aq.startsWith(needle)?0.5:0;
+    const be=bq===needle?1:bq.startsWith(needle)?0.5:0;
+    if(be!==ae)return be-ae;
+    return Date.parse(String(b.item.created_at||""))-Date.parse(String(a.item.created_at||""));
+  });
+  const total=Number(m.count||0)+Number(s.count||0);
+  return json({
+    ok:true,q,items,total,page,limit,
+    has_more:(from+(m.data??[]).length<Number(m.count||0))||(from+(s.data??[]).length<Number(s.count||0))
+  });
+}
+
+async function catalogFacets(url:URL){
+  const type=String(url.searchParams.get("type")||"");
+  if(!["movie","series"].includes(type))return json({error:"invalid catalog type"},400);
+  const {data,error}=await db.rpc("vayzen_catalog_facets",{p_type:type});
+  if(error)throw error;
+  return json({ok:true,type,facets:data||{genres:[],years:[],countries:[]}});
 }
 
 function xtreamEpisodeDurationMinutes(raw:any){
@@ -5607,126 +6353,471 @@ function xtreamEpisodeAirDate(raw:any){
   return null;
 }
 
-async function syncXtreamSeriesEpisodes(seriesId:string){
+async function queueMediaProbeSource(playbackSourceId:string){
+  if(!playbackSourceId)return false;
+  const {data:existing,error:existingError}=await db.from("media_probe_jobs")
+    .select("id,status").eq("playback_source_id",playbackSourceId).maybeSingle();
+  if(existingError)throw existingError;
+  if(existing?.status==="completed")return false;
+  const payload:any={
+    playback_source_id:playbackSourceId,
+    status:"queued",
+    next_attempt_at:new Date().toISOString(),
+    last_error:null,
+    last_error_detail:{},
+  };
+  if(existing){
+    const {error}=await db.from("media_probe_jobs").update(payload).eq("id",existing.id);
+    if(error)throw error;
+  }else{
+    const {error}=await db.from("media_probe_jobs").insert(payload);
+    if(error&&String((error as any)?.code||"")!=="23505")throw error;
+  }
+  await db.from("playback_sources").update({probe_status:"queued"}).eq("id",playbackSourceId);
+  return true;
+}
+
+function seriesIngestFailure(seasonNumber:number,episodeNumber:number,err:any){
+  return {
+    season_number:seasonNumber,
+    episode_number:episodeNumber,
+    ...errorDetail(err),
+  };
+}
+
+async function seriesPlaybackCounts(seriesId:string){
+  const {data,error}=await db.rpc("vayzen_series_playback_counts",{p_series_id:seriesId});
+  if(error)throw error;
+  const row:any=Array.isArray(data)?data[0]:data;
+  return {
+    seasons:Number(row?.seasons||0),
+    episodes:Number(row?.episodes||0),
+    playable:Number(row?.playable||0),
+  };
+}
+
+async function ingestXtreamSeriesJob(job:any){
+  const seriesId=String(job.series_id||"");
+  const accountId=String(job.provider_account_id||"");
+  const externalSeriesId=String(job.external_series_id||"");
+  if(!seriesId||!accountId||!externalSeriesId)throw new Error("Series ingest job is incomplete");
+
   const {data:seriesRow,error:seriesError}=await db.from("series")
-    .select("id,status,external_metadata").eq("id",seriesId).maybeSingle();
+    .select("id,public_id,title,release_year,status,ingestion_status,external_metadata,ready_at")
+    .eq("id",seriesId).maybeSingle();
   if(seriesError)throw seriesError;
-  if(!seriesRow||seriesRow.status!=="published")return {synced:false,episodes:0};
+  if(!seriesRow)throw new Error("Series not found");
 
-  const lastSync=Date.parse(String((seriesRow.external_metadata as any)?.xtream_episode_sync_at||""));
-  if(Number.isFinite(lastSync)&&Date.now()-lastSync<30*60_000)return {synced:false,episodes:0,cached:true};
+  const account:any=await xtreamAccountWithSecret(accountId);
+  if(!account?.is_enabled||account.status==="disabled"||account.status==="down")throw new Error("Xtream account is unavailable");
+  const credentials=await xtreamCredentials(account);
+  const details:any=await xtreamRequest(credentials,"get_series_info",{series_id:externalSeriesId},45000);
+  const seasonGroups=details?.episodes&&typeof details.episodes==="object"?details.episodes:{};
+  const rawGroups=Object.entries(seasonGroups)
+    .map(([key,value])=>({
+      seasonNumber:Math.max(1,Number.parseInt(String(key),10)||1),
+      episodes:Array.isArray(value)?value:[],
+    }))
+    .filter(x=>x.episodes.length)
+    .sort((a,b)=>a.seasonNumber-b.seasonNumber);
 
-  const {data:refs,error:refsError}=await db.from("content_provider_refs")
-    .select("id,provider_account_id,external_id")
-    .eq("provider_type","xtream").eq("entity_type","series").eq("entity_id",seriesId).eq("is_active",true)
-    .order("last_seen_at",{ascending:false}).limit(5);
-  if(refsError){
-    if(String(refsError.message||"").includes("content_provider_refs"))return {synced:false,episodes:0};
-    throw refsError;
+  const flat:any[]=[];
+  for(const group of rawGroups){
+    for(let index=0;index<group.episodes.length;index++){
+      flat.push({seasonNumber:group.seasonNumber,index,raw:group.episodes[index]||{}});
+    }
   }
-  if(!(refs??[]).length)return {synced:false,episodes:0};
 
+  const expectedSeasons=rawGroups.length;
+  const expectedEpisodes=flat.length;
+  if(!expectedSeasons||!expectedEpisodes){
+    const err:any=new Error("Xtream returned no episodes for this series");
+    err.code="XTREAM_EMPTY_SERIES";
+    err.details={external_series_id:externalSeriesId};
+    throw err;
+  }
+
+  const settings=await pipelineSettingsValue();
+  const chunkSize=settings.series_ingest_chunk_size;
+  const cursor=Math.max(0,Math.min(expectedEpisodes,Number(job.cursor_index||0)));
+  const chunk=flat.slice(cursor,cursor+chunkSize);
+  const nextCursor=Math.min(expectedEpisodes,cursor+chunk.length);
+  const passFinished=nextCursor>=expectedEpisodes;
   const now=new Date().toISOString();
+
+  await db.from("series").update({
+    ingestion_status:"processing",
+    expected_seasons:expectedSeasons,
+    expected_episodes:expectedEpisodes,
+    ...(cursor===0?{failed_episodes:0,last_ingestion_error:{}}:{}),
+    updated_at:now
+  }).eq("id",seriesId);
+
+  const failures:any[]=[];
   let touched=0;
-  for(const ref of refs??[]){
-    const accountId=String(ref.provider_account_id||"");
-    if(!accountId)continue;
-    let account:any;
-    try{account=await xtreamAccountWithSecret(accountId);}catch{continue;}
-    if(!account?.is_enabled||account.status==="disabled"||account.status==="down")continue;
-    let credentials:XtreamCredentials;
-    try{credentials=await xtreamCredentials(account);}catch{continue;}
-    let details:any;
-    try{
-      details=await xtreamRequest(credentials,"get_series_info",{series_id:String(ref.external_id)},30000);
-    }catch{
-      continue;
+  const seasonCache=new Map<number,any>();
+
+  const seasonFor=async(seasonNumber:number)=>{
+    if(seasonCache.has(seasonNumber))return seasonCache.get(seasonNumber);
+    let {data:season,error:seasonError}=await db.from("seasons")
+      .select("id,season_number,status,external_source")
+      .eq("series_id",seriesId).eq("season_number",seasonNumber).maybeSingle();
+    if(seasonError)throw seasonError;
+    if(!season){
+      const seasonMeta:any=Array.isArray(details?.seasons)
+        ?details.seasons.find((x:any)=>Number(x?.season_number)===seasonNumber)
+        :null;
+      const {data:created,error:createSeasonError}=await db.from("seasons").insert({
+        series_id:seriesId,
+        season_number:seasonNumber,
+        title:String(seasonMeta?.name||("الموسم "+seasonNumber)).slice(0,240),
+        status:"published",
+        external_source:"xtream",
+        external_id:Number.isSafeInteger(Number(seasonMeta?.id))?Number(seasonMeta.id):null,
+        external_metadata:{created_by_xtream:true},
+        air_date:xtreamEpisodeAirDate(seasonMeta||{})
+      }).select("id,season_number,status,external_source").single();
+      if(createSeasonError)throw createSeasonError;
+      season=created;
     }
-    const seasonGroups=details?.episodes&&typeof details.episodes==="object"?details.episodes:{};
-    for(const [seasonKey,episodeValue] of Object.entries(seasonGroups)){
-      const seasonNumber=Math.max(1,Number.parseInt(String(seasonKey),10)||1);
-      let {data:season,error:seasonError}=await db.from("seasons")
-        .select("id,season_number").eq("series_id",seriesId).eq("season_number",seasonNumber).maybeSingle();
-      if(seasonError)throw seasonError;
-      if(!season){
-        const {data:created,error:createSeasonError}=await db.from("seasons").insert({
-          series_id:seriesId,season_number:seasonNumber,title:"الموسم "+seasonNumber,status:"published",
-          external_source:"xtream",external_metadata:{created_by_xtream:true}
-        }).select("id,season_number").single();
-        if(createSeasonError)throw createSeasonError;
-        season=created;
-      }
-      const episodes=Array.isArray(episodeValue)?episodeValue:[];
-      for(let index=0;index<episodes.length;index++){
-        const raw:any=episodes[index]||{};
-        const episodeNumber=Math.max(1,Number(raw.episode_num??raw.episode_number??raw.info?.episode_num??index+1)||index+1);
-        let {data:episode,error:episodeError}=await db.from("episodes")
-          .select("id,episode_number,status").eq("season_id",season.id).eq("episode_number",episodeNumber).maybeSingle();
-        if(episodeError)throw episodeError;
-        const title=String(raw.title??raw.info?.name??("الحلقة "+episodeNumber)).trim().slice(0,240);
-        const description=String(raw.info?.plot??raw.info?.description??"").trim().slice(0,5000);
-        const quality=qualityFromName(raw.title,raw.container_extension,raw.info?.video);
-        const externalEpisodeId=String(raw.id??raw.stream_id??"").trim();
-        if(!episode){
-          const {data:created,error:createEpisodeError}=await db.from("episodes").insert({
-            season_id:season.id,episode_number:episodeNumber,title,description,
-            duration_minutes:xtreamEpisodeDurationMinutes(raw),quality,status:"published",
-            external_source:"xtream",external_metadata:{xtream_seed:true},
-            air_date:xtreamEpisodeAirDate(raw)
-          }).select("id,episode_number,status").single();
-          if(createEpisodeError)throw createEpisodeError;
-          episode=created;
-        }
-        if(!externalEpisodeId)continue;
+    seasonCache.set(seasonNumber,season);
+    return season;
+  };
 
-        const episodeIdentity=`${seriesId}:s${seasonNumber}:e${episodeNumber}`;
-        const {data:providerRef,error:providerRefError}=await db.from("content_provider_refs").upsert({
-          provider_type:"xtream",provider_account_id:accountId,entity_type:"episode",entity_id:episode.id,
-          external_id:externalEpisodeId,identity_key:episodeIdentity,is_active:true,last_seen_at:now,
-          metadata:{series_external_id:String(ref.external_id),season_number:seasonNumber,episode_number:episodeNumber}
-        },{onConflict:"provider_type,provider_account_id,entity_type,external_id"})
-          .select("id").single();
-        if(providerRefError)throw providerRefError;
-
-        const ext=String(raw.container_extension??"mp4").replace(/[^a-zA-Z0-9]/g,"").toLowerCase()||"mp4";
-        const {error:sourceError}=await db.from("playback_sources").upsert({
-          entity_type:"episode",entity_id:episode.id,source_type:"xtream",
-          provider_ref_id:providerRef.id,xtream_account_id:accountId,
-          external_stream_id:externalEpisodeId,external_series_id:String(ref.external_id),
-          container_extension:ext,quality:quality||normalizeVariant(String(raw.info?.quality??"default")),
-          language:"",priority:Number(account.priority||50),is_active:true,health_status:"unknown",
-          consecutive_failures:0,last_seen_at:now,
-          metadata:{season_number:seasonNumber,episode_number:episodeNumber}
-        },{onConflict:"xtream_account_id,entity_type,external_stream_id"});
-        if(sourceError)throw sourceError;
-        touched++;
+  for(const entry of chunk){
+    const raw:any=entry.raw||{};
+    const seasonNumber=Number(entry.seasonNumber||1);
+    const episodeNumber=Math.max(
+      1,
+      Number(raw.episode_num??raw.episode_number??raw.info?.episode_num??Number(entry.index||0)+1)
+        ||Number(entry.index||0)+1
+    );
+    try{
+      const season=await seasonFor(seasonNumber);
+      const title=String(raw.title??raw.info?.name??("الحلقة "+episodeNumber)).trim().slice(0,240);
+      const description=String(raw.info?.plot??raw.info?.description??"").trim().slice(0,5000);
+      const quality=qualityFromName(raw.title,raw.container_extension,raw.info?.video);
+      const externalEpisodeId=String(raw.id??raw.stream_id??"").trim();
+      if(!externalEpisodeId){
+        const err:any=new Error("Xtream episode stream id is missing");
+        err.code="XTREAM_EPISODE_ID_MISSING";
+        throw err;
       }
+
+      let {data:episode,error:episodeError}=await db.from("episodes")
+        .select("id,episode_number,status,external_source,title,description")
+        .eq("season_id",season.id).eq("episode_number",episodeNumber).maybeSingle();
+      if(episodeError)throw episodeError;
+
+      if(!episode){
+        const {data:created,error:createEpisodeError}=await db.from("episodes").insert({
+          season_id:season.id,
+          episode_number:episodeNumber,
+          title,description,
+          duration_minutes:xtreamEpisodeDurationMinutes(raw),
+          quality,
+          status:"published",
+          external_source:"xtream",
+          external_metadata:{xtream_seed:true},
+          air_date:xtreamEpisodeAirDate(raw)
+        }).select("id,episode_number,status,external_source,title,description").single();
+        if(createEpisodeError)throw createEpisodeError;
+        episode=created;
+      }else if(String(episode.external_source||"")==="xtream"){
+        const {error:updateEpisodeError}=await db.from("episodes").update({
+          title:title||episode.title,
+          description:description||episode.description,
+          duration_minutes:xtreamEpisodeDurationMinutes(raw),
+          quality:quality||"",
+          air_date:xtreamEpisodeAirDate(raw),
+          updated_at:new Date().toISOString()
+        }).eq("id",episode.id);
+        if(updateEpisodeError)throw updateEpisodeError;
+      }
+
+      const episodeIdentity=seriesId+":s"+seasonNumber+":e"+episodeNumber;
+      const {data:providerRef,error:providerRefError}=await db.from("content_provider_refs").upsert({
+        provider_type:"xtream",
+        provider_account_id:accountId,
+        entity_type:"episode",
+        entity_id:episode.id,
+        external_id:externalEpisodeId,
+        identity_key:episodeIdentity,
+        is_active:true,
+        last_seen_at:now,
+        metadata:{series_external_id:externalSeriesId,season_number:seasonNumber,episode_number:episodeNumber}
+      },{onConflict:"provider_type,provider_account_id,entity_type,external_id"})
+        .select("id").single();
+      if(providerRefError)throw providerRefError;
+
+      const ext=String(raw.container_extension??"mp4").replace(/[^a-zA-Z0-9]/g,"").toLowerCase()||"mp4";
+      const {data:source,error:sourceError}=await db.from("playback_sources").upsert({
+        entity_type:"episode",
+        entity_id:episode.id,
+        source_type:"xtream",
+        provider_ref_id:providerRef.id,
+        xtream_account_id:accountId,
+        external_stream_id:externalEpisodeId,
+        external_series_id:externalSeriesId,
+        container_extension:ext,
+        probe_status:"queued",
+        compatibility_mode:ext==="mkv"?"audio_aac":"direct",
+        quality:quality||normalizeVariant(String(raw.info?.quality??"default")),
+        language:"",
+        priority:Number(account.priority||50),
+        is_active:true,
+        health_status:"unknown",
+        consecutive_failures:0,
+        last_seen_at:now,
+        metadata:{season_number:seasonNumber,episode_number:episodeNumber}
+      },{onConflict:"xtream_account_id,entity_type,external_stream_id"})
+        .select("id").single();
+      if(sourceError)throw sourceError;
+      await queueMediaProbeSource(String(source.id)).catch(()=>false);
+      touched++;
+    }catch(err){
+      failures.push(seriesIngestFailure(seasonNumber,episodeNumber,err));
     }
   }
 
+  const counts=await seriesPlaybackCounts(seriesId);
+  const complete=passFinished&&counts.playable>=expectedEpisodes;
+  const partial=passFinished&&!complete&&counts.playable>0;
+  const failedEpisodes=Math.max(0,expectedEpisodes-counts.playable);
   const metadata={
     ...((seriesRow.external_metadata&&typeof seriesRow.external_metadata==="object")?seriesRow.external_metadata:{}),
     xtream_episode_sync_at:now,
-    xtream_episode_sources_touched:touched
+    xtream_episode_sources_touched:Number((seriesRow.external_metadata as any)?.xtream_episode_sources_touched||0)+touched,
+    xtream_expected_episodes:expectedEpisodes,
+    xtream_ingest_cursor:nextCursor
   };
-  await db.from("series").update({external_metadata:metadata,updated_at:now}).eq("id",seriesId);
-  return {synced:true,episodes:touched};
+
+  const recentFailureDetail=failures.length
+    ?{recent_failures:failures.slice(0,12),cursor_from:cursor,cursor_to:nextCursor,total_in_chunk:chunk.length}
+    :(!complete&&passFinished?{message:"Series pass incomplete",missing_episodes:failedEpisodes,cursor_to:nextCursor}:{});
+
+  await db.from("series").update({
+    external_metadata:metadata,
+    ingestion_status:complete?"ready":(passFinished?(partial?"partial":"queued"):"processing"),
+    status:complete?"published":seriesRow.status,
+    expected_seasons:expectedSeasons,
+    expected_episodes:expectedEpisodes,
+    synced_episodes:counts.episodes,
+    playable_episodes:counts.playable,
+    failed_episodes:failedEpisodes,
+    last_ingestion_error:recentFailureDetail,
+    last_episode_sync_at:now,
+    ready_at:complete?(seriesRow.ready_at||now):null,
+    updated_at:now
+  }).eq("id",seriesId);
+
+  return {
+    complete,
+    partial,
+    in_progress:!passFinished,
+    next_cursor:nextCursor,
+    series:seriesRow,
+    account,
+    expected_seasons:expectedSeasons,
+    expected_episodes:expectedEpisodes,
+    synced_episodes:counts.episodes,
+    playable_episodes:counts.playable,
+    failed_episodes:failedEpisodes,
+    failures,
+    cursor_from:cursor,
+    cursor_to:nextCursor,
+    chunk_size:chunk.length
+  };
+}
+
+async function processSeriesIngestJob(){
+  const now=new Date().toISOString();
+  const {data:job,error}=await db.from("series_ingest_jobs")
+    .select("id,series_id,provider_account_id,provider_ref_id,external_series_id,parent_catalog_job_id,status,attempts,error_attempts,max_attempts,cursor_index,priority,started_at")
+    .in("status",["queued","partial","failed"])
+    .is("completed_at",null)
+    .lte("next_attempt_at",now)
+    .order("priority",{ascending:false})
+    .order("created_at",{ascending:true})
+    .limit(1).maybeSingle();
+  if(error)throw error;
+  if(!job)return {worked:false};
+
+  const cursor=Math.max(0,Number(job.cursor_index||0));
+  const passAttempt=cursor===0
+    ?Number(job.attempts||0)+1
+    :Math.max(1,Number(job.attempts||0));
+  const lockAt=new Date().toISOString();
+  const {error:lockError}=await db.from("series_ingest_jobs").update({
+    status:"running",
+    attempts:passAttempt,
+    started_at:job.started_at||lockAt,
+    last_error:null
+  }).eq("id",job.id).in("status",["queued","partial","failed"]);
+  if(lockError)throw lockError;
+
+  try{
+    const result:any=await ingestXtreamSeriesJob({...job,attempts:passAttempt});
+    const detail={
+      expected_episodes:result.expected_episodes,
+      synced_episodes:result.synced_episodes,
+      playable_episodes:result.playable_episodes,
+      failed_episodes:result.failed_episodes,
+      cursor_from:result.cursor_from,
+      cursor_to:result.cursor_to,
+      failures:(result.failures||[]).slice(0,12)
+    };
+
+    if(result.in_progress){
+      await db.from("series_ingest_jobs").update({
+        status:"queued",
+        attempts:passAttempt,
+        error_attempts:0,
+        cursor_index:result.next_cursor,
+        expected_seasons:result.expected_seasons,
+        expected_episodes:result.expected_episodes,
+        synced_seasons:result.expected_seasons,
+        synced_episodes:result.synced_episodes,
+        playable_episodes:result.playable_episodes,
+        failed_episodes:result.failed_episodes,
+        last_error:result.failures?.length?"Some episodes in the last chunk need retry":null,
+        last_error_detail:detail,
+        next_attempt_at:new Date(Date.now()+1000).toISOString()
+      }).eq("id",job.id);
+      return {
+        worked:true,completed:false,in_progress:true,
+        job_id:job.id,series_id:job.series_id,
+        cursor:result.next_cursor,total:result.expected_episodes,
+        processed_chunk:result.chunk_size
+      };
+    }
+
+    if(result.complete){
+      const completedAt=new Date().toISOString();
+      await db.from("series_ingest_jobs").update({
+        status:"completed",
+        attempts:passAttempt,
+        error_attempts:0,
+        cursor_index:result.expected_episodes,
+        expected_seasons:result.expected_seasons,
+        expected_episodes:result.expected_episodes,
+        synced_seasons:result.expected_seasons,
+        synced_episodes:result.synced_episodes,
+        playable_episodes:result.playable_episodes,
+        failed_episodes:0,
+        last_error:null,
+        last_error_detail:{},
+        completed_at:completedAt
+      }).eq("id",job.id);
+
+      const seriesEntity={
+        id:String(result.series.id),
+        public_id:String(result.series.public_id||""),
+        title:String(result.series.title||""),
+        release_year:Number(result.series.release_year||0)||null
+      };
+      await queueTmdbEntities("series",[seriesEntity]).catch(()=>0);
+      if(job.parent_catalog_job_id){
+        await queueXtreamAnnouncementChunks(
+          "series-ready-"+String(job.id),
+          String(result.account?.name||"Xtream"),
+          "series",
+          [seriesEntity]
+        ).catch(()=>0);
+      }
+      return {worked:true,completed:true,job_id:job.id,series_id:job.series_id,...result};
+    }
+
+    const maxAttempts=Math.max(1,Number(job.max_attempts||6));
+    const exhausted=passAttempt>=maxAttempts;
+    await db.from("series_ingest_jobs").update({
+      status:exhausted?"failed":"partial",
+      attempts:passAttempt,
+      error_attempts:0,
+      cursor_index:0,
+      expected_seasons:result.expected_seasons,
+      expected_episodes:result.expected_episodes,
+      synced_seasons:result.expected_seasons,
+      synced_episodes:result.synced_episodes,
+      playable_episodes:result.playable_episodes,
+      failed_episodes:result.failed_episodes,
+      last_error:exhausted?"Series ingestion incomplete after retries":"Series ingestion pass incomplete",
+      last_error_detail:detail,
+      next_attempt_at:new Date(Date.now()+queueBackoffSeconds(passAttempt)*1000).toISOString(),
+      ...(exhausted?{completed_at:new Date().toISOString()}:{})
+    }).eq("id",job.id);
+
+    if(exhausted){
+      await db.from("series").update({
+        ingestion_status:"failed",
+        last_ingestion_error:detail,
+        updated_at:new Date().toISOString()
+      }).eq("id",job.series_id);
+    }
+    return {worked:true,completed:false,partial:true,exhausted,job_id:job.id,...detail};
+  }catch(err){
+    const errorAttempts=Number(job.error_attempts||0)+1;
+    const maxAttempts=Math.max(1,Number(job.max_attempts||6));
+    const exhausted=errorAttempts>=maxAttempts;
+    const detail=errorDetail(err);
+    const next=new Date(Date.now()+queueBackoffSeconds(errorAttempts)*1000).toISOString();
+    await db.from("series_ingest_jobs").update({
+      status:"failed",
+      error_attempts:errorAttempts,
+      last_error:detail.message,
+      last_error_detail:detail,
+      next_attempt_at:next,
+      ...(exhausted?{completed_at:new Date().toISOString()}:{})
+    }).eq("id",job.id);
+    await db.from("series").update({
+      ingestion_status:exhausted?"failed":"queued",
+      last_ingestion_error:detail,
+      updated_at:new Date().toISOString()
+    }).eq("id",job.series_id);
+    await systemLog(exhausted?"error":"warning","Xtream series ingestion failed",{
+      job_id:job.id,
+      series_id:job.series_id,
+      cursor_index:cursor,
+      error_attempts:errorAttempts,
+      error:detail
+    });
+    return {worked:true,completed:false,failed:true,exhausted,job_id:job.id,error:detail.message};
+  }
+}
+
+async function syncXtreamSeriesEpisodes(seriesId:string){
+  if(!/^[0-9a-f-]{36}$/i.test(seriesId))return {queued:false};
+  const {data:ref,error}=await db.from("content_provider_refs")
+    .select("id,provider_account_id,external_id")
+    .eq("provider_type","xtream").eq("entity_type","series").eq("entity_id",seriesId).eq("is_active",true)
+    .order("last_seen_at",{ascending:false}).limit(1).maybeSingle();
+  if(error)throw error;
+  if(!ref)return {queued:false};
+  const queued=await queueSeriesIngestJob({
+    seriesId,accountId:String(ref.provider_account_id),providerRefId:String(ref.id),
+    externalSeriesId:String(ref.external_id),priority:90
+  });
+  if(queued)await db.from("series").update({ingestion_status:"queued",updated_at:new Date().toISOString()}).eq("id",seriesId);
+  return {queued};
 }
 
 async function seriesContent(url:URL){
   const id=String(url.searchParams.get("id")||"");
   if(!/^[0-9a-f-]{36}$/i.test(id))return json({error:"invalid id"},400);
-  try{await syncXtreamSeriesEpisodes(id);}catch(error){
-    await systemLog("warning","Xtream series episode sync failed",{series_id:id,error:adminErrorText(error)});
-  }
-  try{await syncTmdbSeriesEpisodeMetadata(id);}catch(error){
-    await systemLog("warning","TMDb series episode metadata sync failed",{series_id:id,error:adminErrorText(error)});
-  }
+
+  const {data:seriesState,error:stateError}=await db.from("series")
+    .select("ingestion_status,expected_seasons,expected_episodes,synced_episodes,playable_episodes,failed_episodes")
+    .eq("id",id).maybeSingle();
+  if(stateError)throw stateError;
+  if(!seriesState)return json({error:"not found"},404);
+
   const {data:seasons,error}=await db.from("seasons").select("id,season_number,title").eq("series_id",id).eq("status","published").order("season_number",{ascending:true});
   if(error)throw error;
   const out=[];
   for(const season of seasons??[]){
-    const {data:episodes,error:e}=await db.from("episodes").select("id,public_id,episode_number,title,description,duration_minutes,quality,rating,rating_count").eq("season_id",season.id).eq("status","published").order("episode_number",{ascending:true});
+    const {data:episodes,error:e}=await db.from("episodes")
+      .select("id,public_id,episode_number,title,description,duration_minutes,quality,rating,rating_count")
+      .eq("season_id",season.id).eq("status","published").order("episode_number",{ascending:true});
     if(e)throw e;
     const eps:any[]=episodes??[];
     const ids=eps.map((x:any)=>x.id);
@@ -5737,7 +6828,7 @@ async function seriesContent(url:URL){
     let xtreamAssets:any[]=[];
     if(ids.length){
       const xtreamResult=await db.from("playback_sources")
-        .select("entity_id,quality,container_extension,health_status")
+        .select("entity_id,quality,container_extension,health_status,probe_status,compatibility_mode")
         .eq("entity_type","episode").eq("source_type","xtream").eq("is_active",true).in("entity_id",ids)
         .neq("health_status","down");
       if(!xtreamResult.error)xtreamAssets=xtreamResult.data??[];
@@ -5753,7 +6844,10 @@ async function seriesContent(url:URL){
       const list=qmap.get(key)||[];
       const existing=list.find(x=>x.variant===variant);
       if(existing)existing.source_count=Number(existing.source_count||1)+1;
-      else list.push({variant,label:variantLabel(variant),file_size:0,source_count:1});
+      else list.push({
+        variant,label:variantLabel(variant),file_size:0,source_count:1,
+        probe_status:a.probe_status||"unknown",compatibility_mode:a.compatibility_mode||"direct"
+      });
       qmap.set(key,list);
     }
     const enriched=eps.map((ep:any)=>({
@@ -5762,7 +6856,18 @@ async function seriesContent(url:URL){
     }));
     out.push({...season,episodes:enriched});
   }
-  return json({ok:true,seasons:out});
+  return json({
+    ok:true,
+    ingestion:{
+      status:String(seriesState.ingestion_status||"ready"),
+      expected_seasons:Number(seriesState.expected_seasons||0),
+      expected_episodes:Number(seriesState.expected_episodes||0),
+      synced_episodes:Number(seriesState.synced_episodes||0),
+      playable_episodes:Number(seriesState.playable_episodes||0),
+      failed_episodes:Number(seriesState.failed_episodes||0),
+    },
+    seasons:out
+  });
 }
 
 async function favoritesApi(req:Request){
@@ -5882,32 +6987,49 @@ async function watchHistoryApi(req:Request){
   return json({ok:true,history:out});
 }
 
+
 async function publicRequest(req:Request){
   const b=await req.json().catch(()=>null);
-  if(!b) return json({error:"invalid body"},400);
-  const requester=String(b.requester_key||"").trim();
+  if(!b)return json({error:"invalid body"},400);
+  const auth=await userFromRequest(req);
+  const requester=String(b.requester_key||auth?.user?.id||"").trim();
   const type=String(b.request_type||"");
   const title=String(b.title||"").trim().slice(0,160);
   const note=String(b.note||"").trim().slice(0,500);
-  if(!/^[A-Za-z0-9_-]{20,100}$/.test(requester)||!["movie","series"].includes(type)||title.length<2) return json({error:"invalid request"},400);
-  const allowed=await consumeRateLimit(requester,"content_request",5,24*60*60);
-  if(!allowed) return json({error:"daily limit reached"},429);
-  const {data,error}=await db.from("content_requests").insert({requester_key:requester,request_type:type,title,note})
-    .select("request_code,status,title,request_type,created_at").single();
-  if(error) throw error;
+  if(!/^[A-Za-z0-9_-]{20,100}$/.test(requester)||!["movie","series"].includes(type)||title.length<2)return json({error:"invalid request"},400);
+  const limiter=auth?.user?.id?"user:"+auth.user.id:requester;
+  const allowed=await consumeRateLimit(limiter,"content_request",5,24*60*60);
+  if(!allowed)return json({error:"daily limit reached"},429);
+  const {data,error}=await db.from("content_requests").insert({
+    requester_key:requester,
+    user_id:auth?.user?.id||null,
+    request_type:type,title,note
+  }).select("request_code,status,title,request_type,created_at").single();
+  if(error)throw error;
   try{
     const ch=await channel("requests");
-    await tg("sendMessage",{chat_id:ch.telegram_channel_id,text:`طلب جديد\n${data.request_code}\nالنوع: ${type==="movie"?"فيلم":"مسلسل"}\nالاسم: ${title}\nملاحظة: ${note||"—"}`});
+    await tg("sendMessage",{chat_id:ch.telegram_channel_id,text:
+      "طلب جديد\n"+data.request_code+"\nالنوع: "+(type==="movie"?"فيلم":"مسلسل")+
+      "\nالاسم: "+title+"\nملاحظة: "+(note||"—")
+    });
   }catch{}
   return json({ok:true,request:data},201);
 }
 
-async function requestStatus(url:URL){
-  const k=String(url.searchParams.get("requester_key")||"");
-  if(!/^[A-Za-z0-9_-]{20,100}$/.test(k)) return json({error:"invalid key"},400);
-  const {data,error}=await db.from("content_requests")
+async function requestStatus(url:URL,req:Request){
+  const auth=await userFromRequest(req);
+  const k=String(url.searchParams.get("requester_key")||auth?.user?.id||"");
+  if(!auth&&!/^[A-Za-z0-9_-]{20,100}$/.test(k))return json({error:"invalid key"},400);
+
+  let query:any=db.from("content_requests")
     .select("request_code,request_type,title,status,created_at,updated_at,linked_entity_type,linked_entity_id")
-    .eq("requester_key",k).order("created_at",{ascending:false}).limit(20);
+    .order("created_at",{ascending:false}).limit(30);
+  if(auth?.user?.id){
+    const uid=String(auth.user.id);
+    query=query.or("user_id.eq."+uid+",requester_key.eq."+uid);
+  }else query=query.eq("requester_key",k);
+
+  const {data,error}=await query;
   if(error)throw error;
   const rows:any[]=data??[];
   const out=[];
@@ -5915,7 +7037,9 @@ async function requestStatus(url:URL){
     let linked:any=null;
     if(row.status==="added"&&row.linked_entity_id&&["movie","series"].includes(row.linked_entity_type)){
       const table=row.linked_entity_type==="movie"?"movies":"series";
-      const {data:item}=await db.from(table).select("id,public_id,title,status").eq("id",row.linked_entity_id).maybeSingle();
+      let itemQuery:any=db.from(table).select("id,public_id,title,status").eq("id",row.linked_entity_id);
+      if(row.linked_entity_type==="series")itemQuery=itemQuery.eq("ingestion_status","ready");
+      const {data:item}=await itemQuery.maybeSingle();
       if(item?.status==="published")linked={type:row.linked_entity_type,id:item.id,public_id:item.public_id,title:item.title};
     }
     out.push({...row,linked});
@@ -5925,22 +7049,32 @@ async function requestStatus(url:URL){
 
 async function publicReport(req:Request){
   const b=await req.json().catch(()=>null);
-  if(!b) return json({error:"invalid body"},400);
-  const reporter=String(b.reporter_key||"").trim();
+  if(!b)return json({error:"invalid body"},400);
+  const auth=await userFromRequest(req);
+  const reporter=String(b.reporter_key||auth?.user?.id||"").trim();
   const type=String(b.entity_type||"");
   const publicId=String(b.entity_public_id||"").trim().slice(0,40);
   const reason=String(b.reason||"").trim().slice(0,160);
-  const details=String(b.details||"").trim().slice(0,800);
-  if(!/^[A-Za-z0-9_-]{20,100}$/.test(reporter)||!["movie","series","episode","other"].includes(type)||reason.length<2) return json({error:"invalid report"},400);
-  const allowed=await consumeRateLimit(reporter,"report",10,60*60);
+  const details=String(b.details||"").trim().slice(0,1200);
+  const diagnostics=(b.diagnostics&&typeof b.diagnostics==="object")?b.diagnostics:{};
+  if(!/^[A-Za-z0-9_-]{20,100}$/.test(reporter)||!["movie","series","episode","other"].includes(type)||reason.length<2)return json({error:"invalid report"},400);
+  const limiter=auth?.user?.id?"user:"+auth.user.id:reporter;
+  const allowed=await consumeRateLimit(limiter,"report",10,60*60);
   if(!allowed)return json({error:"report limit reached"},429);
+  const detailText=details+(Object.keys(diagnostics).length
+    ?"\n\nDiagnostics: "+JSON.stringify(diagnostics).slice(0,1000)
+    :"");
   const {data,error}=await db.from("reports").insert({
-    reporter_key:reporter,entity_type:type,entity_public_id:publicId,reason,details,
+    reporter_key:reporter,user_id:auth?.user?.id||null,
+    entity_type:type,entity_public_id:publicId,reason,details:detailText.slice(0,1800),
   }).select("report_code,status,created_at").single();
-  if(error) throw error;
+  if(error)throw error;
   try{
     const ch=await channel("reports");
-    await tg("sendMessage",{chat_id:ch.telegram_channel_id,text:`بلاغ جديد\n${data.report_code}\nID: ${publicId||"—"}\nالسبب: ${reason}\nالتفاصيل: ${details||"—"}`});
+    await tg("sendMessage",{chat_id:ch.telegram_channel_id,text:
+      "بلاغ جديد\n"+data.report_code+"\nID: "+(publicId||"—")+
+      "\nالسبب: "+reason+"\nالتفاصيل: "+(detailText||"—")
+    });
   }catch{}
   return json({ok:true,report:data},201);
 }
@@ -5979,6 +7113,9 @@ Deno.serve(async(req:Request)=>{
     }
     if(action==="pipeline_worker"&&req.method==="POST") return pipelineWorkerTick(req);
     if(action==="catalog"&&req.method==="GET") return catalog();
+    if(action==="catalog_page"&&req.method==="GET") return catalogPage(url);
+    if(action==="search_catalog"&&req.method==="GET") return searchCatalog(url);
+    if(action==="catalog_facets"&&req.method==="GET") return catalogFacets(url);
     if(action==="series_content"&&req.method==="GET") return seriesContent(url);
     if(action==="media_variants"&&req.method==="GET") return publicMediaVariants(url);
     if(action==="subtitles"&&req.method==="GET") return publicSubtitles(url);
@@ -5987,13 +7124,15 @@ Deno.serve(async(req:Request)=>{
     if(action==="refresh"&&req.method==="POST") return authRefresh(req);
     if(action==="me"&&req.method==="GET") return me(req);
     if(action==="profile"&&req.method==="POST") return updateProfile(req);
+    if(action==="password_reset"&&req.method==="POST") return requestPasswordReset(req);
+    if(action==="recover_password"&&req.method==="POST") return recoverPassword(req);
     if(action==="change_password"&&req.method==="POST") return changePassword(req);
     if(action==="view"&&req.method==="POST") return recordView(req);
     if(action==="favorites"&&(req.method==="GET"||req.method==="POST")) return favoritesApi(req);
     if(action==="progress"&&(req.method==="GET"||req.method==="POST")) return progressApi(req);
     if(action==="watch_history"&&req.method==="GET") return watchHistoryApi(req);
     if(req.method==="POST"&&action==="request_content") return publicRequest(req);
-    if(req.method==="GET"&&action==="request_status") return requestStatus(url);
+    if(req.method==="GET"&&action==="request_status") return requestStatus(url,req);
     if(req.method==="POST"&&action==="report") return publicReport(req);
 
     const mt=url.searchParams.get("media"),id=url.searchParams.get("id");

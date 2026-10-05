@@ -1266,3 +1266,18 @@ body::before{
   .history-state{display:none}
   .episode-watch-state{font-size:6px;padding:4px 5px}
 }
+
+.catalog-more{
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  padding:24px 16px 10px;
+}
+.catalog-more .btn{
+  min-width:180px;
+}
+.chip small{
+  opacity:.72;
+  margin-inline-start:6px;
+  font-size:.72em;
+}

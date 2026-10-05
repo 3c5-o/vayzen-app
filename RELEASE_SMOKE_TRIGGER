@@ -1,4 +1,5 @@
-VAYZEN production smoke trigger
-release=1.0.0
-release_commit=180651cf6d766126e6266ec2f6469f3210aeb082
-deployed_at=2026-09-24
+VAYZEN preproduction smoke trigger
+branch=vayzen-full-hardening-20261005
+supabase=kmhzagrxkdprqlkeqwrc
+test=xtream-series-30-and-mkv-ac3-aac
+date=2026-10-05

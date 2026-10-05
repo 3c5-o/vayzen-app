@@ -27,6 +27,16 @@ create table if not exists public.movies (
   release_date date,
   rating numeric(4,2),
   rating_count integer,
+  ingestion_status text not null default 'ready'
+    check (ingestion_status in ('ready','queued','processing','partial','failed')),
+  expected_seasons integer not null default 0 check (expected_seasons >= 0),
+  expected_episodes integer not null default 0 check (expected_episodes >= 0),
+  synced_episodes integer not null default 0 check (synced_episodes >= 0),
+  playable_episodes integer not null default 0 check (playable_episodes >= 0),
+  failed_episodes integer not null default 0 check (failed_episodes >= 0),
+  last_ingestion_error jsonb not null default '{}'::jsonb,
+  last_episode_sync_at timestamptz,
+  ready_at timestamptz,
   created_by bigint,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -56,6 +66,138 @@ create table if not exists public.series (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.series
+  add column if not exists ingestion_status text not null default 'ready',
+  add column if not exists expected_seasons integer not null default 0,
+  add column if not exists expected_episodes integer not null default 0,
+  add column if not exists synced_episodes integer not null default 0,
+  add column if not exists playable_episodes integer not null default 0,
+  add column if not exists failed_episodes integer not null default 0,
+  add column if not exists last_ingestion_error jsonb not null default '{}'::jsonb,
+  add column if not exists last_episode_sync_at timestamptz,
+  add column if not exists ready_at timestamptz;
+
+create index if not exists series_ingestion_status_idx
+  on public.series(ingestion_status,status,updated_at desc);
+
+create or replace function public.vayzen_catalog_facets(p_type text)
+returns jsonb
+language plpgsql
+security invoker
+set search_path=public
+as $
+declare
+  result jsonb;
+begin
+  if p_type not in ('movie','series') then
+    raise exception 'invalid catalog type';
+  end if;
+
+  if p_type='movie' then
+    select jsonb_build_object(
+      'genres',coalesce((
+        select jsonb_agg(jsonb_build_object('value',genre,'count',cnt) order by cnt desc,genre)
+        from (
+          select genre,count(*)::int cnt
+          from public.movies m, unnest(m.genres) genre
+          where m.status='published' and btrim(genre)<>''
+          group by genre order by cnt desc,genre limit 40
+        ) g
+      ),'[]'::jsonb),
+      'years',coalesce((
+        select jsonb_agg(jsonb_build_object('value',release_year,'count',cnt) order by release_year desc)
+        from (
+          select release_year,count(*)::int cnt from public.movies
+          where status='published' and release_year is not null
+          group by release_year order by release_year desc limit 150
+        ) y
+      ),'[]'::jsonb),
+      'countries',coalesce((
+        select jsonb_agg(jsonb_build_object('value',country_code,'label',country,'count',cnt) order by cnt desc,country)
+        from (
+          select country_code,max(country) country,count(*)::int cnt from public.movies
+          where status='published' and country_code is not null
+          group by country_code order by cnt desc,country_code limit 80
+        ) c
+      ),'[]'::jsonb)
+    ) into result;
+  else
+    select jsonb_build_object(
+      'genres',coalesce((
+        select jsonb_agg(jsonb_build_object('value',genre,'count',cnt) order by cnt desc,genre)
+        from (
+          select genre,count(*)::int cnt
+          from public.series s, unnest(s.genres) genre
+          where s.status='published' and s.ingestion_status='ready' and btrim(genre)<>''
+          group by genre order by cnt desc,genre limit 40
+        ) g
+      ),'[]'::jsonb),
+      'years',coalesce((
+        select jsonb_agg(jsonb_build_object('value',release_year,'count',cnt) order by release_year desc)
+        from (
+          select release_year,count(*)::int cnt from public.series
+          where status='published' and ingestion_status='ready' and release_year is not null
+          group by release_year order by release_year desc limit 150
+        ) y
+      ),'[]'::jsonb),
+      'countries',coalesce((
+        select jsonb_agg(jsonb_build_object('value',country_code,'label',country,'count',cnt) order by cnt desc,country)
+        from (
+          select country_code,max(country) country,count(*)::int cnt from public.series
+          where status='published' and ingestion_status='ready' and country_code is not null
+          group by country_code order by cnt desc,country_code limit 80
+        ) c
+      ),'[]'::jsonb)
+    ) into result;
+  end if;
+  return result;
+end;
+$;
+
+revoke all on function public.vayzen_catalog_facets(text) from public,anon,authenticated;
+grant execute on function public.vayzen_catalog_facets(text) to service_role;
+
+create or replace function public.vayzen_series_playback_counts(p_series_id uuid)
+returns table(seasons bigint, episodes bigint, playable bigint)
+language sql
+security invoker
+set search_path=public
+as $
+  with s as (
+    select id from public.seasons
+    where series_id=p_series_id and status='published'
+  ),
+  e as (
+    select ep.id
+    from public.episodes ep
+    join s on s.id=ep.season_id
+    where ep.status='published'
+  )
+  select
+    (select count(*) from s)::bigint,
+    (select count(*) from e)::bigint,
+    (
+      select count(*)::bigint
+      from e
+      where exists (
+        select 1 from public.media_assets ma
+        where ma.entity_type='episode'
+          and ma.entity_id=e.id
+          and ma.kind='video'
+      )
+      or exists (
+        select 1 from public.playback_sources ps
+        where ps.entity_type='episode'
+          and ps.entity_id=e.id
+          and ps.is_active=true
+          and ps.health_status<>'down'
+      )
+    );
+$;
+
+revoke all on function public.vayzen_series_playback_counts(uuid) from public,anon,authenticated;
+grant execute on function public.vayzen_series_playback_counts(uuid) to service_role;
 
 create table if not exists public.seasons (
   id uuid primary key default gen_random_uuid(),
@@ -208,6 +350,7 @@ create table if not exists public.content_requests (
   id uuid primary key default gen_random_uuid(),
   request_code text unique not null default ('REQ-' || lpad(nextval('public.request_code_seq')::text, 6, '0')),
   requester_key text not null,
+  user_id uuid references auth.users(id) on delete set null,
   request_type text not null check (request_type in ('movie','series')),
   title text not null check (char_length(btrim(title)) between 1 and 160),
   note text not null default '',
@@ -223,6 +366,7 @@ create table if not exists public.reports (
   id uuid primary key default gen_random_uuid(),
   report_code text unique not null default ('REP-' || lpad(nextval('public.report_code_seq')::text, 6, '0')),
   reporter_key text not null,
+  user_id uuid references auth.users(id) on delete set null,
   entity_type text not null check (entity_type in ('movie','series','episode','other')),
   entity_public_id text not null default '',
   reason text not null,
@@ -232,6 +376,12 @@ create table if not exists public.reports (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.content_requests add column if not exists user_id uuid references auth.users(id) on delete set null;
+alter table public.reports add column if not exists user_id uuid references auth.users(id) on delete set null;
+
+create index if not exists content_requests_user_recent_idx on public.content_requests(user_id,created_at desc) where user_id is not null;
+create index if not exists reports_user_recent_idx on public.reports(user_id,created_at desc) where user_id is not null;
 
 create table if not exists public.admin_logs (
   id uuid primary key default gen_random_uuid(),
@@ -781,6 +931,12 @@ create unique index if not exists content_provider_refs_unique_idx
     external_id
   );
 
+alter table public.content_provider_refs
+  drop constraint if exists content_provider_refs_upsert_unique;
+alter table public.content_provider_refs
+  add constraint content_provider_refs_upsert_unique
+  unique(provider_type,provider_account_id,entity_type,external_id);
+
 create index if not exists content_provider_refs_entity_idx
   on public.content_provider_refs(entity_type,entity_id,is_active);
 
@@ -799,6 +955,13 @@ create table if not exists public.playback_sources (
   external_stream_id text,
   external_series_id text,
   container_extension text not null default '',
+  video_codec text not null default '',
+  audio_codec text not null default '',
+  audio_channels integer,
+  probe_status text not null default 'unknown'
+    check (probe_status in ('unknown','queued','probing','compatible','needs_audio_transcode','needs_full_transcode','failed')),
+  compatibility_mode text not null default 'direct'
+    check (compatibility_mode in ('direct','hls_remux','audio_aac','full_h264_aac')),
   quality text not null default '',
   language text not null default '',
   country_code text,
@@ -819,9 +982,26 @@ create table if not exists public.playback_sources (
   )
 );
 
+alter table public.playback_sources
+  add column if not exists video_codec text not null default '',
+  add column if not exists audio_codec text not null default '',
+  add column if not exists audio_channels integer,
+  add column if not exists probe_status text not null default 'unknown',
+  add column if not exists compatibility_mode text not null default 'direct';
+
+alter table public.playback_sources drop constraint if exists playback_sources_compatibility_mode_check;
+alter table public.playback_sources add constraint playback_sources_compatibility_mode_check
+  check (compatibility_mode in ('direct','hls_remux','audio_aac','full_h264_aac'));
+
 create unique index if not exists playback_sources_xtream_unique_idx
   on public.playback_sources(xtream_account_id,entity_type,external_stream_id)
   where source_type='xtream';
+
+alter table public.playback_sources
+  drop constraint if exists playback_sources_xtream_upsert_unique;
+alter table public.playback_sources
+  add constraint playback_sources_xtream_upsert_unique
+  unique(xtream_account_id,entity_type,external_stream_id);
 
 create unique index if not exists playback_sources_telegram_unique_idx
   on public.playback_sources(telegram_asset_id)
@@ -874,6 +1054,14 @@ create table if not exists public.metadata_sync_queue (
   unique(provider,entity_type,entity_id)
 );
 
+alter table public.metadata_sync_queue
+  add column if not exists max_attempts integer not null default 8,
+  add column if not exists last_error_detail jsonb not null default '{}'::jsonb;
+
+alter table public.metadata_sync_queue drop constraint if exists metadata_sync_queue_status_check;
+alter table public.metadata_sync_queue add constraint metadata_sync_queue_status_check
+  check (status in ('pending','processing','completed','not_found','failed','manual_review','permanent_failed'));
+
 create index if not exists metadata_sync_queue_pick_idx
   on public.metadata_sync_queue(status,next_attempt_at,priority desc,created_at)
   where status in ('pending','failed');
@@ -909,8 +1097,11 @@ create table if not exists public.xtream_catalog_sync_jobs (
   created_items integer not null default 0 check (created_items >= 0),
   merged_items integer not null default 0 check (merged_items >= 0),
   source_links_created integer not null default 0 check (source_links_created >= 0),
+  series_ready integer not null default 0 check (series_ready >= 0),
+  series_failed integer not null default 0 check (series_failed >= 0),
+  series_pending integer not null default 0 check (series_pending >= 0),
   status text not null default 'pending'
-    check (status in ('pending','running','completed','failed','cancelled')),
+    check (status in ('pending','running','completed','partial','failed','cancelled')),
   started_by bigint,
   last_error text,
   started_at timestamptz,
@@ -918,6 +1109,15 @@ create table if not exists public.xtream_catalog_sync_jobs (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.xtream_catalog_sync_jobs
+  add column if not exists series_ready integer not null default 0,
+  add column if not exists series_failed integer not null default 0,
+  add column if not exists series_pending integer not null default 0;
+
+alter table public.xtream_catalog_sync_jobs drop constraint if exists xtream_catalog_sync_jobs_status_check;
+alter table public.xtream_catalog_sync_jobs add constraint xtream_catalog_sync_jobs_status_check
+  check (status in ('pending','running','completed','partial','failed','cancelled'));
 
 create unique index if not exists xtream_catalog_sync_jobs_one_active_per_account
   on public.xtream_catalog_sync_jobs(account_id)
@@ -927,6 +1127,69 @@ create index if not exists xtream_catalog_sync_jobs_pick_idx
   on public.xtream_catalog_sync_jobs(status,created_at)
   where status in ('pending','running');
 
+create table if not exists public.series_ingest_jobs (
+  id uuid primary key default gen_random_uuid(),
+  series_id uuid not null references public.series(id) on delete cascade,
+  provider_account_id uuid not null references public.xtream_accounts(id) on delete cascade,
+  provider_ref_id uuid references public.content_provider_refs(id) on delete set null,
+  external_series_id text not null,
+  parent_catalog_job_id uuid references public.xtream_catalog_sync_jobs(id) on delete set null,
+  status text not null default 'queued'
+    check (status in ('queued','running','completed','partial','failed','cancelled')),
+  expected_seasons integer not null default 0 check (expected_seasons >= 0),
+  expected_episodes integer not null default 0 check (expected_episodes >= 0),
+  synced_seasons integer not null default 0 check (synced_seasons >= 0),
+  synced_episodes integer not null default 0 check (synced_episodes >= 0),
+  playable_episodes integer not null default 0 check (playable_episodes >= 0),
+  failed_episodes integer not null default 0 check (failed_episodes >= 0),
+  attempts integer not null default 0 check (attempts >= 0),
+  error_attempts integer not null default 0 check (error_attempts >= 0),
+  max_attempts integer not null default 6 check (max_attempts between 1 and 20),
+  cursor_index integer not null default 0 check (cursor_index >= 0),
+  priority integer not null default 50,
+  next_attempt_at timestamptz not null default now(),
+  last_error text,
+  last_error_detail jsonb not null default '{}'::jsonb,
+  started_at timestamptz,
+  completed_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.series_ingest_jobs
+  add column if not exists error_attempts integer not null default 0,
+  add column if not exists cursor_index integer not null default 0;
+
+create unique index if not exists series_ingest_jobs_one_active_per_series
+  on public.series_ingest_jobs(series_id)
+  where status in ('queued','running');
+
+create index if not exists series_ingest_jobs_pick_idx
+  on public.series_ingest_jobs(status,next_attempt_at,priority desc,created_at)
+  where status in ('queued','partial','failed');
+
+create table if not exists public.media_probe_jobs (
+  id uuid primary key default gen_random_uuid(),
+  playback_source_id uuid not null references public.playback_sources(id) on delete cascade,
+  status text not null default 'queued'
+    check (status in ('queued','probing','completed','failed','permanent_failed')),
+  attempts integer not null default 0 check (attempts >= 0),
+  max_attempts integer not null default 5 check (max_attempts between 1 and 20),
+  next_attempt_at timestamptz not null default now(),
+  last_error text,
+  last_error_detail jsonb not null default '{}'::jsonb,
+  started_at timestamptz,
+  completed_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique(playback_source_id)
+);
+
+create index if not exists media_probe_jobs_pick_idx
+  on public.media_probe_jobs(status,next_attempt_at,created_at)
+  where status in ('queued','failed');
+
+
 alter table public.xtream_accounts enable row level security;
 alter table public.content_provider_refs enable row level security;
 alter table public.playback_sources enable row level security;
@@ -934,9 +1197,12 @@ alter table public.xtream_sync_runs enable row level security;
 alter table public.metadata_sync_queue enable row level security;
 alter table public.telegram_announcement_outbox enable row level security;
 alter table public.xtream_catalog_sync_jobs enable row level security;
+alter table public.series_ingest_jobs enable row level security;
+alter table public.media_probe_jobs enable row level security;
 
 revoke all on public.xtream_accounts,public.content_provider_refs,public.playback_sources,public.xtream_sync_runs,
-  public.metadata_sync_queue,public.telegram_announcement_outbox,public.xtream_catalog_sync_jobs
+  public.metadata_sync_queue,public.telegram_announcement_outbox,public.xtream_catalog_sync_jobs,
+  public.series_ingest_jobs,public.media_probe_jobs
 from anon,authenticated;
 
 drop trigger if exists trg_xtream_accounts_updated_at on public.xtream_accounts;
@@ -969,6 +1235,16 @@ create trigger trg_xtream_catalog_sync_jobs_updated_at
 before update on public.xtream_catalog_sync_jobs
 for each row execute function public.touch_updated_at();
 
+drop trigger if exists trg_series_ingest_jobs_updated_at on public.series_ingest_jobs;
+create trigger trg_series_ingest_jobs_updated_at
+before update on public.series_ingest_jobs
+for each row execute function public.touch_updated_at();
+
+drop trigger if exists trg_media_probe_jobs_updated_at on public.media_probe_jobs;
+create trigger trg_media_probe_jobs_updated_at
+before update on public.media_probe_jobs
+for each row execute function public.touch_updated_at();
+
 insert into public.app_settings(key,value)
 values('xtream',jsonb_build_object(
   'enabled',false,
@@ -984,12 +1260,25 @@ values('xtream',jsonb_build_object(
 on conflict (key) do nothing;
 
 insert into public.app_settings(key,value)
+values('public_app',jsonb_build_object(
+  'url','https://vayzen-gateway-production.up.railway.app'
+))
+on conflict (key) do nothing;
+
+insert into public.app_settings(key,value)
 values('content_sync_pipeline',jsonb_build_object(
-  'version',1,
+  'version',2,
   'tmdb_auto_enrich',true,
   'tmdb_worker_batch',20,
+  'tmdb_max_attempts',8,
+  'series_ingest_batch',1,
+  'series_ingest_chunk_size',12,
+  'series_ingest_max_attempts',6,
+  'media_probe_batch',3,
   'announcement_worker_batch',2,
   'announcement_list_chunk',35,
+  'ready_only_catalog',true,
+  'catalog_page_size',40,
   'xtream_batch_choices',jsonb_build_array(10,50,100,500,1000)
 ))
 on conflict (key) do nothing;

@@ -3,10 +3,30 @@ const SESSION_KEY="vayzen.session";
 const PREFS_KEY="vayzen.prefs";
 const DEVICE_KEY="vayzen.device";
 const GUEST_PROGRESS_KEY="vayzen.guest.progress";
+const RECOVERY_FRAGMENT=(()=>{
+  try{
+    const raw=location.hash.startsWith("#")?location.hash.slice(1):"";
+    if(!raw.includes("access_token="))return null;
+    const p=new URLSearchParams(raw);
+    if(p.get("type")!=="recovery"||!p.get("access_token"))return null;
+    return {
+      access_token:p.get("access_token"),
+      refresh_token:p.get("refresh_token")||"",
+      expires_at:Math.floor(Date.now()/1000)+Math.max(60,Number(p.get("expires_in")||3600))
+    };
+  }catch{return null}
+})();
 
 const state={
-  movies:[],series:[],favorites:[],progress:[],watchHistory:[],user:null,session:null,
-  query:"",movieGenre:"",seriesGenre:"",movieYear:"",seriesYear:"",movieCountry:"",seriesCountry:"",currentPage:"home",detail:null,detailVariant:"",player:null,nextEpisode:null,searchReturnPage:"home",
+  movies:[],series:[],moviePageItems:[],seriesPageItems:[],searchResults:[],
+  favorites:[],progress:[],watchHistory:[],user:null,session:null,
+  query:"",movieGenre:"",seriesGenre:"",movieYear:"",seriesYear:"",movieCountry:"",seriesCountry:"",
+  movieSort:"latest",seriesSort:"latest",
+  moviePage:1,seriesPage:1,searchPage:1,movieTotal:0,seriesTotal:0,searchTotal:0,
+  movieHasMore:false,seriesHasMore:false,searchHasMore:false,
+  catalogLoading:{movie:false,series:false,search:false},
+  facets:{movie:{genres:[],years:[],countries:[]},series:{genres:[],years:[],countries:[]}},
+  currentPage:"home",detail:null,detailVariant:"",player:null,nextEpisode:null,searchReturnPage:"home",
   heroItems:[],heroIndex:0,
   prefs:{autoplayNext:true,saveProgress:true}
 };
@@ -114,6 +134,12 @@ function percent(type,id){
   if(!p||!Number(p.duration_seconds))return 0;
   return Math.max(0,Math.min(100,Number(p.position_seconds)/Number(p.duration_seconds)*100));
 }
+function mergeCatalogCache(type,items){
+  const key=type==="movie"?"movies":"series";
+  const map=new Map(state[key].map(x=>[x.id,x]));
+  for(const item of items||[])if(item?.id)map.set(item.id,{...(map.get(item.id)||{}),...item});
+  state[key]=[...map.values()];
+}
 function itemBy(type,id){return (type==="movie"?state.movies:state.series).find(x=>x.id===id)}
 
 function watchHistoryFor(type,id){return state.watchHistory.find(x=>x.entity_type===type&&x.entity_id===id)}
@@ -214,16 +240,8 @@ function bindCards(root=document){
   });
 }
 
+
 function renderCatalog(){
-  const q=state.query.trim().toLowerCase();
-  const filter=(arr,genre,year,country)=>arr.filter(x=>
-    contentMatches(x,q)&&
-    (!genre||genreList(x).includes(genre))&&
-    (!year||String(x.release_year||"")===String(year))&&
-    (!country||countryKey(x)===country)
-  );
-  const movies=filter(state.movies,state.movieGenre,state.movieYear,state.movieCountry);
-  const series=filter(state.series,state.seriesGenre,state.seriesYear,state.seriesCountry);
   const mixed=mixedCatalog();
   const recent=[...mixed].sort((a,b)=>createdValue(b.item)-createdValue(a.item));
   const trending=[...mixed].sort((a,b)=>(Number(b.item.view_count)||0)-(Number(a.item.view_count)||0)||createdValue(b.item)-createdValue(a.item));
@@ -231,26 +249,46 @@ function renderCatalog(){
   const recommended=[...mixed].sort((a,b)=>(Number(Boolean(b.item.is_featured))-Number(Boolean(a.item.is_featured)))||ratingValue(b.item)-ratingValue(a.item)||createdValue(b.item)-createdValue(a.item));
 
   $("#latestMovies").innerHTML=state.movies.slice().sort((a,b)=>createdValue(b)-createdValue(a)).slice(0,12).map(x=>card(x,"movie",{compact:true})).join("")||'<div class="empty-card">لا توجد أفلام منشورة بعد.</div>';
-  $("#latestSeries").innerHTML=state.series.slice().sort((a,b)=>createdValue(b)-createdValue(a)).slice(0,12).map(x=>card(x,"series",{compact:true})).join("")||'<div class="empty-card">لا توجد مسلسلات منشورة بعد.</div>';
+  $("#latestSeries").innerHTML=state.series.slice().sort((a,b)=>createdValue(b)-createdValue(a)).slice(0,12).map(x=>card(x,"series",{compact:true})).join("")||'<div class="empty-card">لا توجد مسلسلات جاهزة بعد.</div>';
   $("#recommendedRail").innerHTML=recent.slice(0,14).map(x=>card(x.item,x.type,{compact:true})).join("")||'<div class="empty-card">سيظهر المحتوى الجديد هنا.</div>';
   $("#trendingRail").innerHTML=trending.slice(0,14).map(x=>card(x.item,x.type,{compact:true})).join("")||'<div class="empty-card">يظهر الأكثر مشاهدة بعد بدء المشاهدات.</div>';
   $("#topRatedRail").innerHTML=(rated.length?rated:recommended).slice(0,14).map(x=>card(x.item,x.type,{compact:true})).join("")||'<div class="empty-card">لا توجد تقييمات بعد.</div>';
-  $("#moviesGrid").innerHTML=movies.map(x=>card(x,"movie")).join("")||'<div class="empty-state">لا توجد أفلام مطابقة للفلاتر الحالية.</div>';
-  $("#seriesGrid").innerHTML=series.map(x=>card(x,"series")).join("")||'<div class="empty-state">لا توجد مسلسلات مطابقة للفلاتر الحالية.</div>';
-  $("#movieCount").textContent=String(movies.length);
-  $("#seriesCount").textContent=String(series.length);
 
-  const searchMatches=mixed.filter(x=>contentMatches(x.item,q));
-  $("#searchResultsGrid").innerHTML=q?(searchMatches.map(x=>card(x.item,x.type)).join("")||'<div class="empty-state">ما لقينا نتائج مطابقة. جرّب اسمًا آخر.</div>'):'<div class="empty-state">اكتب اسم فيلم أو مسلسل في مربع البحث.</div>';
-  $("#searchCount").textContent=String(q?searchMatches.length:0);
-  $("#searchSummary").textContent=q?`نتائج البحث عن “${state.query.trim()}”`:"اكتب اسم فيلم أو مسلسل للبحث.";
+  $("#moviesGrid").innerHTML=state.moviePageItems.map(x=>card(x,"movie")).join("")||'<div class="empty-state">لا توجد أفلام مطابقة للفلاتر الحالية.</div>';
+  $("#seriesGrid").innerHTML=state.seriesPageItems.map(x=>card(x,"series")).join("")||'<div class="empty-state">لا توجد مسلسلات مطابقة للفلاتر الحالية.</div>';
+  $("#movieCount").textContent=Number(state.movieTotal||0).toLocaleString("ar-IQ");
+  $("#seriesCount").textContent=Number(state.seriesTotal||0).toLocaleString("ar-IQ");
 
-  renderGenreChips("movieChips",state.movies,"movieGenre");
-  renderGenreChips("seriesChips",state.series,"seriesGenre");
-  renderCountryFilter("movieCountryFilter",state.movies,"movieCountry");
-  renderCountryFilter("seriesCountryFilter",state.series,"seriesCountry");
-  renderYearFilter("movieYearFilter",state.movies,"movieYear");
-  renderYearFilter("seriesYearFilter",state.series,"seriesYear");
+  const search=$("#searchResultsGrid");
+  if(state.query.trim()){
+    search.innerHTML=state.searchResults.length
+      ?state.searchResults.map(x=>card(x.item,x.type)).join("")
+      :'<div class="empty-state">ما لقينا نتائج مطابقة. جرّب اسمًا آخر.</div>';
+  }else search.innerHTML='<div class="empty-state">اكتب اسم فيلم أو مسلسل في مربع البحث.</div>';
+  $("#searchCount").textContent=Number(state.query.trim()?state.searchTotal:0).toLocaleString("ar-IQ");
+  $("#searchSummary").textContent=state.query.trim()?`نتائج البحث عن “${state.query.trim()}”`:"اكتب اسم فيلم أو مسلسل للبحث.";
+
+  renderGenreChips("movieChips","movie","movieGenre");
+  renderGenreChips("seriesChips","series","seriesGenre");
+  renderCountryFilter("movieCountryFilter","movie","movieCountry");
+  renderCountryFilter("seriesCountryFilter","series","seriesCountry");
+  renderYearFilter("movieYearFilter","movie","movieYear");
+  renderYearFilter("seriesYearFilter","series","seriesYear");
+
+  const movieSort=$("#movieSort"),seriesSort=$("#seriesSort");
+  if(movieSort){
+    movieSort.value=state.movieSort;
+    movieSort.onchange=async()=>{state.movieSort=movieSort.value||"latest";await loadCatalogType("movie",{reset:true})};
+  }
+  if(seriesSort){
+    seriesSort.value=state.seriesSort;
+    seriesSort.onchange=async()=>{state.seriesSort=seriesSort.value||"latest";await loadCatalogType("series",{reset:true})};
+  }
+
+  $("#loadMoreMovies")?.classList.toggle("hidden",!state.movieHasMore);
+  $("#loadMoreSeries")?.classList.toggle("hidden",!state.seriesHasMore);
+  $("#loadMoreSearch")?.classList.toggle("hidden",!state.searchHasMore||!state.query.trim());
+
   renderHomeGenres();
   bindCards();
   renderHero();
@@ -270,39 +308,49 @@ function renderHomeGenres(){
   }
   const genres=[...map.entries()].sort((a,b)=>b[1].count-a[1].count).slice(0,10);
   el.innerHTML=genres.length?genres.map(([g,v])=>`<button class="home-genre" data-home-genre="${esc(g)}" data-target="${v.movies>=v.series?"movies":"series"}">${esc(g)}<small>${v.count}</small></button>`).join(""):'<span class="muted-note">تظهر التصنيفات بعد إضافة المحتوى.</span>';
-  el.querySelectorAll("[data-home-genre]").forEach(b=>b.onclick=()=>{
+  el.querySelectorAll("[data-home-genre]").forEach(b=>b.onclick=async()=>{
     const genre=b.dataset.homeGenre||"",target=b.dataset.target||"movies";
     state.query="";$("#searchInput").value="";
     if(target==="movies")state.movieGenre=genre;else state.seriesGenre=genre;
-    renderCatalog();go(target);
+    await loadCatalogType(target,{reset:true});go(target);
   });
 }
 
-function renderGenreChips(id,items,key){
-  const genres=[...new Set(items.flatMap(genreList))].filter(Boolean).slice(0,18);
-  $("#"+id).innerHTML=`<button class="chip ${!state[key]?"active":""}" data-genre="">الكل</button>`+
-    genres.map(g=>`<button class="chip ${state[key]===g?"active":""}" data-genre="${esc(g)}">${esc(g)}</button>`).join("");
-  $("#"+id).querySelectorAll(".chip").forEach(b=>b.onclick=()=>{state[key]=b.dataset.genre||"";renderCatalog()});
+function facetRows(type,kind){
+  return Array.isArray(state.facets?.[type]?.[kind])?state.facets[type][kind]:[];
 }
-function renderCountryFilter(id,items,key){
+function renderGenreChips(id,type,key){
   const el=$("#"+id);if(!el)return;
-  const options=[...new Map(items.map(item=>[countryKey(item),countryLabel(item)]).filter(([value])=>Boolean(value))).entries()]
-    .sort((a,b)=>String(a[1]).localeCompare(String(b[1]),"ar"));
+  const rows=facetRows(type,"genres").slice(0,24);
+  el.innerHTML=`<button class="chip ${!state[key]?"active":""}" data-genre="">الكل</button>`+
+    rows.map(x=>`<button class="chip ${state[key]===String(x.value)?"active":""}" data-genre="${esc(x.value)}">${esc(x.value)}<small>${Number(x.count||0).toLocaleString("ar-IQ")}</small></button>`).join("");
+  el.querySelectorAll(".chip").forEach(b=>b.onclick=async()=>{
+    state[key]=b.dataset.genre||"";
+    await loadCatalogType(type,{reset:true});
+  });
+}
+function renderCountryFilter(id,type,key){
+  const el=$("#"+id);if(!el)return;
+  const rows=facetRows(type,"countries");
   const current=String(state[key]||"");
-  const html='<option value="">كل الدول</option>'+options.map(([value,label])=>`<option value="${esc(value)}">${esc(label)}</option>`).join("");
+  const html='<option value="">كل الدول</option>'+rows.map(x=>{
+    const value=String(x.value||""),label=countryLabel(value)||String(x.label||value);
+    return `<option value="${esc(value)}">${esc(label)} (${Number(x.count||0).toLocaleString("ar-IQ")})</option>`;
+  }).join("");
   if(el.innerHTML!==html)el.innerHTML=html;
   el.value=current;
-  el.onchange=()=>{state[key]=el.value||"";renderCatalog()};
+  el.onchange=async()=>{state[key]=el.value||"";await loadCatalogType(type,{reset:true})};
 }
-function renderYearFilter(id,items,key){
+function renderYearFilter(id,type,key){
   const el=$("#"+id);if(!el)return;
-  const years=[...new Set(items.map(x=>Number(x.release_year)).filter(y=>Number.isInteger(y)&&y>0))].sort((a,b)=>b-a);
+  const rows=facetRows(type,"years");
   const current=String(state[key]||"");
-  const html='<option value="">كل السنوات</option>'+years.map(y=>`<option value="${y}">${y}</option>`).join("");
+  const html='<option value="">كل السنوات</option>'+rows.map(x=>`<option value="${esc(x.value)}">${esc(x.value)} (${Number(x.count||0).toLocaleString("ar-IQ")})</option>`).join("");
   if(el.innerHTML!==html)el.innerHTML=html;
   el.value=current;
-  el.onchange=()=>{state[key]=el.value||"";renderCatalog()};
+  el.onchange=async()=>{state[key]=el.value||"";await loadCatalogType(type,{reset:true})};
 }
+
 function buildHeroItems(){
   return mixedCatalog()
     .sort((a,b)=>createdValue(b.item)-createdValue(a.item)||ratingValue(b.item)-ratingValue(a.item))
@@ -493,20 +541,128 @@ function renderMyList(){
   bindCards(grid);renderWatchHistory();
 }
 
+
+function catalogParams(type,page){
+  const movie=type==="movie";
+  return {
+    type,
+    page:String(page),
+    limit:"40",
+    genre:String(movie?state.movieGenre:state.seriesGenre),
+    year:String(movie?state.movieYear:state.seriesYear),
+    country:String(movie?state.movieCountry:state.seriesCountry),
+    sort:String(movie?state.movieSort:state.seriesSort)
+  };
+}
+async function loadCatalogType(type,{reset=false}={}){
+  if(state.catalogLoading[type])return;
+  state.catalogLoading[type]=true;
+  const movie=type==="movie";
+  const nextPage=reset?1:(movie?state.moviePage:state.seriesPage)+1;
+  const grid=$(movie?"#moviesGrid":"#seriesGrid");
+  if(reset&&grid)grid.innerHTML=skeletonCards(8);
+  try{
+    const j=await rawApi("catalog_page",{params:catalogParams(type,nextPage)});
+    const items=Array.isArray(j.items)?j.items:[];
+    mergeCatalogCache(type,items);
+    const listKey=movie?"moviePageItems":"seriesPageItems";
+    const current=reset?[]:state[listKey];
+    const map=new Map(current.map(x=>[x.id,x]));
+    for(const item of items)map.set(item.id,item);
+    state[listKey]=[...map.values()];
+    if(movie){
+      state.moviePage=Number(j.page||nextPage);
+      state.movieTotal=Number(j.total||0);
+      state.movieHasMore=Boolean(j.has_more);
+    }else{
+      state.seriesPage=Number(j.page||nextPage);
+      state.seriesTotal=Number(j.total||0);
+      state.seriesHasMore=Boolean(j.has_more);
+    }
+  }catch(e){
+    showToast("تعذر تحميل "+(movie?"الأفلام":"المسلسلات"));
+  }finally{
+    state.catalogLoading[type]=false;
+    renderCatalog();
+  }
+}
+async function loadCatalogFacets(type){
+  try{
+    const j=await rawApi("catalog_facets",{params:{type}});
+    state.facets[type]=j.facets||{genres:[],years:[],countries:[]};
+  }catch{
+    state.facets[type]={genres:[],years:[],countries:[]};
+  }
+}
+let searchRequestSeq=0;
+async function runSearch({reset=false}={}){
+  const q=state.query.trim();
+  if(q.length<2){
+    state.searchResults=[];state.searchTotal=0;state.searchHasMore=false;state.searchPage=1;
+    renderCatalog();return;
+  }
+  if(state.catalogLoading.search)return;
+  state.catalogLoading.search=true;
+  const seq=++searchRequestSeq;
+  const page=reset?1:state.searchPage+1;
+  if(reset)$("#searchResultsGrid").innerHTML=skeletonCards(8);
+  try{
+    const j=await rawApi("search_catalog",{params:{q,page:String(page),limit:"20"}});
+    if(seq!==searchRequestSeq)return;
+    const rows=Array.isArray(j.items)?j.items:[];
+    for(const row of rows)if(row?.item?.id)mergeCatalogCache(row.type,[row.item]);
+    const current=reset?[]:state.searchResults;
+    const map=new Map(current.map(x=>[x.type+":"+x.item.id,x]));
+    for(const row of rows)if(row?.item?.id)map.set(row.type+":"+row.item.id,row);
+    state.searchResults=[...map.values()];
+    state.searchPage=Number(j.page||page);
+    state.searchTotal=Number(j.total||0);
+    state.searchHasMore=Boolean(j.has_more);
+  }catch{
+    if(reset)state.searchResults=[];
+    showToast("تعذر البحث حاليًا");
+  }finally{
+    if(seq===searchRequestSeq){
+      state.catalogLoading.search=false;
+      renderCatalog();
+    }
+  }
+}
 async function loadCatalog(){
   const skeleton=skeletonCards(8);
-  ["latestMovies","latestSeries","recommendedRail","trendingRail","topRatedRail","moviesGrid","seriesGrid"].forEach(id=>{const el=$("#"+id);if(el)el.innerHTML=skeleton});
+  ["latestMovies","latestSeries","recommendedRail","trendingRail","topRatedRail","moviesGrid","seriesGrid"].forEach(id=>{
+    const el=$("#"+id);if(el)el.innerHTML=skeleton;
+  });
   try{
-    const j=await rawApi("catalog");
-    state.movies=j.movies||[];state.series=j.series||[];
+    const [home,movies,series]=await Promise.all([
+      rawApi("catalog"),
+      rawApi("catalog_page",{params:catalogParams("movie",1)}),
+      rawApi("catalog_page",{params:catalogParams("series",1)})
+    ]);
+    state.movies=[];state.series=[];
+    mergeCatalogCache("movie",home.movies||[]);
+    mergeCatalogCache("series",home.series||[]);
+    mergeCatalogCache("movie",movies.items||[]);
+    mergeCatalogCache("series",series.items||[]);
+    state.moviePageItems=movies.items||[];
+    state.seriesPageItems=series.items||[];
+    state.moviePage=1;state.seriesPage=1;
+    state.movieTotal=Number(movies.total??home.totals?.movies??0);
+    state.seriesTotal=Number(series.total??home.totals?.series??0);
+    state.movieHasMore=Boolean(movies.has_more);
+    state.seriesHasMore=Boolean(series.has_more);
+    await Promise.all([loadCatalogFacets("movie"),loadCatalogFacets("series")]);
     renderCatalog();
   }catch(e){
     showToast("تعذر تحميل المحتوى");
     $("#moviesGrid").innerHTML='<div class="empty-state">تعذر تحميل المحتوى حاليًا.</div>';
     $("#seriesGrid").innerHTML='<div class="empty-state">تعذر تحميل المحتوى حاليًا.</div>';
-    ["recommendedRail","trendingRail","topRatedRail","latestMovies","latestSeries"].forEach(id=>{const el=$("#"+id);if(el)el.innerHTML='<div class="empty-card">تعذر تحميل المحتوى.</div>'});
+    ["recommendedRail","trendingRail","topRatedRail","latestMovies","latestSeries"].forEach(id=>{
+      const el=$("#"+id);if(el)el.innerHTML='<div class="empty-card">تعذر تحميل المحتوى.</div>';
+    });
   }
 }
+
 async function loadUserState(){
   if(!state.session?.access_token){state.user=null;state.favorites=[];state.progress=[];state.watchHistory=[];renderAccount();renderCatalog();return}
   try{
@@ -713,6 +869,33 @@ $("#loginForm").addEventListener("submit",async e=>{
     setSession(j.session);closeModal("authModal");await loadUserState();showToast("تم تسجيل الدخول");
   }catch(err){showToast(err.message)}finally{btn.disabled=false}
 });
+$("#forgotPasswordBtn").onclick=async()=>{
+  const email=$("#loginEmail").value.trim();
+  if(!email||!email.includes("@")){showToast("اكتب بريدك الإلكتروني أولًا");$("#loginEmail").focus();return}
+  const btn=$("#forgotPasswordBtn");btn.disabled=true;
+  try{
+    const j=await rawApi("password_reset",{method:"POST",body:{email}});
+    showToast(j.message||"إذا كان البريد مسجلًا ستصل رسالة الاستعادة");
+  }catch(err){showToast(err.message)}finally{btn.disabled=false}
+};
+$("#recoveryPasswordForm").addEventListener("submit",async e=>{
+  e.preventDefault();
+  const next=$("#recoveryPassword").value;
+  const confirm=$("#recoveryConfirm").value;
+  if(next.length<8){showToast("كلمة المرور يجب أن تكون 8 أحرف على الأقل");return}
+  if(next!==confirm){showToast("تأكيد كلمة المرور غير مطابق");return}
+  const btn=e.submitter;btn.disabled=true;
+  try{
+    await rawApi("recover_password",{method:"POST",auth:true,body:{new_password:next}});
+    e.target.reset();
+    closeModal("recoveryPasswordModal");
+    setSession(null);state.user=null;state.favorites=[];state.progress=[];state.watchHistory=[];
+    history.replaceState({vayzen:true,page:"account"},"","#account");
+    renderAccount();renderCatalog();
+    showToast("تم تحديث كلمة المرور. سجل الدخول من جديد");
+    openAuth("login");
+  }catch(err){showToast(err.message)}finally{btn.disabled=false}
+});
 $("#registerForm").addEventListener("submit",async e=>{
   e.preventDefault();
   const pass=$("#registerPassword").value,confirm=$("#registerConfirm").value;
@@ -752,14 +935,14 @@ $("#logoutBtn").onclick=()=>{setSession(null);state.user=null;state.favorites=[]
 $("#requestForm").addEventListener("submit",async e=>{
   e.preventDefault();const btn=e.submitter;btn.disabled=true;
   try{
-    const j=await rawApi("request_content",{method:"POST",body:{requester_key:requestKey(),request_type:$("#requestType").value,title:$("#requestTitle").value.trim(),note:$("#requestNote").value.trim()}});
+    const j=await rawApi("request_content",{method:"POST",auth:Boolean(state.user),body:{requester_key:requestKey(),request_type:$("#requestType").value,title:$("#requestTitle").value.trim(),note:$("#requestNote").value.trim()}});
     closeModal("requestModal");$("#requestForm").reset();showToast("تم إرسال الطلب "+j.request.request_code);
   }catch(err){showToast(err.message)}finally{btn.disabled=false}
 });
 async function openRequests(){
   openModal("requestsModal");$("#requestsList").innerHTML='<div class="empty-state">جاري التحميل...</div>';
   try{
-    const j=await rawApi("request_status",{params:{requester_key:requestKey()}});
+    const j=await rawApi("request_status",{auth:Boolean(state.user),params:{requester_key:requestKey()}});
     const labels={new:"جديد",reviewing:"قيد المراجعة",added:"تمت الإضافة",rejected:"مرفوض",duplicate:"مكرر"};
     $("#requestsList").innerHTML=(j.requests||[]).length?(j.requests||[]).map((x,i)=>`<div class="request-item"><div class="request-top"><b>${esc(x.title)}</b><span class="status-pill status-${esc(x.status)}">${labels[x.status]||esc(x.status)}</span></div><small>${esc(x.request_code)} • ${x.request_type==="movie"?"فيلم":"مسلسل"}</small>${x.linked?`<button class="btn primary request-watch" data-request-watch="${i}"><svg><use href="#i-play"/></svg><span>مشاهدة الآن</span></button>`:""}</div>`).join(""):'<div class="empty-state">ما عندك طلبات بعد.</div>';
     $("#requestsList").querySelectorAll("[data-request-watch]").forEach(btn=>btn.onclick=()=>{
@@ -774,7 +957,7 @@ function openReport(type="other",publicId=""){if(!state.user){openAuth("login");
 $("#reportForm").addEventListener("submit",async e=>{
   e.preventDefault();const btn=e.submitter;btn.disabled=true;
   try{
-    const j=await rawApi("report",{method:"POST",body:{reporter_key:requestKey(),entity_type:$("#reportEntityType").value||"other",entity_public_id:$("#reportPublicId").value||"",reason:$("#reportReason").value,details:$("#reportDetails").value.trim()}});
+    const j=await rawApi("report",{method:"POST",auth:Boolean(state.user),body:{reporter_key:requestKey(),entity_type:$("#reportEntityType").value||"other",entity_public_id:$("#reportPublicId").value||"",reason:$("#reportReason").value,details:$("#reportDetails").value.trim(),diagnostics:{online:navigator.onLine,user_agent:navigator.userAgent.slice(0,240),page:state.currentPage,player_type:state.player?.type||null,player_id:state.player?.id||null,quality:state.player?.qualityVariant||null}}});
     closeModal("reportModal");showToast("تم إرسال البلاغ "+j.report.report_code);
   }catch(err){showToast(err.message)}finally{btn.disabled=false}
 });
@@ -795,6 +978,8 @@ let playerRetryCount=0;
 let playerRetryTimer=0;
 let nextCountdownTimer=0;
 let nextCountdownTick=0;
+let hlsInstance=null;
+let hlsRecoveryCount=0;
 
 function formatClock(value){
   const n=Math.max(0,Math.floor(Number(value)||0));
@@ -870,18 +1055,20 @@ async function loadPlayerQualities(o){
       const name=String(v.variant||"");
       if(!name||seen.has(name))continue;
       seen.add(name);
-      unique.push({variant:name,label:String(v.label||name)});
+      unique.push({variant:name,label:String(v.label||name),delivery:String(v.delivery||"direct"),fallback_delivery:String(v.fallback_delivery||v.delivery||"direct"),mime_type:String(v.mime_type||""),compatibility_mode:String(v.compatibility_mode||"direct"),fallback_compatibility_mode:String(v.fallback_compatibility_mode||v.compatibility_mode||"direct")});
     }
     if(!unique.length){
       select.innerHTML='<option value="default">تلقائي</option>';
       return;
     }
     select.innerHTML=unique.map(v=>"<option value=\""+esc(v.variant)+"\">"+esc(v.variant==="default"?(o.quality||v.label||"افتراضي"):v.label)+"</option>").join("");
+    o.mediaVariants=unique;
     const names=unique.map(v=>v.variant);
     const wanted=o.qualityVariant&&names.includes(o.qualityVariant)?o.qualityVariant:(names.includes("default")?"default":names[0]);
     if(wanted)select.value=wanted;
     select.classList.toggle("hidden",unique.length<=1);
   }catch{
+    o.mediaVariants=[];
     select.innerHTML='<option value="default">تلقائي</option>';
     select.classList.add("hidden");
   }
@@ -930,6 +1117,72 @@ function sourceForPlayer(o,variant=""){
     return u.toString();
   }catch{return base}
 }
+function playerVariantInfo(o,variant="default"){
+  const rows=Array.isArray(o?.mediaVariants)?o.mediaVariants:[];
+  return rows.find(x=>String(x.variant||"default")===String(variant||"default"))||rows[0]||null;
+}
+function playerDelivery(o,variant="default"){
+  const row=playerVariantInfo(o,variant);
+  if(!row)return "direct";
+  return String(o?.forceXtream?(row.fallback_delivery||row.delivery||"direct"):(row.delivery||"direct"));
+}
+function destroyHls(){
+  if(hlsInstance){
+    try{hlsInstance.destroy()}catch{}
+    hlsInstance=null;
+  }
+  hlsRecoveryCount=0;
+}
+function showPlayerSourceError(message){
+  $("#playerLoader").classList.add("hidden");
+  $("#playerErrorText").textContent=message||"تعذر تشغيل مصدر الفيديو.";
+  $("#playerError").classList.remove("hidden");
+  showPlayerControls(true);
+}
+async function attachPlayerSource(o,src,variant="default"){
+  destroyHls();
+  video.pause();
+  video.removeAttribute("src");
+  const delivery=playerDelivery(o,variant);
+  if(delivery!=="hls"){
+    video.src=src;video.load();return "direct";
+  }
+  const nativeHls=video.canPlayType("application/vnd.apple.mpegurl")||video.canPlayType("application/x-mpegURL");
+  if(nativeHls){
+    video.src=src;video.load();return "native-hls";
+  }
+  const HlsClass=window.Hls;
+  if(HlsClass?.isSupported?.()){
+    const hls=new HlsClass({
+      enableWorker:true,
+      lowLatencyMode:false,
+      backBufferLength:60,
+      maxBufferLength:90,
+      manifestLoadingMaxRetry:4,
+      levelLoadingMaxRetry:4,
+      fragLoadingMaxRetry:5
+    });
+    hlsInstance=hls;
+    hls.on(HlsClass.Events.ERROR,(_event,data)=>{
+      if(!data?.fatal||hlsInstance!==hls)return;
+      if(data.type===HlsClass.ErrorTypes.NETWORK_ERROR&&hlsRecoveryCount<2){
+        hlsRecoveryCount++;try{hls.startLoad()}catch{};return;
+      }
+      if(data.type===HlsClass.ErrorTypes.MEDIA_ERROR&&hlsRecoveryCount<2){
+        hlsRecoveryCount++;try{hls.recoverMediaError()}catch{};return;
+      }
+      destroyHls();
+      showPlayerSourceError("تعذر تشغيل البث المتوافق. أعد المحاولة.");
+    });
+    hls.attachMedia(video);
+    hls.on(HlsClass.Events.MEDIA_ATTACHED,()=>{
+      if(hlsInstance===hls)hls.loadSource(src);
+    });
+    return "hls.js";
+  }
+  video.src=src;video.load();
+  return "fallback";
+}
 async function openPlayer(o,{pushHistory=true}={}){
   clearTimeout(playerRetryTimer);clearInterval(nextCountdownTimer);clearInterval(nextCountdownTick);
   playerRetryCount=0;
@@ -948,7 +1201,7 @@ async function openPlayer(o,{pushHistory=true}={}){
   await Promise.all([loadPlayerQualities(o),loadPlayerSubtitles(o)]);
   const qv=$("#qualitySelect")?.value||"default";
   o.qualityVariant=qv;o.src=sourceForPlayer(o,qv);
-  video.src=o.src;video.load();
+  await attachPlayerSource(o,o.src,qv);
   if(pushHistory&&history.state?.overlay!=="player")history.pushState({vayzen:true,page:state.currentPage,overlay:"player"},"","#watch");
 
   const p=playerProgress();
@@ -966,6 +1219,7 @@ async function closePlayer({fromHistory=false}={}){
   $("#nextCountdown")?.classList.add("hidden");
   await saveCurrentProgress();
   video.pause();
+  destroyHls();
   clearPlayerTracks();
   video.removeAttribute("src");video.load();
   playerLayer.classList.remove("open","controls-hidden","idle");
@@ -1008,12 +1262,12 @@ video.addEventListener("loadedmetadata",syncPlayerUI);
 video.addEventListener("durationchange",syncPlayerUI);
 video.addEventListener("play",()=>{updatePlayIcon();scheduleControlsHide()});
 video.addEventListener("pause",()=>{updatePlayIcon();showPlayerControls(true);saveCurrentProgress()});
-function retryCurrentPlayer(auto=false){
+async function retryCurrentPlayer(auto=false){
   const o=state.player;if(!o)return;
   const t=video.currentTime||0,paused=video.paused;
   $("#playerError").classList.add("hidden");$("#playerLoader").classList.remove("hidden");
   o.src=freshSourceForPlayer(o,o.qualityVariant||"default");
-  video.src=o.src;video.load();
+  await attachPlayerSource(o,o.src,o.qualityVariant||"default");
   video.addEventListener("loadedmetadata",()=>{
     if(t>0&&t<video.duration)video.currentTime=t;
     if(!paused||auto)video.play().catch(()=>{});
@@ -1125,13 +1379,13 @@ $("#playerBack").onclick=()=>closePlayer();
 $("#playPauseBtn").onclick=togglePlayback;
 $("#rewindBtn").onclick=()=>seekBy(-10);
 $("#forwardBtn").onclick=()=>seekBy(10);
-$("#qualitySelect").onchange=()=>{
+$("#qualitySelect").onchange=async()=>{
   const o=state.player;if(!o)return;
   const t=video.currentTime||0,paused=video.paused;
   o.qualityVariant=$("#qualitySelect").value||"default";
   o.src=freshSourceForPlayer(o,o.qualityVariant);
   $("#playerLoader").classList.remove("hidden");
-  video.src=o.src;video.load();
+  await attachPlayerSource(o,o.src,o.qualityVariant);
   video.addEventListener("loadedmetadata",()=>{
     if(t>0&&t<video.duration)video.currentTime=t;
     if(!paused)video.play().catch(()=>{});
@@ -1249,15 +1503,27 @@ $("#globalSearchBtn").onclick=()=>{
   panel.classList.toggle("hidden");
   if(opening){state.searchReturnPage=state.currentPage==="search"?"home":state.currentPage;setTimeout(()=>$("#searchInput").focus(),20)}
 };
+let searchDebounceTimer=0;
 $("#clearSearch").onclick=()=>{
-  $("#searchInput").value="";state.query="";renderCatalog();
+  clearTimeout(searchDebounceTimer);searchRequestSeq++;
+  $("#searchInput").value="";state.query="";
+  state.searchResults=[];state.searchTotal=0;state.searchHasMore=false;state.searchPage=1;
+  renderCatalog();
   if(state.currentPage==="search")go(state.searchReturnPage||"home");
 };
 $("#searchInput").oninput=e=>{
   state.query=e.target.value;
-  renderCatalog();
-  if(state.query.trim()){if(state.currentPage!=="search")go("search")}
-  else if(state.currentPage==="search")go(state.searchReturnPage||"home");
+  clearTimeout(searchDebounceTimer);
+  if(state.query.trim()){
+    if(state.currentPage!=="search")go("search");
+    $("#searchResultsGrid").innerHTML=skeletonCards(6);
+    searchDebounceTimer=setTimeout(()=>runSearch({reset:true}),300);
+  }else{
+    searchRequestSeq++;
+    state.searchResults=[];state.searchTotal=0;state.searchHasMore=false;state.searchPage=1;
+    renderCatalog();
+    if(state.currentPage==="search")go(state.searchReturnPage||"home");
+  }
 };
 $("#editProfileBtn").onclick=()=>openModal("editProfileModal");
 $("#openPasswordBtn").onclick=()=>openModal("changePasswordModal");
@@ -1266,16 +1532,27 @@ $("#openRequestsHistory").onclick=openRequests;
 $("#openReportGeneral").onclick=()=>openReport("other","");
 $("#autoplayNext").onchange=e=>{state.prefs.autoplayNext=e.target.checked;savePrefs()};
 $("#saveProgress").onchange=e=>{state.prefs.saveProgress=e.target.checked;savePrefs()};
+$("#loadMoreMovies").onclick=()=>loadCatalogType("movie",{reset:false});
+$("#loadMoreSeries").onclick=()=>loadCatalogType("series",{reset:false});
+$("#loadMoreSearch").onclick=()=>runSearch({reset:false});
 
 async function boot(){
   const splash=$("#splash");
   const started=performance.now();
   const failSafe=setTimeout(()=>splash?.classList.add("hide"),4500);
   try{
-    loadPrefs();loadSession();
+    loadPrefs();
+    if(RECOVERY_FRAGMENT){
+      setSession(RECOVERY_FRAGMENT);
+      history.replaceState({vayzen:true,page:"account"},"","#account");
+    }else loadSession();
     await loadCatalog();
     await loadUserState();
-    applyPage(history.state?.page||"home");
+    applyPage(RECOVERY_FRAGMENT?"account":(history.state?.page||"home"));
+    if(RECOVERY_FRAGMENT){
+      if(state.user)openModal("recoveryPasswordModal");
+      else{showToast("رابط الاستعادة غير صالح أو منتهي");openAuth("login")}
+    }
   }finally{
     clearTimeout(failSafe);
     const elapsed=performance.now()-started;

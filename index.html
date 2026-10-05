@@ -166,9 +166,14 @@
           <div class="chips" id="movieChips"></div>
           <select class="filter-select" id="movieCountryFilter" aria-label="فلترة الأفلام حسب الدولة"><option value="">كل الدول</option></select>
           <select class="filter-select" id="movieYearFilter" aria-label="فلترة الأفلام حسب السنة"><option value="">كل السنوات</option></select>
+          <select class="filter-select" id="movieSort" aria-label="ترتيب الأفلام">
+            <option value="latest">الأحدث</option><option value="popular">الأكثر مشاهدة</option>
+            <option value="rating">الأعلى تقييمًا</option><option value="year">الأحدث سنة</option>
+          </select>
         </div>
       </div>
       <div class="grid cinematic-grid" id="moviesGrid"></div>
+      <div class="catalog-more"><button class="btn secondary hidden" id="loadMoreMovies">تحميل المزيد</button></div>
     </section>
 
     <section class="page catalog-page" data-page="series">
@@ -182,9 +187,14 @@
           <div class="chips" id="seriesChips"></div>
           <select class="filter-select" id="seriesCountryFilter" aria-label="فلترة المسلسلات حسب الدولة"><option value="">كل الدول</option></select>
           <select class="filter-select" id="seriesYearFilter" aria-label="فلترة المسلسلات حسب السنة"><option value="">كل السنوات</option></select>
+          <select class="filter-select" id="seriesSort" aria-label="ترتيب المسلسلات">
+            <option value="latest">الأحدث</option><option value="popular">الأكثر مشاهدة</option>
+            <option value="rating">الأعلى تقييمًا</option><option value="year">الأحدث سنة</option>
+          </select>
         </div>
       </div>
       <div class="grid cinematic-grid" id="seriesGrid"></div>
+      <div class="catalog-more"><button class="btn secondary hidden" id="loadMoreSeries">تحميل المزيد</button></div>
     </section>
 
     <section class="page search-page" data-page="search">
@@ -193,6 +203,7 @@
         <div class="catalog-count"><b id="searchCount">0</b><span>نتيجة</span></div>
       </div>
       <div class="grid cinematic-grid search-grid" id="searchResultsGrid"></div>
+      <div class="catalog-more"><button class="btn secondary hidden" id="loadMoreSearch">تحميل نتائج أكثر</button></div>
     </section>
 
     <section class="page" data-page="mylist">
@@ -277,6 +288,7 @@
       <label><span>البريد الإلكتروني</span><input type="email" id="loginEmail" autocomplete="email" required></label>
       <label><span>كلمة المرور</span><input type="password" id="loginPassword" autocomplete="current-password" minlength="8" required></label>
       <button class="btn primary wide" type="submit">دخول</button>
+      <button class="text-btn auth-recovery-link" id="forgotPasswordBtn" type="button">نسيت كلمة المرور؟</button>
     </form>
 
     <form id="registerForm" class="form-stack hidden">
@@ -286,6 +298,19 @@
       <label><span>تأكيد كلمة المرور</span><input type="password" id="registerConfirm" autocomplete="new-password" minlength="8" required></label>
       <button class="btn primary wide" type="submit">إنشاء الحساب</button>
       <p class="fine">باستخدام VAYZEN أنت توافق على شروط الاستخدام وسياسة الخصوصية.</p>
+    </form>
+  </div>
+</div>
+
+<div class="modal" id="recoveryPasswordModal">
+  <div class="sheet compact-sheet">
+    <button class="sheet-close" data-close="recoveryPasswordModal">×</button>
+    <h2>تعيين كلمة مرور جديدة</h2>
+    <p class="muted-note">اكتب كلمة مرور جديدة لحسابك.</p>
+    <form id="recoveryPasswordForm" class="form-stack">
+      <label><span>كلمة المرور الجديدة</span><input type="password" id="recoveryPassword" autocomplete="new-password" minlength="8" required></label>
+      <label><span>تأكيد كلمة المرور</span><input type="password" id="recoveryConfirm" autocomplete="new-password" minlength="8" required></label>
+      <button class="btn primary wide" type="submit">حفظ كلمة المرور</button>
     </form>
   </div>
 </div>
@@ -422,6 +447,7 @@
   </div>
 </div>
 
-<script src="./app.js?v=20260925-01" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js" defer></script>
+<script src="./app.js?v=20261005-02" defer></script>
 </body>
 </html>
