@@ -3834,14 +3834,88 @@ async function callback(q:any){
   return showMenu(chatId);
 }
 
+async function claimOwnerAccess(m:any,text:string){
+  const chatId=Number(m.chat?.id||0);
+  const userId=Number(m.from?.id||0);
+  if(!chatId||!userId)return;
+  if(String(m.chat?.type||"")!=="private"&&chatId!==userId){
+    return send(chatId,"استعادة حساب المالك متاحة فقط في المحادثة الخاصة مع البوت.");
+  }
+
+  const {data:existingOwner}=await db.from("admin_users")
+    .select("telegram_user_id").eq("role","owner").eq("is_active",true).maybeSingle();
+  if(existingOwner?.telegram_user_id){
+    return send(chatId,"تم تعيين مالك VAYZEN بالفعل، وتم إغلاق الاستعادة لمرة واحدة.");
+  }
+
+  const {data:row}=await db.from("app_settings").select("value").eq("key","owner_claim").maybeSingle();
+  const claim:any=row?.value||{};
+  if(claim.enabled!==true||!claim.token_hash){
+    return send(chatId,"استعادة حساب المالك غير مفعلة.");
+  }
+  const expiresAt=Date.parse(String(claim.expires_at||""));
+  if(Number.isFinite(expiresAt)&&Date.now()>expiresAt){
+    return send(chatId,"انتهت صلاحية رمز استعادة المالك.");
+  }
+
+  const code=text.replace(/^\/claim(?:@\w+)?\s*/i,"").trim().toUpperCase();
+  try{await tg("deleteMessage",{chat_id:chatId,message_id:m.message_id});}catch{}
+  if(code.length<8||code.length>64){
+    return send(chatId,"رمز الاستعادة غير صحيح.");
+  }
+  const allowed=await consumeRateLimit(String(userId),"owner_claim",5,60*60);
+  if(!allowed)return send(chatId,"تم تجاوز محاولات الاستعادة المسموحة مؤقتًا.");
+
+  const hash=await sha256Text(code);
+  if(hash!==String(claim.token_hash)){
+    return send(chatId,"رمز الاستعادة غير صحيح.");
+  }
+
+  const displayName=[
+    String(m.from?.first_name||"").trim(),
+    String(m.from?.last_name||"").trim()
+  ].filter(Boolean).join(" ").slice(0,60) || String(m.from?.username||"").slice(0,60) || String(userId);
+
+  const {data:created,error}=await db.from("admin_users").insert({
+    telegram_user_id:userId,
+    display_name:displayName,
+    role:"owner",
+    permissions:{},
+    is_active:true,
+    added_by:null
+  }).select("telegram_user_id,display_name,role,permissions,is_active").single();
+  if(error){
+    const {data:ownerNow}=await db.from("admin_users")
+      .select("telegram_user_id").eq("role","owner").eq("is_active",true).maybeSingle();
+    if(ownerNow?.telegram_user_id)return send(chatId,"تم تعيين مالك VAYZEN بالفعل.");
+    throw error;
+  }
+
+  await db.from("app_settings").upsert({
+    key:"owner_claim",
+    value:{
+      ...claim,
+      enabled:false,
+      token_hash:null,
+      claimed_at:new Date().toISOString(),
+      claimed_by:userId
+    },
+    updated_at:new Date().toISOString()
+  });
+  await clearSession(userId);
+  await adminLog(userId,"owner_claim","admin",undefined,String(userId),{recovered_project:true});
+  return showMenu(chatId,"تم استعادة حساب المالك وربط الإدارة بالمشروع الجديد.",created as Admin);
+}
+
 async function message(m:any){
   const chatId=Number(m.chat?.id||0);
   const userId=Number(m.from?.id||0);
   if(!chatId||!userId) return;
-  const admin=await getAdmin(userId);
-  if(!admin) return send(chatId,"هذا البوت مخصص لإدارة VAYZEN.");
   const text=String(m.text??"").trim();
   const caption=String(m.caption??"").trim();
+  if(/^\/claim(?:@\w+)?(?:\s|$)/i.test(text))return claimOwnerAccess(m,text);
+  const admin=await getAdmin(userId);
+  if(!admin) return send(chatId,"هذا البوت مخصص لإدارة VAYZEN.");
 
   if(text==="/start"||text==="/menu"){
     await clearSession(userId);
@@ -5016,10 +5090,11 @@ Deno.serve(async(req:Request)=>{
     const runtime=(globalThis as any).EdgeRuntime;
     if(runtime?.waitUntil)runtime.waitUntil(maybeOperationalCheck());
     if(req.method==="GET"&&url.searchParams.get("health")==="1"){
+      const bridge=await telegramBridgeConfig();
       return json({
         ok:true,name:"VAYZEN",maxVideoMB:MAX_VIDEO_MB,
-        botConfigured:Boolean(BOT_TOKEN),
-        webhookSecretConfigured:Boolean(BOT_SECRET),
+        botConfigured:Boolean(BOT_TOKEN||(bridge.url&&bridge.secret)),
+        webhookSecretConfigured:Boolean(BOT_SECRET||bridge.botSecret),
         streamGatewayConfigured:Boolean(await streamGateway()),
         streamSigningConfigured:Boolean(await streamSigningSecret()),
       });
