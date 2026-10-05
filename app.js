@@ -1077,6 +1077,72 @@ function sourceForPlayer(o,variant=""){
     return u.toString();
   }catch{return base}
 }
+function playerVariantInfo(o,variant="default"){
+  const rows=Array.isArray(o?.mediaVariants)?o.mediaVariants:[];
+  return rows.find(x=>String(x.variant||"default")===String(variant||"default"))||rows[0]||null;
+}
+function playerDelivery(o,variant="default"){
+  const row=playerVariantInfo(o,variant);
+  if(!row)return "direct";
+  return String(o?.forceXtream?(row.fallback_delivery||row.delivery||"direct"):(row.delivery||"direct"));
+}
+function destroyHls(){
+  if(hlsInstance){
+    try{hlsInstance.destroy()}catch{}
+    hlsInstance=null;
+  }
+  hlsRecoveryCount=0;
+}
+function showPlayerSourceError(message){
+  $("#playerLoader").classList.add("hidden");
+  $("#playerErrorText").textContent=message||"تعذر تشغيل مصدر الفيديو.";
+  $("#playerError").classList.remove("hidden");
+  showPlayerControls(true);
+}
+async function attachPlayerSource(o,src,variant="default"){
+  destroyHls();
+  video.pause();
+  video.removeAttribute("src");
+  const delivery=playerDelivery(o,variant);
+  if(delivery!=="hls"){
+    video.src=src;video.load();return "direct";
+  }
+  const nativeHls=video.canPlayType("application/vnd.apple.mpegurl")||video.canPlayType("application/x-mpegURL");
+  if(nativeHls){
+    video.src=src;video.load();return "native-hls";
+  }
+  const HlsClass=window.Hls;
+  if(HlsClass?.isSupported?.()){
+    const hls=new HlsClass({
+      enableWorker:true,
+      lowLatencyMode:false,
+      backBufferLength:60,
+      maxBufferLength:90,
+      manifestLoadingMaxRetry:4,
+      levelLoadingMaxRetry:4,
+      fragLoadingMaxRetry:5
+    });
+    hlsInstance=hls;
+    hls.on(HlsClass.Events.ERROR,(_event,data)=>{
+      if(!data?.fatal||hlsInstance!==hls)return;
+      if(data.type===HlsClass.ErrorTypes.NETWORK_ERROR&&hlsRecoveryCount<2){
+        hlsRecoveryCount++;try{hls.startLoad()}catch{};return;
+      }
+      if(data.type===HlsClass.ErrorTypes.MEDIA_ERROR&&hlsRecoveryCount<2){
+        hlsRecoveryCount++;try{hls.recoverMediaError()}catch{};return;
+      }
+      destroyHls();
+      showPlayerSourceError("تعذر تشغيل البث المتوافق. أعد المحاولة.");
+    });
+    hls.attachMedia(video);
+    hls.on(HlsClass.Events.MEDIA_ATTACHED,()=>{
+      if(hlsInstance===hls)hls.loadSource(src);
+    });
+    return "hls.js";
+  }
+  video.src=src;video.load();
+  return "fallback";
+}
 async function openPlayer(o,{pushHistory=true}={}){
   clearTimeout(playerRetryTimer);clearInterval(nextCountdownTimer);clearInterval(nextCountdownTick);
   playerRetryCount=0;
@@ -1095,7 +1161,7 @@ async function openPlayer(o,{pushHistory=true}={}){
   await Promise.all([loadPlayerQualities(o),loadPlayerSubtitles(o)]);
   const qv=$("#qualitySelect")?.value||"default";
   o.qualityVariant=qv;o.src=sourceForPlayer(o,qv);
-  video.src=o.src;video.load();
+  await attachPlayerSource(o,o.src,qv);
   if(pushHistory&&history.state?.overlay!=="player")history.pushState({vayzen:true,page:state.currentPage,overlay:"player"},"","#watch");
 
   const p=playerProgress();
@@ -1113,6 +1179,7 @@ async function closePlayer({fromHistory=false}={}){
   $("#nextCountdown")?.classList.add("hidden");
   await saveCurrentProgress();
   video.pause();
+  destroyHls();
   clearPlayerTracks();
   video.removeAttribute("src");video.load();
   playerLayer.classList.remove("open","controls-hidden","idle");
