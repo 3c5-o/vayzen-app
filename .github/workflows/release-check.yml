@@ -68,6 +68,67 @@ jobs:
           print("Static UI integrity: OK")
           PY
 
+      - name: Xtream architecture integrity
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          schema = Path("supabase/schema.sql").read_text(encoding="utf-8")
+          edge = Path("supabase/functions/vayzen-gateway/index.ts").read_text(encoding="utf-8")
+          provider = Path("supabase/functions/vayzen-gateway/xtream.ts").read_text(encoding="utf-8")
+          gateway = Path("gateway/app.py").read_text(encoding="utf-8")
+          web = Path("app.js").read_text(encoding="utf-8")
+          html = Path("index.html").read_text(encoding="utf-8")
+
+          required_schema = [
+              "public.xtream_accounts",
+              "public.content_provider_refs",
+              "public.playback_sources",
+              "public.xtream_sync_runs",
+              "vayzen_identity_key",
+          ]
+          required_edge = [
+              "syncXtreamBatch",
+              "syncXtreamSeriesEpisodes",
+              "xtreamProxyToken",
+              "xtreamStreamSource",
+              "sendXtreamSettings",
+          ]
+          required_provider = [
+              "xtreamRequest",
+              "identityKey",
+              "classifyCountry",
+              "qualityFromName",
+          ]
+          required_gateway = [
+              "/xtream/{token}",
+              "decrypt_xtream_target",
+              "rewrite_hls_playlist",
+              "AESGCM",
+          ]
+          required_web = [
+              "movieCountry",
+              "seriesCountry",
+              "renderCountryFilter",
+              "forceXtream",
+          ]
+          required_html = ["movieCountryFilter", "seriesCountryFilter"]
+
+          groups = [
+              ("schema", schema, required_schema),
+              ("edge", edge, required_edge),
+              ("provider", provider, required_provider),
+              ("gateway", gateway, required_gateway),
+              ("web", web, required_web),
+              ("html", html, required_html),
+          ]
+          for label, content, markers in groups:
+              missing = [m for m in markers if m not in content]
+              if missing:
+                  raise SystemExit(f"{label} Xtream markers missing: {missing}")
+          print("Multi-Xtream architecture integrity: OK")
+          PY
+
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
