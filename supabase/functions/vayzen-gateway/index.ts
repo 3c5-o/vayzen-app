@@ -1339,7 +1339,7 @@ async function publishMovie(userId:number,chatId:number,d:any){
       title:d.title,original_title:d.original_title||"",description:d.description||"",
       release_year:d.release_year,genres:d.genres||[],language:d.language||"",country:d.country||"",
       duration_minutes:d.duration_minutes,quality:bestLabel,status:"draft",
-      external_source:d.external_source||null,external_id:d.external_id||null,external_metadata:d.external_metadata||{},
+      external_source:d.external_source||null,external_id:d.external_id||null,external_metadata:{...(d.external_metadata||{}),tmdb_sync_status:d.external_source==="tmdb"&&d.external_id?"matched":"pending",...(d.external_source==="tmdb"&&d.external_id?{tmdb_enriched_at:new Date().toISOString()}: {})},
       release_date:d.release_date||null,rating:d.rating||null,rating_count:d.rating_count||null,created_by:userId,
     }).select("id,public_id,status").single();
     if(error||!created) throw error??new Error("Movie insert failed");
@@ -1391,7 +1391,7 @@ async function publishSeries(userId:number,chatId:number,d:any){
     title:d.title,original_title:d.original_title||"",description:d.description||"",
     release_year:d.release_year,genres:d.genres||[],language:d.language||"",country:d.country||"",
     quality:d.quality||"",status:"draft",
-    external_source:d.external_source||null,external_id:d.external_id||null,external_metadata:d.external_metadata||{},
+    external_source:d.external_source||null,external_id:d.external_id||null,external_metadata:{...(d.external_metadata||{}),tmdb_sync_status:d.external_source==="tmdb"&&d.external_id?"matched":"pending",...(d.external_source==="tmdb"&&d.external_id?{tmdb_enriched_at:new Date().toISOString()}: {})},
     first_air_date:d.first_air_date||null,rating:d.rating||null,rating_count:d.rating_count||null,created_by:userId,
   }).select("id,public_id").single();
   if(error||!series) throw error??new Error("Series insert failed");
