@@ -661,6 +661,37 @@ alter table public.series
   add column if not exists origin_country_codes text[] not null default '{}',
   add column if not exists original_language_code text;
 
+create or replace function public.vayzen_identity_key(p_type text,p_title text,p_year integer)
+returns text
+language sql
+immutable
+set search_path=public
+as $
+  select p_type || ':' ||
+    btrim(
+      regexp_replace(
+        lower(
+          translate(
+            regexp_replace(coalesce(p_title,''),'[ًٌٍَُِّْـ]','','g'),
+            'أإآةى',
+            'اااهي'
+          )
+        ),
+        '[[:space:][:punct:]]+',
+        ' ',
+        'g'
+      )
+    ) || ':' || coalesce(p_year,0)::text
+$;
+
+update public.movies
+set identity_key=public.vayzen_identity_key('movie',title,release_year)
+where identity_key is null or btrim(identity_key)='';
+
+update public.series
+set identity_key=public.vayzen_identity_key('series',title,release_year)
+where identity_key is null or btrim(identity_key)='';
+
 create index if not exists movies_identity_key_idx
   on public.movies(identity_key)
   where identity_key is not null;
