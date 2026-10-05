@@ -856,12 +856,87 @@ create index if not exists xtream_accounts_enabled_priority_idx
 create index if not exists xtream_sync_runs_recent_idx
   on public.xtream_sync_runs(account_id,started_at desc);
 
+create table if not exists public.metadata_sync_queue (
+  id uuid primary key default gen_random_uuid(),
+  provider text not null default 'tmdb',
+  entity_type text not null check (entity_type in ('movie','series')),
+  entity_id uuid not null,
+  status text not null default 'pending'
+    check (status in ('pending','processing','completed','not_found','failed')),
+  priority integer not null default 50,
+  attempts integer not null default 0 check (attempts >= 0),
+  next_attempt_at timestamptz not null default now(),
+  last_error text,
+  locked_at timestamptz,
+  completed_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique(provider,entity_type,entity_id)
+);
+
+create index if not exists metadata_sync_queue_pick_idx
+  on public.metadata_sync_queue(status,next_attempt_at,priority desc,created_at)
+  where status in ('pending','failed');
+
+create table if not exists public.telegram_announcement_outbox (
+  id uuid primary key default gen_random_uuid(),
+  dedupe_key text not null unique,
+  channel_key text not null,
+  entity_type text not null check (entity_type in ('movie','series','system')),
+  payload jsonb not null default '{}'::jsonb,
+  status text not null default 'pending'
+    check (status in ('pending','processing','sent','failed')),
+  attempts integer not null default 0 check (attempts >= 0),
+  next_attempt_at timestamptz not null default now(),
+  last_error text,
+  locked_at timestamptz,
+  sent_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists telegram_announcement_outbox_pick_idx
+  on public.telegram_announcement_outbox(status,next_attempt_at,created_at)
+  where status in ('pending','failed');
+
+create table if not exists public.xtream_catalog_sync_jobs (
+  id uuid primary key default gen_random_uuid(),
+  account_id uuid not null references public.xtream_accounts(id) on delete cascade,
+  requested_items integer not null check (requested_items in (10,50,100,500,1000)),
+  processed_items integer not null default 0 check (processed_items >= 0),
+  movies_seen integer not null default 0 check (movies_seen >= 0),
+  series_seen integer not null default 0 check (series_seen >= 0),
+  created_items integer not null default 0 check (created_items >= 0),
+  merged_items integer not null default 0 check (merged_items >= 0),
+  source_links_created integer not null default 0 check (source_links_created >= 0),
+  status text not null default 'pending'
+    check (status in ('pending','running','completed','failed','cancelled')),
+  started_by bigint,
+  last_error text,
+  started_at timestamptz,
+  completed_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create unique index if not exists xtream_catalog_sync_jobs_one_active_per_account
+  on public.xtream_catalog_sync_jobs(account_id)
+  where status in ('pending','running');
+
+create index if not exists xtream_catalog_sync_jobs_pick_idx
+  on public.xtream_catalog_sync_jobs(status,created_at)
+  where status in ('pending','running');
+
 alter table public.xtream_accounts enable row level security;
 alter table public.content_provider_refs enable row level security;
 alter table public.playback_sources enable row level security;
 alter table public.xtream_sync_runs enable row level security;
+alter table public.metadata_sync_queue enable row level security;
+alter table public.telegram_announcement_outbox enable row level security;
+alter table public.xtream_catalog_sync_jobs enable row level security;
 
-revoke all on public.xtream_accounts,public.content_provider_refs,public.playback_sources,public.xtream_sync_runs
+revoke all on public.xtream_accounts,public.content_provider_refs,public.playback_sources,public.xtream_sync_runs,
+  public.metadata_sync_queue,public.telegram_announcement_outbox,public.xtream_catalog_sync_jobs
 from anon,authenticated;
 
 drop trigger if exists trg_xtream_accounts_updated_at on public.xtream_accounts;
@@ -879,6 +954,21 @@ create trigger trg_playback_sources_updated_at
 before update on public.playback_sources
 for each row execute function public.touch_updated_at();
 
+drop trigger if exists trg_metadata_sync_queue_updated_at on public.metadata_sync_queue;
+create trigger trg_metadata_sync_queue_updated_at
+before update on public.metadata_sync_queue
+for each row execute function public.touch_updated_at();
+
+drop trigger if exists trg_telegram_announcement_outbox_updated_at on public.telegram_announcement_outbox;
+create trigger trg_telegram_announcement_outbox_updated_at
+before update on public.telegram_announcement_outbox
+for each row execute function public.touch_updated_at();
+
+drop trigger if exists trg_xtream_catalog_sync_jobs_updated_at on public.xtream_catalog_sync_jobs;
+create trigger trg_xtream_catalog_sync_jobs_updated_at
+before update on public.xtream_catalog_sync_jobs
+for each row execute function public.touch_updated_at();
+
 insert into public.app_settings(key,value)
 values('xtream',jsonb_build_object(
   'enabled',false,
@@ -888,8 +978,19 @@ values('xtream',jsonb_build_object(
   'source_failover',true,
   'sync_live',false,
   'series_details_on_demand',true,
-  'auto_publish',false,
-  'sync_batch_size',120
+  'auto_publish',true,
+  'sync_batch_size',100
+))
+on conflict (key) do nothing;
+
+insert into public.app_settings(key,value)
+values('content_sync_pipeline',jsonb_build_object(
+  'version',1,
+  'tmdb_auto_enrich',true,
+  'tmdb_worker_batch',20,
+  'announcement_worker_batch',2,
+  'announcement_list_chunk',35,
+  'xtream_batch_choices',jsonb_build_array(10,50,100,500,1000)
 ))
 on conflict (key) do nothing;
 
