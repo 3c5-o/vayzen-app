@@ -120,7 +120,7 @@ async function xtreamSettingsValue(){
     auto_publish:Boolean((data as any)?.value?.auto_publish),
     sync_movies:(data as any)?.value?.sync_movies!==false,
     sync_series:(data as any)?.value?.sync_series!==false,
-    sync_batch_size:Math.max(20,Math.min(200,Number((data as any)?.value?.sync_batch_size||XTREAM_SYNC_BATCH_DEFAULT))),
+    sync_batch_size:Math.max(10,Math.min(1000,Number((data as any)?.value?.sync_batch_size||XTREAM_SYNC_BATCH_DEFAULT))),
     source_failover:(data as any)?.value?.source_failover!==false,
   };
 }
@@ -232,7 +232,7 @@ async function canonicalMap(table:"movies"|"series",keys:string[]){
   for(let i=0;i<unique.length;i+=80){
     const part=unique.slice(i,i+80);
     const {data,error}=await db.from(table)
-      .select("id,identity_key,title,release_year,status,external_source,external_id")
+      .select("id,public_id,identity_key,title,release_year,status,external_source,external_id")
       .in("identity_key",part);
     if(error)throw error;
     for(const row of data??[])if(row.identity_key&&!map.has(row.identity_key))map.set(row.identity_key,row);
@@ -274,7 +274,7 @@ async function createCanonicalRows(
       }
       return base;
     });
-    const {data,error}=await db.from(table).insert(rows).select("id,identity_key,title,release_year,status");
+    const {data,error}=await db.from(table).insert(rows).select("id,public_id,identity_key,title,release_year,status");
     if(error)throw error;
     for(const row of data??[])if(row.identity_key)existing.set(row.identity_key,row);
   }
@@ -398,10 +398,343 @@ async function syncXtreamRefsAndSources(args:{
     }
   }
 
-  return {processed:prepared.length,createdItems,mergedItems,sourceLinks};
+  const entities=[...canonical.values()].map((x:any)=>({
+    id:String(x.id||""),
+    public_id:String(x.public_id||""),
+    title:String(x.title||""),
+    release_year:Number(x.release_year||0)||null,
+    external_source:String(x.external_source||""),
+    external_id:x.external_id??null,
+  })).filter((x:any)=>x.id);
+  const createdEntities=entities.filter((x:any)=>{
+    const key=[...canonical.entries()].find(([,v]:any)=>String(v.id)===String(x.id))?.[0];
+    return key?createdKeys.has(String(key)):false;
+  });
+  return {processed:prepared.length,createdItems,mergedItems,sourceLinks,entities,createdEntities};
 }
 
-async function syncXtreamBatch(accountId:string,startedBy:number){
+
+async function pipelineSettingsValue(){
+  const {data}=await db.from("app_settings").select("value").eq("key","content_sync_pipeline").maybeSingle();
+  const v:any=(data as any)?.value||{};
+  return {
+    tmdb_auto_enrich:v.tmdb_auto_enrich!==false,
+    tmdb_worker_batch:Math.max(1,Math.min(20,Number(v.tmdb_worker_batch||12))),
+    announcement_worker_batch:Math.max(1,Math.min(5,Number(v.announcement_worker_batch||2))),
+    announcement_list_chunk:Math.max(10,Math.min(35,Number(v.announcement_list_chunk||35))),
+    xtream_batch_choices:Array.isArray(v.xtream_batch_choices)?v.xtream_batch_choices:[10,50,100,500,1000],
+  };
+}
+
+async function queueTmdbEntities(entityType:"movie"|"series",entities:any[]){
+  if(!entities.length)return 0;
+  const rows=entities.filter((x:any)=>x?.id).map((x:any)=>({
+    provider:"tmdb",
+    entity_type:entityType,
+    entity_id:String(x.id),
+    status:"pending",
+    priority:60,
+    next_attempt_at:new Date().toISOString(),
+    updated_at:new Date().toISOString(),
+  }));
+  if(!rows.length)return 0;
+  const {error}=await db.from("metadata_sync_queue").upsert(rows,{
+    onConflict:"provider,entity_type,entity_id",
+    ignoreDuplicates:true
+  });
+  if(error)throw error;
+  return rows.length;
+}
+
+async function queueXtreamAnnouncementChunks(runId:string,accountName:string,entityType:"movie"|"series",entities:any[]){
+  if(!entities.length)return 0;
+  const settings=await pipelineSettingsValue();
+  const chunkSize=settings.announcement_list_chunk;
+  const channelKey=entityType==="movie"?"movies_info":"series_info";
+  let queued=0;
+  for(let i=0;i<entities.length;i+=chunkSize){
+    const part=entities.slice(i,i+chunkSize).map((x:any)=>({
+      public_id:String(x.public_id||""),
+      title:String(x.title||"").slice(0,120),
+      release_year:Number(x.release_year||0)||null,
+    }));
+    const index=Math.floor(i/chunkSize)+1;
+    const totalParts=Math.ceil(entities.length/chunkSize);
+    const {error}=await db.from("telegram_announcement_outbox").upsert({
+      dedupe_key:"xtream:"+runId+":"+entityType+":"+index,
+      channel_key:channelKey,
+      entity_type:entityType,
+      payload:{
+        source:"xtream",
+        account_name:String(accountName||"Xtream").slice(0,80),
+        total:entities.length,
+        part:index,
+        parts:totalParts,
+        items:part
+      },
+      status:"pending",
+      attempts:0,
+      next_attempt_at:new Date().toISOString(),
+      updated_at:new Date().toISOString()
+    },{onConflict:"dedupe_key",ignoreDuplicates:true});
+    if(error)throw error;
+    queued++;
+  }
+  return queued;
+}
+
+async function enqueuePendingTmdbBacklog(limit=5000){
+  const max=Math.max(1,Math.min(10000,Number(limit||5000)));
+  let queued=0;
+  for(const entityType of ["movie","series"] as const){
+    const table=entityType==="movie"?"movies":"series";
+    const {data,error}=await db.from(table)
+      .select("id")
+      .eq("status","published")
+      .contains("external_metadata",{tmdb_sync_status:"pending"})
+      .limit(max);
+    if(error)throw error;
+    queued+=await queueTmdbEntities(entityType,(data??[]).map((x:any)=>({id:x.id})));
+  }
+  return queued;
+}
+
+async function queueXtreamCatalogJob(accountId:string,requestedItems:number,startedBy:number){
+  const allowed=[10,50,100,500,1000];
+  if(!allowed.includes(requestedItems))throw new Error("حجم الدفعة غير مدعوم.");
+  const {data:active}=await db.from("xtream_catalog_sync_jobs")
+    .select("id,status,requested_items,processed_items,movies_seen,series_seen,created_items,created_at")
+    .eq("account_id",accountId).in("status",["pending","running"])
+    .order("created_at",{ascending:true}).limit(1).maybeSingle();
+  if(active)return {job:active,existing:true};
+  const {data,error}=await db.from("xtream_catalog_sync_jobs").insert({
+    account_id:accountId,requested_items:requestedItems,status:"pending",started_by:startedBy
+  }).select("id,status,requested_items,processed_items,movies_seen,series_seen,created_items,created_at").single();
+  if(error||!data)throw error??new Error("تعذر إنشاء مهمة المزامنة.");
+  return {job:data,existing:false};
+}
+
+async function latestXtreamCatalogJob(accountId:string){
+  const {data,error}=await db.from("xtream_catalog_sync_jobs")
+    .select("id,status,requested_items,processed_items,movies_seen,series_seen,created_items,merged_items,source_links_created,last_error,created_at,started_at,completed_at")
+    .eq("account_id",accountId).order("created_at",{ascending:false}).limit(1).maybeSingle();
+  if(error)throw error;
+  return data??null;
+}
+
+async function processXtreamCatalogJob(){
+  const {data:job,error}=await db.from("xtream_catalog_sync_jobs")
+    .select("id,account_id,requested_items,processed_items,movies_seen,series_seen,created_items,merged_items,source_links_created,status,started_by")
+    .in("status",["pending","running"]).order("created_at",{ascending:true}).limit(1).maybeSingle();
+  if(error)throw error;
+  if(!job)return {worked:false};
+
+  const now=new Date().toISOString();
+  if(job.status==="pending"){
+    const {error:startError}=await db.from("xtream_catalog_sync_jobs").update({
+      status:"running",started_at:now,updated_at:now
+    }).eq("id",job.id);
+    if(startError)throw startError;
+  }
+
+  const remaining=Math.max(0,Number(job.requested_items||0)-Number(job.processed_items||0));
+  if(!remaining){
+    await db.from("xtream_catalog_sync_jobs").update({status:"completed",completed_at:now,updated_at:now}).eq("id",job.id);
+    return {worked:true,completed:true,job_id:job.id};
+  }
+
+  const internalChunk=Math.min(200,remaining);
+  try{
+    const result:any=await syncXtreamBatch(String(job.account_id),Number(job.started_by||0),internalChunk);
+    const processed=Number(result.movies_seen||0)+Number(result.series_seen||0);
+    const totals={
+      processed_items:Number(job.processed_items||0)+processed,
+      movies_seen:Number(job.movies_seen||0)+Number(result.movies_seen||0),
+      series_seen:Number(job.series_seen||0)+Number(result.series_seen||0),
+      created_items:Number(job.created_items||0)+Number(result.created_items||0),
+      merged_items:Number(job.merged_items||0)+Number(result.merged_items||0),
+      source_links_created:Number(job.source_links_created||0)+Number(result.source_links_created||0),
+    };
+    const cycleComplete=Boolean(result?.details?.cycle_complete);
+    const complete=cycleComplete||totals.processed_items>=Number(job.requested_items||0)||processed===0;
+    const update:any={...totals,status:complete?"completed":"running",updated_at:new Date().toISOString(),last_error:null};
+    if(complete)update.completed_at=new Date().toISOString();
+    const {error:updateError}=await db.from("xtream_catalog_sync_jobs").update(update).eq("id",job.id);
+    if(updateError)throw updateError;
+    if(complete&&Number(job.started_by||0)>0){
+      try{
+        await send(Number(job.started_by),
+          "اكتملت مزامنة Xtream.\n"+
+          "المطلوب: "+Number(job.requested_items||0).toLocaleString("ar-IQ")+"\n"+
+          "تمت المعالجة: "+totals.processed_items.toLocaleString("ar-IQ")+"\n"+
+          "أفلام: "+totals.movies_seen.toLocaleString("ar-IQ")+"\n"+
+          "مسلسلات: "+totals.series_seen.toLocaleString("ar-IQ")+"\n"+
+          "محتوى جديد: "+totals.created_items.toLocaleString("ar-IQ")+"\n\n"+
+          "مزامنة TMDb والإعلانات تستمر تلقائيًا بالخلفية.",
+          {inline_keyboard:[[{text:"حالة Xtream",callback_data:"xtream_settings"},{text:"TMDb",callback_data:"tmdb_settings"}]]}
+        );
+      }catch{}
+    }
+    return {worked:true,completed:complete,job_id:job.id,processed};
+  }catch(error){
+    const message=adminErrorText(error);
+    await db.from("xtream_catalog_sync_jobs").update({
+      status:"failed",last_error:message,completed_at:new Date().toISOString(),updated_at:new Date().toISOString()
+    }).eq("id",job.id);
+    if(Number(job.started_by||0)>0){
+      try{await send(Number(job.started_by),"فشلت مهمة مزامنة Xtream.\n"+message,{inline_keyboard:[[{text:"Xtream",callback_data:"xtream_settings"}]]});}catch{}
+    }
+    return {worked:true,failed:true,job_id:job.id,error:message};
+  }
+}
+
+function queueBackoffSeconds(attempts:number){
+  return Math.min(3600,Math.max(20,20*Math.pow(2,Math.min(6,attempts))));
+}
+
+async function processMetadataSyncQueue(limitOverride?:number){
+  const status=await tmdbStatus();
+  if(!status.configured)return {worked:false,configured:false,processed:0};
+  const settings=await pipelineSettingsValue();
+  const limit=Math.max(1,Math.min(20,Number(limitOverride||settings.tmdb_worker_batch)));
+  const now=new Date().toISOString();
+  const {data:items,error}=await db.from("metadata_sync_queue")
+    .select("id,entity_type,entity_id,attempts")
+    .in("status",["pending","failed"])
+    .lte("next_attempt_at",now)
+    .order("priority",{ascending:false})
+    .order("created_at",{ascending:true})
+    .limit(limit);
+  if(error)throw error;
+  let processed=0,matched=0,notFound=0,failed=0;
+  for(const item of items??[]){
+    const lockAt=new Date().toISOString();
+    const {error:lockError}=await db.from("metadata_sync_queue").update({
+      status:"processing",locked_at:lockAt,updated_at:lockAt
+    }).eq("id",item.id).in("status",["pending","failed"]);
+    if(lockError){failed++;continue;}
+    try{
+      const type=String(item.entity_type)==="series"?"series":"movie";
+      const table=type==="movie"?"movies":"series";
+      const fields=type==="movie"
+        ?"id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,duration_minutes,rating,rating_count,external_source,external_id,external_metadata,release_date,status"
+        :"id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,rating,rating_count,external_source,external_id,external_metadata,first_air_date,status";
+      const {data:row,error:rowError}=await db.from(table).select(fields).eq("id",item.entity_id).maybeSingle();
+      if(rowError)throw rowError;
+      if(!row||row.status!=="published"){
+        await db.from("metadata_sync_queue").update({
+          status:"completed",completed_at:new Date().toISOString(),updated_at:new Date().toISOString(),last_error:null
+        }).eq("id",item.id);
+        processed++;
+        continue;
+      }
+      const match=await tmdbAutoMatch(type,row);
+      if(!match){
+        await tmdbMarkUnmatched(type,row);
+        await db.from("metadata_sync_queue").update({
+          status:"not_found",completed_at:new Date().toISOString(),updated_at:new Date().toISOString(),last_error:null
+        }).eq("id",item.id);
+        notFound++;processed++;
+        continue;
+      }
+      await tmdbEnrichRow(type,row,match.id,match.score);
+      if(type==="series"){
+        try{await syncTmdbSeriesEpisodeMetadata(String(row.id));}catch{}
+      }
+      await db.from("metadata_sync_queue").update({
+        status:"completed",completed_at:new Date().toISOString(),updated_at:new Date().toISOString(),last_error:null
+      }).eq("id",item.id);
+      matched++;processed++;
+    }catch(error){
+      const attempts=Number(item.attempts||0)+1;
+      const delay=queueBackoffSeconds(attempts);
+      const next=new Date(Date.now()+delay*1000).toISOString();
+      const message=adminErrorText(error).slice(0,1000);
+      await db.from("metadata_sync_queue").update({
+        status:"failed",attempts,next_attempt_at:next,last_error:message,locked_at:null,updated_at:new Date().toISOString()
+      }).eq("id",item.id);
+      failed++;processed++;
+    }
+  }
+  return {worked:Boolean((items??[]).length),configured:true,processed,matched,not_found:notFound,failed};
+}
+
+function announcementText(row:any){
+  const payload:any=row?.payload||{};
+  const items=Array.isArray(payload.items)?payload.items:[];
+  const type=row.entity_type==="movie"?"أفلام":"مسلسلات";
+  const icon=row.entity_type==="movie"?"🎬":"📺";
+  const header=[
+    icon+" محتوى "+type+" جديد في VAYZEN",
+    "المصدر: "+String(payload.account_name||"Xtream"),
+    "الإجمالي الجديد في هذه الدفعة: "+Number(payload.total||items.length).toLocaleString("ar-IQ"),
+    Number(payload.parts||1)>1?"القائمة "+Number(payload.part||1)+" / "+Number(payload.parts||1):"",
+    ""
+  ].filter(Boolean);
+  const lines=items.map((x:any,i:number)=>{
+    const year=x.release_year?" ("+x.release_year+")":"";
+    const pid=x.public_id?" • "+x.public_id:"";
+    return (i+1)+". "+String(x.title||"بدون اسم").slice(0,90)+year+pid;
+  });
+  return [...header,...lines].join("\n").slice(0,4000);
+}
+
+async function processAnnouncementOutbox(limitOverride?:number){
+  const settings=await pipelineSettingsValue();
+  const limit=Math.max(1,Math.min(5,Number(limitOverride||settings.announcement_worker_batch)));
+  const now=new Date().toISOString();
+  const {data:rows,error}=await db.from("telegram_announcement_outbox")
+    .select("id,channel_key,entity_type,payload,attempts")
+    .in("status",["pending","failed"]).lte("next_attempt_at",now)
+    .order("created_at",{ascending:true}).limit(limit);
+  if(error)throw error;
+  let sent=0,failed=0;
+  for(const row of rows??[]){
+    await db.from("telegram_announcement_outbox").update({
+      status:"processing",locked_at:new Date().toISOString(),updated_at:new Date().toISOString()
+    }).eq("id",row.id);
+    try{
+      const ch=await channel(String(row.channel_key));
+      await tg("sendMessage",{chat_id:ch.telegram_channel_id,text:announcementText(row),disable_web_page_preview:true});
+      await db.from("telegram_announcement_outbox").update({
+        status:"sent",sent_at:new Date().toISOString(),updated_at:new Date().toISOString(),last_error:null
+      }).eq("id",row.id);
+      sent++;
+    }catch(error){
+      const attempts=Number(row.attempts||0)+1;
+      const message=adminErrorText(error).slice(0,1000);
+      const retryMatch=message.match(/retry after\s+(\d+)/i);
+      const delay=retryMatch?Math.max(10,Number(retryMatch[1])):queueBackoffSeconds(attempts);
+      await db.from("telegram_announcement_outbox").update({
+        status:"failed",attempts,last_error:message,
+        next_attempt_at:new Date(Date.now()+delay*1000).toISOString(),
+        locked_at:null,updated_at:new Date().toISOString()
+      }).eq("id",row.id);
+      failed++;
+    }
+  }
+  return {worked:Boolean((rows??[]).length),sent,failed};
+}
+
+async function internalWorkerAuthorized(req:Request){
+  const cfg=await telegramBridgeConfig();
+  const expected=String(cfg.secret||"");
+  const supplied=String(req.headers.get("x-vayzen-edge-secret")||"");
+  if(!expected||!supplied)return false;
+  const [a,b]=await Promise.all([sha256Text(expected),sha256Text(supplied)]);
+  return a===b;
+}
+
+async function pipelineWorkerTick(req:Request){
+  if(!(await internalWorkerAuthorized(req)))return json({error:"unauthorized"},401);
+  await enqueuePendingTmdbBacklog(1000).catch(()=>0);
+  const xtream=await processXtreamCatalogJob();
+  const tmdb=await processMetadataSyncQueue(xtream?.worked?6:undefined);
+  const announcements=await processAnnouncementOutbox();
+  return json({ok:true,xtream,tmdb,announcements});
+}
+
+async function syncXtreamBatch(accountId:string,startedBy:number,batchOverride?:number){
   const account=await xtreamAccountWithSecret(accountId);
   if(!account.is_enabled)throw new Error("حساب Xtream متوقف.");
   const credentials=await xtreamCredentials(account);
@@ -418,7 +751,9 @@ async function syncXtreamBatch(accountId:string,startedBy:number){
     const cursorRaw=(account.metadata as any)?.sync_cursor||{};
     let movieCursor=Math.max(0,Number(cursorRaw.movie||0));
     let seriesCursor=Math.max(0,Number(cursorRaw.series||0));
-    const batch=settings.sync_batch_size;
+    const allowed=[10,50,100,200,500,1000];
+    const requested=Number(batchOverride||settings.sync_batch_size);
+    const batch=allowed.includes(requested)?requested:Math.max(10,Math.min(1000,requested||settings.sync_batch_size));
 
     const movieEnabled=account.sync_movies!==false&&settings.sync_movies;
     const seriesEnabled=account.sync_series!==false&&settings.sync_series;
@@ -459,6 +794,18 @@ async function syncXtreamBatch(accountId:string,startedBy:number){
     }).eq("id",account.id);
     if(updateAccountError)throw updateAccountError;
 
+    const pipelineSettings=await pipelineSettingsValue();
+    if(pipelineSettings.tmdb_auto_enrich){
+      await Promise.all([
+        queueTmdbEntities("movie",movieResult.entities||[]),
+        queueTmdbEntities("series",seriesResult.entities||[])
+      ]);
+    }
+    await Promise.all([
+      queueXtreamAnnouncementChunks(runId,String(account.name||"Xtream"),"movie",movieResult.createdEntities||[]),
+      queueXtreamAnnouncementChunks(runId,String(account.name||"Xtream"),"series",seriesResult.createdEntities||[])
+    ]);
+
     const summary={
       movies_seen:movieResult.processed,series_seen:seriesResult.processed,
       created_items:movieResult.createdItems+seriesResult.createdItems,
@@ -467,7 +814,11 @@ async function syncXtreamBatch(accountId:string,startedBy:number){
       details:{
         cycle_complete:cycleComplete,next_cursor:nextCursor,
         total_movies:snapshot.movies.length,total_series:snapshot.series.length,
-        auto_publish:settings.auto_publish
+        auto_publish:settings.auto_publish,
+        run_id:runId,
+        batch_size:batch,
+        tmdb_queued:(movieResult.entities||[]).length+(seriesResult.entities||[]).length,
+        announcements_queued:(movieResult.createdEntities||[]).length+(seriesResult.createdEntities||[]).length
       }
     };
     await db.from("xtream_sync_runs").update({
