@@ -3118,22 +3118,186 @@ async function sendTrashManager(chatId:number,admin:Admin){
   return send(chatId,`سلة المحذوفات\nالاحتفاظ: 14 يومًا\n\n${lines||"السلة فارغة."}`,{inline_keyboard:rows});
 }
 
+async function jobStatusCounts(table:string,statuses:string[]){
+  const out:Record<string,number>={};
+  for(const status of statuses){
+    const {count,error}=await db.from(table).select("id",{head:true,count:"exact"}).eq("status",status);
+    if(error)throw error;
+    out[status]=Number(count||0);
+  }
+  return out;
+}
+
 async function sendJobCenter(chatId:number){
-  const {data,error}=await db.from("media_transfer_jobs")
-    .select("id,status,entity_type,entity_public_id,kind,variant,file_size,attempts,max_attempts,last_error,updated_at")
-    .order("updated_at",{ascending:false}).limit(20);
-  if(error)throw error;
-  const jobs:any[]=data??[];
-  const counts=jobs.reduce((m:any,j:any)=>(m[j.status]=(m[j.status]||0)+1,m),{});
-  const rows:any[]=jobs.slice(0,10).map((j:any)=>[{text:
-    `${j.status==="completed"?"✓":j.status==="failed"?"!":j.status==="processing"?"…":"○"} ${j.entity_public_id||j.kind||"Job"} • ${sizeLabel(j.file_size)}`,
-    callback_data:`job|${j.id}`
-  }]);
-  rows.push([{text:"تحديث",callback_data:"jobs"},{text:"رجوع",callback_data:"menu"}]);
+  const [transfer,seriesJobs,probeJobs,tmdbJobs]=await Promise.all([
+    jobStatusCounts("media_transfer_jobs",["pending","processing","completed","failed","rolled_back"]),
+    jobStatusCounts("series_ingest_jobs",["queued","running","partial","completed","failed"]),
+    jobStatusCounts("media_probe_jobs",["queued","probing","completed","failed","permanent_failed"]),
+    jobStatusCounts("metadata_sync_queue",["pending","processing","completed","not_found","failed","manual_review","permanent_failed"])
+  ]);
   return send(chatId,
-    `مركز عمليات الوسائط\n\nمكتمل: ${counts.completed||0}\nقيد التنفيذ: ${counts.processing||0}\nبانتظار: ${counts.pending||0}\nفشل: ${counts.failed||0}\n\nآخر العمليات:`,
+    "مركز العمليات\n\n"+
+    "رفع Telegram\n"+
+    "• انتظار: "+transfer.pending+" • تنفيذ: "+transfer.processing+" • فشل: "+(transfer.failed+transfer.rolled_back)+"\n\n"+
+    "تجهيز المسلسلات\n"+
+    "• انتظار: "+seriesJobs.queued+" • تنفيذ: "+seriesJobs.running+" • جزئي: "+seriesJobs.partial+" • مكتمل: "+seriesJobs.completed+" • فشل: "+seriesJobs.failed+"\n\n"+
+    "فحص الصوت وCodec\n"+
+    "• انتظار: "+probeJobs.queued+" • فحص: "+probeJobs.probing+" • مكتمل: "+probeJobs.completed+" • فشل: "+(probeJobs.failed+probeJobs.permanent_failed)+"\n\n"+
+    "TMDb\n"+
+    "• انتظار: "+tmdbJobs.pending+" • تنفيذ: "+tmdbJobs.processing+" • مكتمل: "+tmdbJobs.completed+" • مراجعة: "+(tmdbJobs.manual_review+tmdbJobs.permanent_failed),
+    {inline_keyboard:[
+      [{text:"رفع Telegram",callback_data:"jobs_transfer"},{text:"المسلسلات",callback_data:"jobs_series"}],
+      [{text:"الصوت وCodec",callback_data:"jobs_probe"},{text:"TMDb",callback_data:"jobs_tmdb"}],
+      [{text:"تحديث",callback_data:"jobs"},{text:"رجوع",callback_data:"menu"}]
+    ]}
+  );
+}
+
+async function sendTransferJobs(chatId:number){
+  const {data,error}=await db.from("media_transfer_jobs")
+    .select("id,status,entity_public_id,kind,file_size,updated_at")
+    .order("updated_at",{ascending:false}).limit(12);
+  if(error)throw error;
+  const rows:any[]=(data??[]).map((j:any)=>[{
+    text:(j.status==="completed"?"✓ ":j.status==="failed"?"! ":j.status==="processing"?"… ":"○ ")+(j.entity_public_id||j.kind||"Job")+" • "+sizeLabel(j.file_size),
+    callback_data:"job|"+j.id
+  }]);
+  rows.push([{text:"رجوع للعمليات",callback_data:"jobs"}]);
+  return send(chatId,"آخر عمليات رفع Telegram",{inline_keyboard:rows});
+}
+
+async function sendSeriesJobs(chatId:number){
+  const {data,error}=await db.from("series_ingest_jobs")
+    .select("id,series_id,status,attempts,max_attempts,cursor_index,expected_episodes,playable_episodes,last_error,updated_at")
+    .neq("status","completed").order("updated_at",{ascending:false}).limit(12);
+  if(error)throw error;
+  const rows:any[]=[];
+  const lines:string[]=[];
+  for(const j of data??[]){
+    const {data:s}=await db.from("series").select("public_id,title").eq("id",j.series_id).maybeSingle();
+    const done=Number(j.playable_episodes||0),total=Number(j.expected_episodes||0);
+    lines.push("• "+String(s?.public_id||"—")+" • "+String(s?.title||"مسلسل").slice(0,50)+" • "+j.status+" • "+done+"/"+(total||"؟"));
+    rows.push([{text:(s?.public_id||"مسلسل")+" • "+j.status,callback_data:"sjob|"+j.id}]);
+  }
+  rows.push([{text:"تحديث",callback_data:"jobs_series"},{text:"رجوع",callback_data:"jobs"}]);
+  return send(chatId,"Jobs المسلسلات\n\n"+(lines.join("\n")||"لا توجد عمليات معلقة."),{inline_keyboard:rows});
+}
+
+async function sendSeriesJobItem(chatId:number,id:string){
+  const {data:j,error}=await db.from("series_ingest_jobs").select("*").eq("id",id).maybeSingle();
+  if(error)throw error;
+  if(!j)return sendSeriesJobs(chatId);
+  const {data:s}=await db.from("series").select("public_id,title,ingestion_status").eq("id",j.series_id).maybeSingle();
+  const rows:any[]=[];
+  if(["partial","failed"].includes(j.status)||Number(j.failed_episodes||0)>0){
+    rows.push([{text:"إعادة من البداية",callback_data:"sjob_retry|"+j.id}]);
+  }
+  rows.push([{text:"رجوع لمسلسلات Jobs",callback_data:"jobs_series"}]);
+  return send(chatId,
+    "Job مسلسل\n\n"+
+    "المحتوى: "+String(s?.public_id||"—")+" • "+String(s?.title||"—")+"\n"+
+    "حالة المسلسل: "+String(s?.ingestion_status||"—")+"\n"+
+    "حالة Job: "+j.status+"\n"+
+    "التقدم: "+Number(j.playable_episodes||0)+"/"+(Number(j.expected_episodes||0)||"؟")+"\n"+
+    "Cursor: "+Number(j.cursor_index||0)+"\n"+
+    "المحاولات: "+Number(j.attempts||0)+"/"+Number(j.max_attempts||0)+"\n"+
+    "آخر خطأ: "+(j.last_error?String(j.last_error).slice(0,300):"—"),
     {inline_keyboard:rows}
   );
+}
+
+async function retrySeriesIngestJob(id:string){
+  const {data:j,error}=await db.from("series_ingest_jobs").select("id,series_id").eq("id",id).maybeSingle();
+  if(error||!j)throw error??new Error("Job غير موجود");
+  const now=new Date().toISOString();
+  const {error:updateError}=await db.from("series_ingest_jobs").update({
+    status:"queued",attempts:0,error_attempts:0,cursor_index:0,
+    next_attempt_at:now,completed_at:null,last_error:null,last_error_detail:{},updated_at:now
+  }).eq("id",id);
+  if(updateError)throw updateError;
+  await db.from("series").update({ingestion_status:"queued",last_ingestion_error:{},updated_at:now}).eq("id",j.series_id);
+}
+
+async function sendProbeJobs(chatId:number){
+  const {data,error}=await db.from("media_probe_jobs")
+    .select("id,playback_source_id,status,attempts,max_attempts,last_error,updated_at")
+    .neq("status","completed").order("updated_at",{ascending:false}).limit(12);
+  if(error)throw error;
+  const rows:any[]=[];
+  const lines:string[]=[];
+  for(const j of data??[]){
+    const {data:s}=await db.from("playback_sources")
+      .select("entity_type,entity_id,container_extension,video_codec,audio_codec,compatibility_mode,probe_status")
+      .eq("id",j.playback_source_id).maybeSingle();
+    lines.push("• "+String(s?.entity_type||"media")+" • "+String(s?.container_extension||"—").toUpperCase()+" • "+j.status+" • "+String(s?.audio_codec||"غير مفحوص"));
+    rows.push([{text:String(s?.entity_type||"Media")+" • "+j.status,callback_data:"pjob|"+j.id}]);
+  }
+  rows.push([{text:"تحديث",callback_data:"jobs_probe"},{text:"رجوع",callback_data:"jobs"}]);
+  return send(chatId,"Jobs الصوت وCodec\n\n"+(lines.join("\n")||"لا توجد عمليات معلقة."),{inline_keyboard:rows});
+}
+
+async function sendProbeJobItem(chatId:number,id:string){
+  const {data:j,error}=await db.from("media_probe_jobs").select("*").eq("id",id).maybeSingle();
+  if(error)throw error;
+  if(!j)return sendProbeJobs(chatId);
+  const {data:s}=await db.from("playback_sources")
+    .select("entity_type,container_extension,video_codec,audio_codec,audio_channels,probe_status,compatibility_mode")
+    .eq("id",j.playback_source_id).maybeSingle();
+  const rows:any[]=[];
+  if(["failed","permanent_failed"].includes(j.status))rows.push([{text:"إعادة الفحص",callback_data:"pjob_retry|"+j.id}]);
+  rows.push([{text:"رجوع لفحص Codec",callback_data:"jobs_probe"}]);
+  return send(chatId,
+    "فحص مصدر وسائط\n\n"+
+    "الحالة: "+j.status+"\n"+
+    "النوع: "+String(s?.entity_type||"—")+"\n"+
+    "الحاوية: "+String(s?.container_extension||"—").toUpperCase()+"\n"+
+    "Video: "+String(s?.video_codec||"—")+"\n"+
+    "Audio: "+String(s?.audio_codec||"—")+" • "+String(s?.audio_channels||"—")+"ch\n"+
+    "المعالجة: "+String(s?.compatibility_mode||"—")+"\n"+
+    "المحاولات: "+Number(j.attempts||0)+"/"+Number(j.max_attempts||0)+"\n"+
+    "آخر خطأ: "+(j.last_error?String(j.last_error).slice(0,300):"—"),
+    {inline_keyboard:rows}
+  );
+}
+
+async function retryProbeJob(id:string){
+  const {data:j,error}=await db.from("media_probe_jobs").select("id,playback_source_id").eq("id",id).maybeSingle();
+  if(error||!j)throw error??new Error("Probe Job غير موجود");
+  const now=new Date().toISOString();
+  await db.from("media_probe_jobs").update({
+    status:"queued",attempts:0,next_attempt_at:now,completed_at:null,
+    last_error:null,last_error_detail:{},updated_at:now
+  }).eq("id",id);
+  await db.from("playback_sources").update({probe_status:"queued",updated_at:now}).eq("id",j.playback_source_id);
+}
+
+async function sendTmdbJobs(chatId:number){
+  const counts=await jobStatusCounts("metadata_sync_queue",["pending","processing","completed","not_found","failed","manual_review","permanent_failed"]);
+  const {data,error}=await db.from("metadata_sync_queue")
+    .select("id,entity_type,entity_id,status,attempts,max_attempts,last_error,updated_at")
+    .in("status",["failed","manual_review","permanent_failed"])
+    .order("updated_at",{ascending:false}).limit(8);
+  if(error)throw error;
+  const lines=(data??[]).map((j:any)=>"• "+j.entity_type+" • "+j.status+" • "+j.attempts+"/"+j.max_attempts+" • "+(j.last_error?String(j.last_error).slice(0,100):"—"));
+  return send(chatId,
+    "TMDb Jobs\n\n"+
+    "انتظار: "+counts.pending+" • تنفيذ: "+counts.processing+" • مكتمل: "+counts.completed+"\n"+
+    "غير موجود: "+counts.not_found+" • فشل مؤقت: "+counts.failed+" • مراجعة: "+(counts.manual_review+counts.permanent_failed)+"\n\n"+
+    (lines.join("\n")||"لا توجد أخطاء تحتاج مراجعة."),
+    {inline_keyboard:[
+      [{text:"إعادة أخطاء TMDb",callback_data:"jobs_tmdb_retry"}],
+      [{text:"تحديث",callback_data:"jobs_tmdb"},{text:"رجوع",callback_data:"jobs"}]
+    ]}
+  );
+}
+
+async function retryTmdbFailures(){
+  const now=new Date().toISOString();
+  const {error}=await db.from("metadata_sync_queue").update({
+    status:"pending",attempts:0,next_attempt_at:now,completed_at:null,
+    last_error:null,last_error_detail:{},locked_at:null,updated_at:now
+  }).in("status",["failed","manual_review","permanent_failed"]);
+  if(error)throw error;
 }
 
 async function sendJobItem(chatId:number,id:string){
