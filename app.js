@@ -3,6 +3,19 @@ const SESSION_KEY="vayzen.session";
 const PREFS_KEY="vayzen.prefs";
 const DEVICE_KEY="vayzen.device";
 const GUEST_PROGRESS_KEY="vayzen.guest.progress";
+const RECOVERY_FRAGMENT=(()=>{
+  try{
+    const raw=location.hash.startsWith("#")?location.hash.slice(1):"";
+    if(!raw.includes("access_token="))return null;
+    const p=new URLSearchParams(raw);
+    if(p.get("type")!=="recovery"||!p.get("access_token"))return null;
+    return {
+      access_token:p.get("access_token"),
+      refresh_token:p.get("refresh_token")||"",
+      expires_at:Math.floor(Date.now()/1000)+Math.max(60,Number(p.get("expires_in")||3600))
+    };
+  }catch{return null}
+})();
 
 const state={
   movies:[],series:[],moviePageItems:[],seriesPageItems:[],searchResults:[],
@@ -856,6 +869,33 @@ $("#loginForm").addEventListener("submit",async e=>{
     setSession(j.session);closeModal("authModal");await loadUserState();showToast("تم تسجيل الدخول");
   }catch(err){showToast(err.message)}finally{btn.disabled=false}
 });
+$("#forgotPasswordBtn").onclick=async()=>{
+  const email=$("#loginEmail").value.trim();
+  if(!email||!email.includes("@")){showToast("اكتب بريدك الإلكتروني أولًا");$("#loginEmail").focus();return}
+  const btn=$("#forgotPasswordBtn");btn.disabled=true;
+  try{
+    const j=await rawApi("password_reset",{method:"POST",body:{email}});
+    showToast(j.message||"إذا كان البريد مسجلًا ستصل رسالة الاستعادة");
+  }catch(err){showToast(err.message)}finally{btn.disabled=false}
+};
+$("#recoveryPasswordForm").addEventListener("submit",async e=>{
+  e.preventDefault();
+  const next=$("#recoveryPassword").value;
+  const confirm=$("#recoveryConfirm").value;
+  if(next.length<8){showToast("كلمة المرور يجب أن تكون 8 أحرف على الأقل");return}
+  if(next!==confirm){showToast("تأكيد كلمة المرور غير مطابق");return}
+  const btn=e.submitter;btn.disabled=true;
+  try{
+    await rawApi("recover_password",{method:"POST",auth:true,body:{new_password:next}});
+    e.target.reset();
+    closeModal("recoveryPasswordModal");
+    setSession(null);state.user=null;state.favorites=[];state.progress=[];state.watchHistory=[];
+    history.replaceState({vayzen:true,page:"account"},"","#account");
+    renderAccount();renderCatalog();
+    showToast("تم تحديث كلمة المرور. سجل الدخول من جديد");
+    openAuth("login");
+  }catch(err){showToast(err.message)}finally{btn.disabled=false}
+};
 $("#registerForm").addEventListener("submit",async e=>{
   e.preventDefault();
   const pass=$("#registerPassword").value,confirm=$("#registerConfirm").value;
@@ -895,14 +935,14 @@ $("#logoutBtn").onclick=()=>{setSession(null);state.user=null;state.favorites=[]
 $("#requestForm").addEventListener("submit",async e=>{
   e.preventDefault();const btn=e.submitter;btn.disabled=true;
   try{
-    const j=await rawApi("request_content",{method:"POST",body:{requester_key:requestKey(),request_type:$("#requestType").value,title:$("#requestTitle").value.trim(),note:$("#requestNote").value.trim()}});
+    const j=await rawApi("request_content",{method:"POST",auth:Boolean(state.user),body:{requester_key:requestKey(),request_type:$("#requestType").value,title:$("#requestTitle").value.trim(),note:$("#requestNote").value.trim()}});
     closeModal("requestModal");$("#requestForm").reset();showToast("تم إرسال الطلب "+j.request.request_code);
   }catch(err){showToast(err.message)}finally{btn.disabled=false}
 });
 async function openRequests(){
   openModal("requestsModal");$("#requestsList").innerHTML='<div class="empty-state">جاري التحميل...</div>';
   try{
-    const j=await rawApi("request_status",{params:{requester_key:requestKey()}});
+    const j=await rawApi("request_status",{auth:Boolean(state.user),params:{requester_key:requestKey()}});
     const labels={new:"جديد",reviewing:"قيد المراجعة",added:"تمت الإضافة",rejected:"مرفوض",duplicate:"مكرر"};
     $("#requestsList").innerHTML=(j.requests||[]).length?(j.requests||[]).map((x,i)=>`<div class="request-item"><div class="request-top"><b>${esc(x.title)}</b><span class="status-pill status-${esc(x.status)}">${labels[x.status]||esc(x.status)}</span></div><small>${esc(x.request_code)} • ${x.request_type==="movie"?"فيلم":"مسلسل"}</small>${x.linked?`<button class="btn primary request-watch" data-request-watch="${i}"><svg><use href="#i-play"/></svg><span>مشاهدة الآن</span></button>`:""}</div>`).join(""):'<div class="empty-state">ما عندك طلبات بعد.</div>';
     $("#requestsList").querySelectorAll("[data-request-watch]").forEach(btn=>btn.onclick=()=>{
@@ -917,7 +957,7 @@ function openReport(type="other",publicId=""){if(!state.user){openAuth("login");
 $("#reportForm").addEventListener("submit",async e=>{
   e.preventDefault();const btn=e.submitter;btn.disabled=true;
   try{
-    const j=await rawApi("report",{method:"POST",body:{reporter_key:requestKey(),entity_type:$("#reportEntityType").value||"other",entity_public_id:$("#reportPublicId").value||"",reason:$("#reportReason").value,details:$("#reportDetails").value.trim()}});
+    const j=await rawApi("report",{method:"POST",auth:Boolean(state.user),body:{reporter_key:requestKey(),entity_type:$("#reportEntityType").value||"other",entity_public_id:$("#reportPublicId").value||"",reason:$("#reportReason").value,details:$("#reportDetails").value.trim(),diagnostics:{online:navigator.onLine,user_agent:navigator.userAgent.slice(0,240),page:state.currentPage,player_type:state.player?.type||null,player_id:state.player?.id||null,quality:state.player?.qualityVariant||null}}});
     closeModal("reportModal");showToast("تم إرسال البلاغ "+j.report.report_code);
   }catch(err){showToast(err.message)}finally{btn.disabled=false}
 });
@@ -1501,10 +1541,18 @@ async function boot(){
   const started=performance.now();
   const failSafe=setTimeout(()=>splash?.classList.add("hide"),4500);
   try{
-    loadPrefs();loadSession();
+    loadPrefs();
+    if(RECOVERY_FRAGMENT){
+      setSession(RECOVERY_FRAGMENT);
+      history.replaceState({vayzen:true,page:"account"},"","#account");
+    }else loadSession();
     await loadCatalog();
     await loadUserState();
-    applyPage(history.state?.page||"home");
+    applyPage(RECOVERY_FRAGMENT?"account":(history.state?.page||"home"));
+    if(RECOVERY_FRAGMENT){
+      if(state.user)openModal("recoveryPasswordModal");
+      else{showToast("رابط الاستعادة غير صالح أو منتهي");openAuth("login")}
+    }
   }finally{
     clearTimeout(failSafe);
     const elapsed=performance.now()-started;
