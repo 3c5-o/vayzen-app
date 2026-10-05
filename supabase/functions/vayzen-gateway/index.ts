@@ -4240,19 +4240,118 @@ async function asset(type:string,id:string,variant="default"){
   return sorted[0]??null;
 }
 
+function b64UrlBytes(bytes:Uint8Array){
+  return bytesToB64(bytes).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+}
+async function xtreamProxyToken(upstreamUrl:string){
+  const secret=await streamSigningSecret();
+  if(!secret)throw new Error("streaming gateway not configured");
+  const url=new URL(upstreamUrl);
+  if(!["http:","https:"].includes(url.protocol))throw new Error("invalid Xtream stream URL");
+  const keyMaterial=await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode("vayzen:xtream-proxy:v1:"+secret)
+  );
+  const key=await crypto.subtle.importKey("raw",keyMaterial,{name:"AES-GCM"},false,["encrypt"]);
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const exp=Math.floor(Date.now()/1000)+STREAM_LINK_TTL_SECONDS;
+  const plain=new TextEncoder().encode(JSON.stringify({u:url.href,e:exp}));
+  const encrypted=await crypto.subtle.encrypt(
+    {name:"AES-GCM",iv,additionalData:new TextEncoder().encode("vayzen-xtream-v1")},
+    key,
+    plain
+  );
+  const cipher=new Uint8Array(encrypted);
+  const packed=new Uint8Array(iv.length+cipher.length);
+  packed.set(iv,0);packed.set(cipher,iv.length);
+  return "v1."+b64UrlBytes(packed);
+}
+
+async function xtreamStreamSource(entityType:"movie"|"episode",id:string,variant="default"){
+  if(!/^[0-9a-f-]{36}$/i.test(id))return null;
+  const requested=normalizeVariant(variant);
+  let query=db.from("playback_sources")
+    .select("id,xtream_account_id,external_stream_id,container_extension,quality,priority,health_status,metadata")
+    .eq("entity_type",entityType).eq("entity_id",id)
+    .eq("source_type","xtream").eq("is_active",true)
+    .neq("health_status","down")
+    .order("priority",{ascending:false})
+    .order("consecutive_failures",{ascending:true});
+  if(requested!=="default")query=query.eq("quality",requested);
+  const {data,error}=await query.limit(12);
+  if(error){
+    if(String(error.message||"").includes("playback_sources"))return null;
+    throw error;
+  }
+  for(const source of data??[]){
+    const accountId=String(source.xtream_account_id||"");
+    if(!accountId)continue;
+    const {data:account,error:accountError}=await db.from("xtream_accounts")
+      .select("id,server_url,credentials_ciphertext,is_enabled,status,priority")
+      .eq("id",accountId).maybeSingle();
+    if(accountError)continue;
+    if(!account?.is_enabled||account.status==="disabled"||account.status==="down")continue;
+    try{
+      const credentials=await xtreamCredentials(account);
+      const extension=String(source.container_extension||"").replace(/[^a-zA-Z0-9]/g,"").toLowerCase()||
+        (entityType==="movie"?"mp4":"mp4");
+      const path=entityType==="movie"?"movie":"series";
+      const upstream=credentials.server.replace(/\/+$/,"")+"/"+path+"/"+
+        encodeURIComponent(credentials.username)+"/"+encodeURIComponent(credentials.password)+"/"+
+        encodeURIComponent(String(source.external_stream_id))+"."+extension;
+      return {
+        source,
+        account,
+        upstream,
+        variant:normalizeVariant(String(source.quality||"default")),
+        label:variantLabel(String(source.quality||"default")),
+      };
+    }catch{}
+  }
+  return null;
+}
+
+async function hasUnifiedPlayback(entityType:"movie"|"episode",id:string){
+  const telegram=await asset(entityType==="movie"?"movie_video":"episode_video",id,"default");
+  if(telegram)return true;
+  return Boolean(await xtreamStreamSource(entityType,id,"default"));
+}
+
 async function publicMediaVariants(url:URL){
   const type=String(url.searchParams.get("type")||"");
   const id=String(url.searchParams.get("id")||"");
   if(!["movie","episode"].includes(type)||!/^[0-9a-f-]{36}$/i.test(id))return json({error:"invalid media target"},400);
-  const probe=await asset(type==="movie"?"movie_video":"episode_video",id,"default");
-  if(!probe)return json({error:"not found"},404);
-  const {data,error}=await db.from("media_assets")
+
+  const {data:telegram,error:telegramError}=await db.from("media_assets")
     .select("variant,file_size,mime_type")
     .eq("entity_type",type).eq("entity_id",id).eq("kind","video");
-  if(error)throw error;
-  const variants=(data??[])
-    .map((x:any)=>({variant:String(x.variant||"default"),label:variantLabel(String(x.variant||"default")),file_size:x.file_size||null,mime_type:x.mime_type||null}))
-    .sort((a:any,b:any)=>qualityRank(b.variant)-qualityRank(a.variant));
+  if(telegramError)throw telegramError;
+
+  let xtream:any[]=[];
+  const xtreamResult=await db.from("playback_sources")
+    .select("quality,container_extension,priority,health_status")
+    .eq("entity_type",type).eq("entity_id",id).eq("source_type","xtream").eq("is_active",true)
+    .neq("health_status","down");
+  if(!xtreamResult.error)xtream=xtreamResult.data??[];
+
+  const byVariant=new Map<string,any>();
+  for(const row of telegram??[]){
+    const variant=normalizeVariant(row.variant);
+    byVariant.set(variant,{
+      variant,label:variantLabel(variant),file_size:row.file_size||null,mime_type:row.mime_type||null,
+      source_count:1
+    });
+  }
+  for(const row of xtream){
+    const variant=normalizeVariant(row.quality||"default");
+    const current=byVariant.get(variant);
+    if(current){current.source_count=Number(current.source_count||1)+1;continue;}
+    const ext=String(row.container_extension||"").toLowerCase();
+    const mime=ext==="m3u8"?"application/vnd.apple.mpegurl":ext==="ts"?"video/mp2t":ext==="webm"?"video/webm":ext==="mkv"?"video/x-matroska":"video/mp4";
+    byVariant.set(variant,{variant,label:variantLabel(variant),file_size:null,mime_type:mime,source_count:1});
+  }
+  const variants=[...byVariant.values()].sort((a:any,b:any)=>qualityRank(b.variant)-qualityRank(a.variant));
+  if(!variants.length)return json({error:"not found"},404);
   return json({ok:true,variants});
 }
 
@@ -4261,7 +4360,7 @@ async function publicSubtitles(url:URL){
   const id=String(url.searchParams.get("id")||"");
   if(!["movie","episode"].includes(type)||!/^[0-9a-f-]{36}$/i.test(id))return json({error:"invalid subtitle target"},400);
   const mediaType=type==="movie"?"movie_subtitle":"episode_subtitle";
-  const contentProbe=type==="movie"?await asset("movie_video",id,"default"):await asset("episode_video",id,"default");
+  const contentProbe=await hasUnifiedPlayback(type as "movie"|"episode",id);
   if(!contentProbe)return json({error:"not found"},404);
   const {data,error}=await db.from("subtitle_tracks")
     .select("language_code,label,source_format,is_default")
@@ -4301,18 +4400,29 @@ async function hmacHex(payload:string,secret:string){
 
 async function media(type:string,id:string,req?:Request){
   const quality=req?new URL(req.url).searchParams.get("quality")||"default":"default";
-  const a:any=await asset(type,id,quality);
-  if(!a) return json({error:"not found"},404);
+  let a:any=await asset(type,id,quality);
+
   if(type==="movie_video"||type==="episode_video"){
+    const entityType=type==="movie_video"?"movie":"episode";
     const signingSecret=await streamSigningSecret();
     const gatewayBase=await streamGateway();
     if(!gatewayBase||!signingSecret) return json({error:"streaming gateway not configured"},503);
-    if(a.file_size&&Number(a.file_size)>MAX_VIDEO_BYTES) return json({error:"file exceeds current 2GB limit"},413);
-    const exp=Math.floor(Date.now()/1000)+STREAM_LINK_TTL_SECONDS;
-    const payload=`${a.channel_id}:${a.channel_message_id}:${exp}`;
-    const sig=await hmacHex(payload,signingSecret);
-    return Response.redirect(`${gatewayBase}/stream/${a.channel_id}/${a.channel_message_id}?exp=${exp}&sig=${sig}`,307);
+
+    if(a){
+      if(a.file_size&&Number(a.file_size)>MAX_VIDEO_BYTES) return json({error:"file exceeds current 2GB limit"},413);
+      const exp=Math.floor(Date.now()/1000)+STREAM_LINK_TTL_SECONDS;
+      const payload=`${a.channel_id}:${a.channel_message_id}:${exp}`;
+      const sig=await hmacHex(payload,signingSecret);
+      return Response.redirect(`${gatewayBase}/stream/${a.channel_id}/${a.channel_message_id}?exp=${exp}&sig=${sig}`,307);
+    }
+
+    const xtream=await xtreamStreamSource(entityType,id,quality);
+    if(!xtream)return json({error:"not found"},404);
+    const token=await xtreamProxyToken(xtream.upstream);
+    return Response.redirect(`${gatewayBase}/xtream/${encodeURIComponent(token)}`,307);
   }
+
+  if(!a) return json({error:"not found"},404);
   if(!a.telegram_file_id) return json({error:"telegram file id missing"},409);
   const file=await tg("getFile",{file_id:a.telegram_file_id});
   const upstream=await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
