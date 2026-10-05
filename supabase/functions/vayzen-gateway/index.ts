@@ -265,7 +265,12 @@ async function createCanonicalRows(
         origin_country_codes:item.countryCode?[item.countryCode]:[],
         original_language_code:null,
         quality:qualityFromName(item.raw.name,item.raw.container_extension),
-        status:autoPublish?"published":"draft",
+        status:type==="series"?"draft":(autoPublish?"published":"draft"),
+        ...(type==="series"?{
+          ingestion_status:"queued",
+          expected_seasons:0,expected_episodes:0,synced_episodes:0,playable_episodes:0,failed_episodes:0,
+          last_ingestion_error:{}
+        }:{}),
         identity_key:item.key,
         external_metadata:{xtream_seed:compactXtreamMetadata(item.raw,item.categoryName),tmdb_sync_status:"pending"},
       };
@@ -306,7 +311,7 @@ async function syncXtreamRefsAndSources(args:{
   const canonicalResult=await createCanonicalRows(table,entityType,prepared,autoPublish);
   const canonical=canonicalResult.map;
   const createdKeys=canonicalResult.createdKeys;
-  if(autoPublish){
+  if(autoPublish&&entityType==="movie"){
     const ids=[...new Set([...canonical.values()].map((x:any)=>String(x.id)).filter(Boolean))];
     if(ids.length){
       const {error:publishExistingError}=await db.from(table)
@@ -420,8 +425,14 @@ async function pipelineSettingsValue(){
   return {
     tmdb_auto_enrich:v.tmdb_auto_enrich!==false,
     tmdb_worker_batch:Math.max(1,Math.min(20,Number(v.tmdb_worker_batch||12))),
+    tmdb_max_attempts:Math.max(1,Math.min(20,Number(v.tmdb_max_attempts||8))),
+    series_ingest_batch:Math.max(1,Math.min(2,Number(v.series_ingest_batch||1))),
+    series_ingest_max_attempts:Math.max(1,Math.min(20,Number(v.series_ingest_max_attempts||6))),
+    media_probe_batch:Math.max(1,Math.min(5,Number(v.media_probe_batch||3))),
     announcement_worker_batch:Math.max(1,Math.min(5,Number(v.announcement_worker_batch||2))),
     announcement_list_chunk:Math.max(10,Math.min(35,Number(v.announcement_list_chunk||35))),
+    ready_only_catalog:v.ready_only_catalog!==false,
+    catalog_page_size:Math.max(20,Math.min(100,Number(v.catalog_page_size||40))),
     xtream_batch_choices:Array.isArray(v.xtream_batch_choices)?v.xtream_batch_choices:[10,50,100,500,1000],
   };
 }
@@ -1869,8 +1880,38 @@ async function recoverStalePublishSession(userId:number,flow:string,session:any)
   return true;
 }
 
+function errorDetail(err:any){
+  if(err instanceof Error){
+    const anyErr:any=err;
+    return {
+      name:String(err.name||"Error").slice(0,80),
+      message:String(err.message||"خطأ غير معروف").slice(0,1200),
+      code:anyErr.code??null,
+      status:anyErr.status??anyErr.statusCode??null,
+      details:anyErr.details??null,
+      hint:anyErr.hint??null,
+    };
+  }
+  if(err&&typeof err==="object"){
+    const obj:any=err;
+    let message=String(obj.message??obj.error_description??obj.error??"").trim();
+    if(!message){
+      try{message=JSON.stringify(obj);}catch{message="خطأ غير معروف";}
+    }
+    return {
+      name:String(obj.name||"ObjectError").slice(0,80),
+      message:message.slice(0,1200),
+      code:obj.code??null,
+      status:obj.status??obj.statusCode??null,
+      details:obj.details??null,
+      hint:obj.hint??null,
+    };
+  }
+  return {name:"Error",message:String(err??"خطأ غير معروف").slice(0,1200),code:null,status:null,details:null,hint:null};
+}
 function adminErrorText(err:any){
-  const raw=err instanceof Error?err.message:String(err||"خطأ غير معروف");
+  const detail=errorDetail(err);
+  const raw=detail.message||"خطأ غير معروف";
   if(raw.includes("chat not found"))return "تعذر الوصول إلى قناة التخزين. تحقق أن البوت مشرف في القناة.";
   if(raw.includes("file exceeds"))return "حجم الملف أكبر من الحد المسموح.";
   if(raw.includes("Series not found"))return "المسلسل غير موجود أو غير منشور.";
