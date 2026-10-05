@@ -839,8 +839,35 @@ async function channel(key:string){
     .select("telegram_channel_id,title,is_active")
     .eq("channel_key",key).maybeSingle();
   if(error) throw error;
-  if(!data?.is_active||!data.telegram_channel_id) throw new Error(`Channel not configured: ${key}`);
-  return data;
+  if(data?.is_active&&data.telegram_channel_id)return data;
+
+  const storageFallback:Record<string,string>={
+    movies_info:"movies_storage",
+    series_info:"series_storage",
+  };
+  const fallbackKey=storageFallback[key];
+  if(fallbackKey){
+    const {data:fallback,error:fallbackError}=await db.from("telegram_channels")
+      .select("telegram_channel_id,title,is_active")
+      .eq("channel_key",fallbackKey).maybeSingle();
+    if(fallbackError)throw fallbackError;
+    if(fallback?.is_active&&fallback.telegram_channel_id)return fallback;
+  }
+
+  if(["requests","reports","admin_logs","system_logs"].includes(key)){
+    const {data:owner}=await db.from("admin_users")
+      .select("telegram_user_id,display_name")
+      .eq("role","owner").eq("is_active",true).maybeSingle();
+    if(owner?.telegram_user_id){
+      return {
+        telegram_channel_id:Number(owner.telegram_user_id),
+        title:owner.display_name||"VAYZEN Owner",
+        is_active:true,
+      };
+    }
+  }
+
+  throw new Error(`Channel not configured: ${key}`);
 }
 
 async function send(chatId:string|number,text:string,reply_markup?:unknown){
