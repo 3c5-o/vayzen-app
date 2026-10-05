@@ -922,12 +922,19 @@ function freshSourceForPlayer(o,variant=""){
 }
 
 function sourceForPlayer(o,variant=""){
-  return mediaUrl(o.type==="movie"?"movie_video":"episode_video",o.id,variant);
+  const base=mediaUrl(o.type==="movie"?"movie_video":"episode_video",o.id,variant);
+  if(!o?.forceXtream)return base;
+  try{
+    const u=new URL(base,location.href);
+    u.searchParams.set("source","xtream");
+    return u.toString();
+  }catch{return base}
 }
 async function openPlayer(o,{pushHistory=true}={}){
   clearTimeout(playerRetryTimer);clearInterval(nextCountdownTimer);clearInterval(nextCountdownTick);
   playerRetryCount=0;
   $("#nextCountdown")?.classList.add("hidden");
+  o.forceXtream=false;
   state.player=o;state.nextEpisode=o.next||null;
   $("#playerTitle").textContent=o.title;$("#playerMeta").textContent=o.publicId||"";
   $("#nextEpisodeBtn").classList.toggle("hidden",!o.next);
@@ -1034,8 +1041,9 @@ video.addEventListener("error",()=>{
   const code=video.error?.code||0;
   if(code===2&&navigator.onLine&&playerRetryCount<3&&state.player){
     playerRetryCount+=1;
+    if(playerRetryCount>=2)state.player.forceXtream=true;
     $("#playerError").classList.add("hidden");$("#playerLoader").classList.remove("hidden");
-    $("#playerErrorText").textContent="إعادة الاتصال بمصدر الفيديو...";
+    $("#playerErrorText").textContent=state.player.forceXtream?"جاري الانتقال إلى مصدر احتياطي...":"إعادة الاتصال بمصدر الفيديو...";
     clearTimeout(playerRetryTimer);
     playerRetryTimer=setTimeout(()=>retryCurrentPlayer(true),[800,1800,3500][playerRetryCount-1]||3500);
     return;
