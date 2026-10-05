@@ -831,6 +831,8 @@ values('xtream',jsonb_build_object(
   'auto_country_classification',true,
   'source_failover',true,
   'sync_live',false,
-  'series_details_on_demand',true
+  'series_details_on_demand',true,
+  'auto_publish',false,
+  'sync_batch_size',120
 ))
 on conflict (key) do nothing;
