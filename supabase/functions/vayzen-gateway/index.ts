@@ -6,6 +6,7 @@ import {
   extractCatalogYear,
   identityKey,
   normalizeCatalogTitle,
+  normalizeXtreamServer,
   qualityFromName,
   validateXtreamCredentials,
   xtreamRequest,
@@ -484,8 +485,9 @@ async function sendXtreamSettings(chatId:string|number){
     return `${index+1}. ${x.name} — ${enabled} — أفلام ${Number(x.movie_count||0).toLocaleString("ar-IQ")} — مسلسلات ${Number(x.series_count||0).toLocaleString("ar-IQ")}`;
   });
   const rows:any[][]=accounts.slice(0,10).map((x:any)=>[
-    {text:`مزامنة ${String(x.name).slice(0,20)}`,callback_data:`xtream_sync|${x.id}`},
-    {text:x.is_enabled?"إيقاف":"تفعيل",callback_data:`xtream_toggle|${x.id}`}
+    {text:`مزامنة ${String(x.name).slice(0,16)}`,callback_data:`xtream_sync|${x.id}`},
+    {text:x.is_enabled?"إيقاف":"تفعيل",callback_data:`xtream_toggle|${x.id}`},
+    {text:"حذف",callback_data:`xtream_delete|${x.id}`}
   ]);
   rows.push([{text:"إضافة حساب Xtream",callback_data:"xtream_add"}]);
   rows.push([{text:"رجوع",callback_data:"menu"}]);
@@ -894,7 +896,10 @@ function menuFor(admin:Admin){
   if(can(admin,"content")||admin.role==="owner"){
     const row:any[]=[];
     if(can(admin,"content"))row.push({text:"إدارة المحتوى",callback_data:"content"});
-    if(admin.role==="owner")row.push({text:"TMDb",callback_data:"tmdb_settings"});
+    if(admin.role==="owner"){
+      row.push({text:"Xtream",callback_data:"xtream_settings"});
+      row.push({text:"TMDb",callback_data:"tmdb_settings"});
+    }
     if(row.length)rows.push(row);
   }
   if(can(admin,"requests")||can(admin,"reports")){
@@ -2835,6 +2840,69 @@ async function callback(q:any){
     }
     return send(chatId,`تم تفعيل ألوان الأزرار، لكن Telegram لم يسمح بالأيقونات المخصصة حاليًا.\n\n${String(result.error||"").slice(0,220)}`,{inline_keyboard:[[{text:"رجوع",callback_data:"bot_ui_settings"}]]});
   }
+  if(a==="xtream_settings"){
+    if(admin.role!=="owner")return send(chatId,"إعدادات Xtream متاحة للمالك فقط.");
+    await clearSession(userId);
+    return sendXtreamSettings(chatId);
+  }
+  if(a==="xtream_add"){
+    if(admin.role!=="owner")return send(chatId,"إعدادات Xtream متاحة للمالك فقط.");
+    await setSession(userId,"xtream_add","name",{});
+    return cancelablePrompt(chatId,"أرسل اسمًا لهذا المصدر، مثال: Xtream الرئيسي.");
+  }
+  if(a.startsWith("xtream_toggle|")){
+    if(admin.role!=="owner")return send(chatId,"إعدادات Xtream متاحة للمالك فقط.");
+    const id=a.split("|")[1]||"";
+    if(!/^[0-9a-f-]{36}$/i.test(id))return sendXtreamSettings(chatId);
+    const row:any=await xtreamAccountWithSecret(id);
+    const {error}=await db.from("xtream_accounts").update({
+      is_enabled:!row.is_enabled,status:row.is_enabled?"disabled":"unknown",last_error:null
+    }).eq("id",id);
+    if(error)throw error;
+    await adminLog(userId,row.is_enabled?"xtream_account_disable":"xtream_account_enable","settings",undefined,id,{});
+    return sendXtreamSettings(chatId);
+  }
+  if(a.startsWith("xtream_delete|")){
+    if(admin.role!=="owner")return send(chatId,"إعدادات Xtream متاحة للمالك فقط.");
+    const id=a.split("|")[1]||"";
+    if(!/^[0-9a-f-]{36}$/i.test(id))return sendXtreamSettings(chatId);
+    const row:any=await xtreamAccountWithSecret(id);
+    return send(chatId,`تأكيد حذف مصدر Xtream: ${row.name}?\n\nسيتم حذف روابط هذا المصدر فقط. الأفلام والمسلسلات الأساسية في Vayzen لن تُحذف.`,{
+      inline_keyboard:[[{text:"تأكيد الحذف",callback_data:`xtream_delete_ok|${id}`}],[{text:"تراجع",callback_data:"xtream_settings"}]]
+    });
+  }
+  if(a.startsWith("xtream_delete_ok|")){
+    if(admin.role!=="owner")return send(chatId,"إعدادات Xtream متاحة للمالك فقط.");
+    const id=a.split("|")[1]||"";
+    if(!/^[0-9a-f-]{36}$/i.test(id))return sendXtreamSettings(chatId);
+    const row:any=await xtreamAccountWithSecret(id);
+    const {error}=await db.from("xtream_accounts").delete().eq("id",id);
+    if(error)throw error;
+    await adminLog(userId,"xtream_account_delete","settings",undefined,id,{name:row.name});
+    return sendXtreamSettings(chatId);
+  }
+  if(a.startsWith("xtream_sync|")){
+    if(admin.role!=="owner")return send(chatId,"مزامنة Xtream متاحة للمالك فقط.");
+    const id=a.split("|")[1]||"";
+    if(!/^[0-9a-f-]{36}$/i.test(id))return sendXtreamSettings(chatId);
+    const row:any=await xtreamAccountWithSecret(id);
+    await send(chatId,`بدأت مزامنة دفعة من ${row.name}. لن يتم تكرار المحتوى الموجود.`);
+    try{
+      const result:any=await syncXtreamBatch(id,userId);
+      const details=result?.details||{};
+      await adminLog(userId,"xtream_sync_batch","settings",undefined,id,result);
+      const buttons:any[][]=[];
+      if(!details.cycle_complete)buttons.push([{text:"متابعة المزامنة",callback_data:`xtream_sync|${id}`}]);
+      buttons.push([{text:"رجوع إلى Xtream",callback_data:"xtream_settings"}]);
+      return send(chatId,
+        `اكتملت الدفعة.\nأفلام: ${Number(result.movies_seen||0).toLocaleString("ar-IQ")}\nمسلسلات: ${Number(result.series_seen||0).toLocaleString("ar-IQ")}\nمصادر تشغيل جديدة: ${Number(result.source_links_created||0).toLocaleString("ar-IQ")}\nحالة الدورة: ${details.cycle_complete?"مكتملة":"تحتاج دفعة أخرى"}`,
+        {inline_keyboard:buttons}
+      );
+    }catch(err){
+      return send(chatId,`فشلت مزامنة Xtream.\n${adminErrorText(err)}`,{inline_keyboard:[[{text:"رجوع",callback_data:"xtream_settings"}]]});
+    }
+  }
+
   if(a==="tmdb_settings"){
     if(admin.role!=="owner")return send(chatId,"إعدادات TMDb متاحة للمالك فقط.");
     await clearSession(userId);
@@ -3722,6 +3790,46 @@ async function message(m:any){
   if(!s) return showMenu(chatId);
   const d:any={...(s.draft??{})};
 
+  if(s.flow==="xtream_add"){
+    if(admin.role!=="owner"){await clearSession(userId);return send(chatId,"إعدادات Xtream متاحة للمالك فقط.");}
+    if(s.step==="name"){
+      const name=text.trim().slice(0,80);
+      if(name.length<2)return send(chatId,"أرسل اسمًا واضحًا للحساب، مثال: المصدر الرئيسي.");
+      d.name=name;await setSession(userId,"xtream_add","server",d);
+      return cancelablePrompt(chatId,"أرسل رابط سيرفر Xtream، مثال: https://example.com");
+    }
+    if(s.step==="server"){
+      try{d.server=normalizeXtreamServer(text.trim());}
+      catch{return send(chatId,"رابط السيرفر غير صالح. أرسل رابط HTTP أو HTTPS صحيح.");}
+      await setSession(userId,"xtream_add","username",d);
+      return cancelablePrompt(chatId,"أرسل Username الخاص بحساب Xtream.");
+    }
+    if(s.step==="username"){
+      const username=text.trim();
+      if(!username||username.length>240)return send(chatId,"Username غير صالح.");
+      d.username=username;await setSession(userId,"xtream_add","password",d);
+      return cancelablePrompt(chatId,"أرسل Password الخاص بحساب Xtream. سيتم حذف الرسالة من المحادثة بعد قراءتها.");
+    }
+    if(s.step==="password"){
+      const password=text.trim();
+      try{await tg("deleteMessage",{chat_id:chatId,message_id:m.message_id});}catch{}
+      if(!password||password.length>240)return send(chatId,"Password غير صالح.");
+      try{
+        const saved:any=await saveXtreamAccount({
+          name:String(d.name||""),server:String(d.server||""),username:String(d.username||""),
+          password,createdBy:userId
+        });
+        await clearSession(userId);
+        await adminLog(userId,"xtream_account_add","settings",undefined,String(saved?.id||""),{name:saved?.name||d.name});
+        return sendXtreamSettings(chatId);
+      }catch(err){
+        return send(chatId,`لم يتم حفظ حساب Xtream لأن فحص الاتصال فشل.\n${adminErrorText(err)}`,{
+          inline_keyboard:[[{text:"إعادة المحاولة",callback_data:"xtream_add"},{text:"رجوع",callback_data:"xtream_settings"}]]
+        });
+      }
+    }
+  }
+
   if(s.flow==="tmdb_settings"&&s.step==="token"){
     if(admin.role!=="owner"){await clearSession(userId);return send(chatId,"إعدادات TMDb متاحة للمالك فقط.");}
     const token=text.trim();
@@ -4329,8 +4437,8 @@ async function recordView(req:Request){
 
 async function catalog(){
   const [m,s]=await Promise.all([
-    db.from("movies").select("id,public_id,title,original_title,description,release_year,genres,language,country,duration_minutes,quality,is_featured,view_count,rating,rating_count,created_at").eq("status","published").order("created_at",{ascending:false}),
-    db.from("series").select("id,public_id,title,original_title,description,release_year,genres,language,country,quality,is_featured,view_count,rating,rating_count,created_at").eq("status","published").order("created_at",{ascending:false})
+    db.from("movies").select("id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,duration_minutes,quality,is_featured,view_count,rating,rating_count,created_at").eq("status","published").order("created_at",{ascending:false}),
+    db.from("series").select("id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,quality,is_featured,view_count,rating,rating_count,created_at").eq("status","published").order("created_at",{ascending:false})
   ]);
   if(m.error)throw m.error;if(s.error)throw s.error;
   return json({ok:true,movies:m.data??[],series:s.data??[]});
