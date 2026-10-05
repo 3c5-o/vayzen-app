@@ -2,9 +2,7 @@ name: VAYZEN Production Smoke
 
 on:
   push:
-    branches:
-      - main
-      - vayzen-full-hardening-20261005
+    branches: [main]
     paths:
       - RELEASE_SMOKE_TRIGGER
   workflow_dispatch:
