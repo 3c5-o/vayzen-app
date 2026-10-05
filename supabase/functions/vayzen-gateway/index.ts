@@ -569,12 +569,14 @@ async function pipelineSettingsValue(){
 
 async function queueTmdbEntities(entityType:"movie"|"series",entities:any[]){
   if(!entities.length)return 0;
+  const settings=await pipelineSettingsValue();
   const rows=entities.filter((x:any)=>x?.id).map((x:any)=>({
     provider:"tmdb",
     entity_type:entityType,
     entity_id:String(x.id),
     status:"pending",
     priority:60,
+    max_attempts:settings.tmdb_max_attempts,
     next_attempt_at:new Date().toISOString(),
     updated_at:new Date().toISOString(),
   }));
@@ -777,7 +779,7 @@ async function processMetadataSyncQueue(limitOverride?:number){
   const limit=Math.max(1,Math.min(20,Number(limitOverride||settings.tmdb_worker_batch)));
   const now=new Date().toISOString();
   const {data:items,error}=await db.from("metadata_sync_queue")
-    .select("id,entity_type,entity_id,attempts")
+    .select("id,entity_type,entity_id,attempts,max_attempts,last_error_detail")
     .in("status",["pending","failed"])
     .lte("next_attempt_at",now)
     .order("priority",{ascending:false})
@@ -796,12 +798,23 @@ async function processMetadataSyncQueue(limitOverride?:number){
       const table=type==="movie"?"movies":"series";
       const fields=type==="movie"
         ?"id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,duration_minutes,rating,rating_count,external_source,external_id,external_metadata,release_date,status"
-        :"id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,rating,rating_count,external_source,external_id,external_metadata,first_air_date,status";
+        :"id,public_id,title,original_title,description,release_year,genres,language,country,country_code,origin_country_codes,original_language_code,rating,rating_count,external_source,external_id,external_metadata,first_air_date,status,ingestion_status";
       const {data:row,error:rowError}=await db.from(table).select(fields).eq("id",item.entity_id).maybeSingle();
       if(rowError)throw rowError;
-      if(!row||row.status!=="published"){
+      if(!row){
         await db.from("metadata_sync_queue").update({
-          status:"completed",completed_at:new Date().toISOString(),updated_at:new Date().toISOString(),last_error:null
+          status:"permanent_failed",completed_at:new Date().toISOString(),updated_at:new Date().toISOString(),
+          last_error:"Content row no longer exists",last_error_detail:{code:"CONTENT_MISSING"}
+        }).eq("id",item.id);
+        processed++;failed++;
+        continue;
+      }
+      if(row.status!=="published"||(type==="series"&&String((row as any).ingestion_status||"ready")!=="ready")){
+        await db.from("metadata_sync_queue").update({
+          status:"pending",
+          next_attempt_at:new Date(Date.now()+5*60_000).toISOString(),
+          updated_at:new Date().toISOString(),
+          last_error:null,last_error_detail:{}
         }).eq("id",item.id);
         processed++;
         continue;
@@ -820,17 +833,33 @@ async function processMetadataSyncQueue(limitOverride?:number){
         try{await syncTmdbSeriesEpisodeMetadata(String(row.id));}catch{}
       }
       await db.from("metadata_sync_queue").update({
-        status:"completed",completed_at:new Date().toISOString(),updated_at:new Date().toISOString(),last_error:null
+        status:"completed",completed_at:new Date().toISOString(),updated_at:new Date().toISOString(),last_error:null,last_error_detail:{}
       }).eq("id",item.id);
       matched++;processed++;
     }catch(error){
       const attempts=Number(item.attempts||0)+1;
+      const settings=await pipelineSettingsValue();
+      const maxAttempts=Math.max(1,Number(item.max_attempts||settings.tmdb_max_attempts||8));
+      const exhausted=attempts>=maxAttempts;
       const delay=queueBackoffSeconds(attempts);
       const next=new Date(Date.now()+delay*1000).toISOString();
-      const message=adminErrorText(error).slice(0,1000);
+      const detail=errorDetail(error);
       await db.from("metadata_sync_queue").update({
-        status:"failed",attempts,next_attempt_at:next,last_error:message,locked_at:null,updated_at:new Date().toISOString()
+        status:exhausted?"manual_review":"failed",
+        attempts,
+        max_attempts:maxAttempts,
+        next_attempt_at:next,
+        last_error:String(detail.message||"TMDb sync failed").slice(0,1000),
+        last_error_detail:detail,
+        locked_at:null,
+        updated_at:new Date().toISOString(),
+        ...(exhausted?{completed_at:new Date().toISOString()}:{})
       }).eq("id",item.id);
+      if(exhausted){
+        await systemLog("warning","TMDb metadata moved to manual review",{
+          entity_type:item.entity_type,entity_id:item.entity_id,attempts,error:detail
+        });
+      }
       failed++;processed++;
     }
   }
