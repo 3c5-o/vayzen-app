@@ -641,3 +641,196 @@ values('release',jsonb_build_object(
 ))
 on conflict (key) do update set value=excluded.value,updated_at=now();
 
+
+
+-- ============================================================================
+-- VAYZEN MULTI-XTREAM FOUNDATION
+-- Canonical catalog stays in movies/series/episodes. Providers are references.
+-- Credentials are encrypted by the Edge Function before they reach this table.
+-- ============================================================================
+
+alter table public.movies
+  add column if not exists identity_key text,
+  add column if not exists country_code text,
+  add column if not exists origin_country_codes text[] not null default '{}',
+  add column if not exists original_language_code text;
+
+alter table public.series
+  add column if not exists identity_key text,
+  add column if not exists country_code text,
+  add column if not exists origin_country_codes text[] not null default '{}',
+  add column if not exists original_language_code text;
+
+create index if not exists movies_identity_key_idx
+  on public.movies(identity_key)
+  where identity_key is not null;
+
+create index if not exists series_identity_key_idx
+  on public.series(identity_key)
+  where identity_key is not null;
+
+create index if not exists movies_country_code_idx
+  on public.movies(country_code,status,created_at desc)
+  where country_code is not null;
+
+create index if not exists series_country_code_idx
+  on public.series(country_code,status,created_at desc)
+  where country_code is not null;
+
+create table if not exists public.xtream_accounts (
+  id uuid primary key default gen_random_uuid(),
+  name text not null unique check (char_length(btrim(name)) between 1 and 80),
+  server_url text not null check (server_url ~ '^https?://'),
+  credentials_ciphertext text not null,
+  priority integer not null default 50 check (priority between 0 and 1000),
+  is_enabled boolean not null default true,
+  sync_movies boolean not null default true,
+  sync_series boolean not null default true,
+  sync_live boolean not null default false,
+  status text not null default 'unknown'
+    check (status in ('unknown','active','degraded','down','disabled')),
+  last_error text,
+  last_checked_at timestamptz,
+  last_sync_at timestamptz,
+  movie_count integer not null default 0 check (movie_count >= 0),
+  series_count integer not null default 0 check (series_count >= 0),
+  episode_count integer not null default 0 check (episode_count >= 0),
+  metadata jsonb not null default '{}'::jsonb,
+  created_by bigint,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.content_provider_refs (
+  id uuid primary key default gen_random_uuid(),
+  provider_type text not null check (provider_type in ('xtream','tmdb','telegram')),
+  provider_account_id uuid references public.xtream_accounts(id) on delete cascade,
+  entity_type text not null check (entity_type in ('movie','series','episode')),
+  entity_id uuid not null,
+  external_id text not null,
+  identity_key text,
+  is_active boolean not null default true,
+  first_seen_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create unique index if not exists content_provider_refs_unique_idx
+  on public.content_provider_refs(
+    provider_type,
+    coalesce(provider_account_id,'00000000-0000-0000-0000-000000000000'::uuid),
+    entity_type,
+    external_id
+  );
+
+create index if not exists content_provider_refs_entity_idx
+  on public.content_provider_refs(entity_type,entity_id,is_active);
+
+create index if not exists content_provider_refs_identity_idx
+  on public.content_provider_refs(entity_type,identity_key)
+  where identity_key is not null;
+
+create table if not exists public.playback_sources (
+  id uuid primary key default gen_random_uuid(),
+  entity_type text not null check (entity_type in ('movie','episode')),
+  entity_id uuid not null,
+  source_type text not null check (source_type in ('xtream','telegram')),
+  provider_ref_id uuid references public.content_provider_refs(id) on delete cascade,
+  xtream_account_id uuid references public.xtream_accounts(id) on delete cascade,
+  telegram_asset_id uuid references public.media_assets(id) on delete cascade,
+  external_stream_id text,
+  external_series_id text,
+  container_extension text not null default '',
+  quality text not null default '',
+  language text not null default '',
+  country_code text,
+  priority integer not null default 50 check (priority between 0 and 1000),
+  is_active boolean not null default true,
+  health_status text not null default 'unknown'
+    check (health_status in ('unknown','healthy','degraded','down')),
+  consecutive_failures integer not null default 0 check (consecutive_failures >= 0),
+  last_seen_at timestamptz not null default now(),
+  last_checked_at timestamptz,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  check (
+    (source_type='xtream' and xtream_account_id is not null and external_stream_id is not null)
+    or
+    (source_type='telegram' and telegram_asset_id is not null)
+  )
+);
+
+create unique index if not exists playback_sources_xtream_unique_idx
+  on public.playback_sources(xtream_account_id,entity_type,external_stream_id)
+  where source_type='xtream';
+
+create unique index if not exists playback_sources_telegram_unique_idx
+  on public.playback_sources(telegram_asset_id)
+  where source_type='telegram';
+
+create index if not exists playback_sources_entity_rank_idx
+  on public.playback_sources(entity_type,entity_id,is_active,health_status,priority desc);
+
+create table if not exists public.xtream_sync_runs (
+  id uuid primary key default gen_random_uuid(),
+  account_id uuid not null references public.xtream_accounts(id) on delete cascade,
+  mode text not null default 'incremental' check (mode in ('dry_run','full','incremental','series_details')),
+  status text not null default 'running' check (status in ('running','completed','partial','failed','cancelled')),
+  movies_seen integer not null default 0,
+  series_seen integer not null default 0,
+  episodes_seen integer not null default 0,
+  created_items integer not null default 0,
+  merged_items integer not null default 0,
+  source_links_created integer not null default 0,
+  deactivated_sources integer not null default 0,
+  errors_count integer not null default 0,
+  details jsonb not null default '{}'::jsonb,
+  started_by bigint,
+  started_at timestamptz not null default now(),
+  completed_at timestamptz,
+  error text
+);
+
+create index if not exists xtream_accounts_enabled_priority_idx
+  on public.xtream_accounts(is_enabled,priority desc,created_at);
+
+create index if not exists xtream_sync_runs_recent_idx
+  on public.xtream_sync_runs(account_id,started_at desc);
+
+alter table public.xtream_accounts enable row level security;
+alter table public.content_provider_refs enable row level security;
+alter table public.playback_sources enable row level security;
+alter table public.xtream_sync_runs enable row level security;
+
+revoke all on public.xtream_accounts,public.content_provider_refs,public.playback_sources,public.xtream_sync_runs
+from anon,authenticated;
+
+drop trigger if exists trg_xtream_accounts_updated_at on public.xtream_accounts;
+create trigger trg_xtream_accounts_updated_at
+before update on public.xtream_accounts
+for each row execute function public.touch_updated_at();
+
+drop trigger if exists trg_content_provider_refs_updated_at on public.content_provider_refs;
+create trigger trg_content_provider_refs_updated_at
+before update on public.content_provider_refs
+for each row execute function public.touch_updated_at();
+
+drop trigger if exists trg_playback_sources_updated_at on public.playback_sources;
+create trigger trg_playback_sources_updated_at
+before update on public.playback_sources
+for each row execute function public.touch_updated_at();
+
+insert into public.app_settings(key,value)
+values('xtream',jsonb_build_object(
+  'enabled',false,
+  'sync_mode','incremental',
+  'dedupe_strategy','tmdb_then_identity',
+  'auto_country_classification',true,
+  'source_failover',true,
+  'sync_live',false,
+  'series_details_on_demand',true
+))
+on conflict (key) do nothing;
