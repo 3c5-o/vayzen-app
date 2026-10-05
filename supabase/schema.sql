@@ -172,7 +172,7 @@ create index if not exists admin_users_role_active_idx
   on public.admin_users(role,is_active,created_at);
 
 create or replace function public.protect_owner_admin()
-returns trigger language plpgsql set search_path=public as $
+returns trigger language plpgsql set search_path=public as $$
 begin
   if tg_op='DELETE' then
     if old.role='owner' then
@@ -188,7 +188,7 @@ begin
     end if;
   end if;
   return new;
-end $;
+end $$;
 
 drop trigger if exists protect_owner_admin_trigger on public.admin_users;
 create trigger protect_owner_admin_trigger
@@ -666,7 +666,7 @@ returns text
 language sql
 immutable
 set search_path=public
-as $
+as $$
   select p_type || ':' ||
     btrim(
       regexp_replace(
@@ -682,13 +682,13 @@ as $
         'g'
       )
     ) || ':' || coalesce(p_year,0)::text
-$;
+$$;
 
 create or replace function public.set_vayzen_content_identity()
 returns trigger
 language plpgsql
 set search_path=public
-as $
+as $$
 begin
   new.identity_key=public.vayzen_identity_key(
     case when tg_table_name='movies' then 'movie' else 'series' end,
@@ -697,7 +697,7 @@ begin
   );
   return new;
 end
-$;
+$$;
 
 drop trigger if exists trg_movies_identity_key on public.movies;
 create trigger trg_movies_identity_key
@@ -892,3 +892,96 @@ values('xtream',jsonb_build_object(
   'sync_batch_size',120
 ))
 on conflict (key) do nothing;
+
+
+-- ============================================================================
+-- VAYZEN USER ACCOUNT CORE
+-- Profiles, favorites, resume progress, and auth-user profile provisioning.
+-- ============================================================================
+
+create schema if not exists private;
+revoke all on schema private from public;
+revoke all on schema private from anon, authenticated;
+
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  display_name text not null default '',
+  avatar_url text not null default '',
+  is_disabled boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.favorites (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  entity_type text not null check (entity_type in ('movie','series')),
+  entity_id uuid not null,
+  created_at timestamptz not null default now(),
+  primary key (user_id, entity_type, entity_id)
+);
+
+create table if not exists public.watch_progress (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  entity_type text not null check (entity_type in ('movie','episode')),
+  entity_id uuid not null,
+  position_seconds numeric not null default 0 check (position_seconds >= 0),
+  duration_seconds numeric not null default 0 check (duration_seconds >= 0),
+  updated_at timestamptz not null default now(),
+  primary key (user_id, entity_type, entity_id)
+);
+
+alter table public.profiles enable row level security;
+alter table public.favorites enable row level security;
+alter table public.watch_progress enable row level security;
+
+revoke all on public.profiles,public.favorites,public.watch_progress from anon,authenticated;
+
+drop trigger if exists trg_profiles_updated_at on public.profiles;
+create trigger trg_profiles_updated_at
+before update on public.profiles
+for each row execute function public.touch_updated_at();
+
+create index if not exists profiles_created_idx on public.profiles(created_at desc);
+create index if not exists favorites_user_recent_idx on public.favorites(user_id,created_at desc);
+create index if not exists watch_progress_user_recent_idx on public.watch_progress(user_id,updated_at desc);
+
+create or replace function private.handle_new_auth_user()
+returns trigger
+language plpgsql
+security definer
+set search_path=public
+as $$
+begin
+  insert into public.profiles(id,display_name,avatar_url)
+  values(
+    new.id,
+    left(coalesce(new.raw_user_meta_data->>'display_name',''),40),
+    left(coalesce(new.raw_user_meta_data->>'avatar_url',''),500)
+  )
+  on conflict (id) do nothing;
+  return new;
+end;
+$$;
+
+revoke all on function private.handle_new_auth_user() from public,anon,authenticated;
+
+drop trigger if exists on_auth_user_created_vayzen on auth.users;
+create trigger on_auth_user_created_vayzen
+after insert on auth.users
+for each row execute function private.handle_new_auth_user();
+
+create index if not exists content_provider_refs_provider_account_idx
+  on public.content_provider_refs(provider_account_id)
+  where provider_account_id is not null;
+
+create index if not exists media_health_issues_run_idx
+  on public.media_health_issues(run_id)
+  where run_id is not null;
+
+create index if not exists playback_sources_provider_ref_idx
+  on public.playback_sources(provider_ref_id)
+  where provider_ref_id is not null;
+
+create index if not exists subtitle_tracks_media_asset_idx
+  on public.subtitle_tracks(media_asset_id)
+  where media_asset_id is not null;
