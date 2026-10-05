@@ -6635,32 +6635,49 @@ async function watchHistoryApi(req:Request){
   return json({ok:true,history:out});
 }
 
+
 async function publicRequest(req:Request){
   const b=await req.json().catch(()=>null);
-  if(!b) return json({error:"invalid body"},400);
-  const requester=String(b.requester_key||"").trim();
+  if(!b)return json({error:"invalid body"},400);
+  const auth=await userFromRequest(req);
+  const requester=String(b.requester_key||auth?.user?.id||"").trim();
   const type=String(b.request_type||"");
   const title=String(b.title||"").trim().slice(0,160);
   const note=String(b.note||"").trim().slice(0,500);
-  if(!/^[A-Za-z0-9_-]{20,100}$/.test(requester)||!["movie","series"].includes(type)||title.length<2) return json({error:"invalid request"},400);
-  const allowed=await consumeRateLimit(requester,"content_request",5,24*60*60);
-  if(!allowed) return json({error:"daily limit reached"},429);
-  const {data,error}=await db.from("content_requests").insert({requester_key:requester,request_type:type,title,note})
-    .select("request_code,status,title,request_type,created_at").single();
-  if(error) throw error;
+  if(!/^[A-Za-z0-9_-]{20,100}$/.test(requester)||!["movie","series"].includes(type)||title.length<2)return json({error:"invalid request"},400);
+  const limiter=auth?.user?.id?"user:"+auth.user.id:requester;
+  const allowed=await consumeRateLimit(limiter,"content_request",5,24*60*60);
+  if(!allowed)return json({error:"daily limit reached"},429);
+  const {data,error}=await db.from("content_requests").insert({
+    requester_key:requester,
+    user_id:auth?.user?.id||null,
+    request_type:type,title,note
+  }).select("request_code,status,title,request_type,created_at").single();
+  if(error)throw error;
   try{
     const ch=await channel("requests");
-    await tg("sendMessage",{chat_id:ch.telegram_channel_id,text:`طلب جديد\n${data.request_code}\nالنوع: ${type==="movie"?"فيلم":"مسلسل"}\nالاسم: ${title}\nملاحظة: ${note||"—"}`});
+    await tg("sendMessage",{chat_id:ch.telegram_channel_id,text:
+      "طلب جديد\n"+data.request_code+"\nالنوع: "+(type==="movie"?"فيلم":"مسلسل")+
+      "\nالاسم: "+title+"\nملاحظة: "+(note||"—")
+    });
   }catch{}
   return json({ok:true,request:data},201);
 }
 
-async function requestStatus(url:URL){
-  const k=String(url.searchParams.get("requester_key")||"");
-  if(!/^[A-Za-z0-9_-]{20,100}$/.test(k)) return json({error:"invalid key"},400);
-  const {data,error}=await db.from("content_requests")
+async function requestStatus(url:URL,req:Request){
+  const auth=await userFromRequest(req);
+  const k=String(url.searchParams.get("requester_key")||auth?.user?.id||"");
+  if(!auth&&!/^[A-Za-z0-9_-]{20,100}$/.test(k))return json({error:"invalid key"},400);
+
+  let query:any=db.from("content_requests")
     .select("request_code,request_type,title,status,created_at,updated_at,linked_entity_type,linked_entity_id")
-    .eq("requester_key",k).order("created_at",{ascending:false}).limit(20);
+    .order("created_at",{ascending:false}).limit(30);
+  if(auth?.user?.id){
+    const uid=String(auth.user.id);
+    query=query.or("user_id.eq."+uid+",requester_key.eq."+uid);
+  }else query=query.eq("requester_key",k);
+
+  const {data,error}=await query;
   if(error)throw error;
   const rows:any[]=data??[];
   const out=[];
@@ -6668,7 +6685,9 @@ async function requestStatus(url:URL){
     let linked:any=null;
     if(row.status==="added"&&row.linked_entity_id&&["movie","series"].includes(row.linked_entity_type)){
       const table=row.linked_entity_type==="movie"?"movies":"series";
-      const {data:item}=await db.from(table).select("id,public_id,title,status").eq("id",row.linked_entity_id).maybeSingle();
+      let itemQuery:any=db.from(table).select("id,public_id,title,status").eq("id",row.linked_entity_id);
+      if(row.linked_entity_type==="series")itemQuery=itemQuery.eq("ingestion_status","ready");
+      const {data:item}=await itemQuery.maybeSingle();
       if(item?.status==="published")linked={type:row.linked_entity_type,id:item.id,public_id:item.public_id,title:item.title};
     }
     out.push({...row,linked});
@@ -6678,22 +6697,32 @@ async function requestStatus(url:URL){
 
 async function publicReport(req:Request){
   const b=await req.json().catch(()=>null);
-  if(!b) return json({error:"invalid body"},400);
-  const reporter=String(b.reporter_key||"").trim();
+  if(!b)return json({error:"invalid body"},400);
+  const auth=await userFromRequest(req);
+  const reporter=String(b.reporter_key||auth?.user?.id||"").trim();
   const type=String(b.entity_type||"");
   const publicId=String(b.entity_public_id||"").trim().slice(0,40);
   const reason=String(b.reason||"").trim().slice(0,160);
-  const details=String(b.details||"").trim().slice(0,800);
-  if(!/^[A-Za-z0-9_-]{20,100}$/.test(reporter)||!["movie","series","episode","other"].includes(type)||reason.length<2) return json({error:"invalid report"},400);
-  const allowed=await consumeRateLimit(reporter,"report",10,60*60);
+  const details=String(b.details||"").trim().slice(0,1200);
+  const diagnostics=(b.diagnostics&&typeof b.diagnostics==="object")?b.diagnostics:{};
+  if(!/^[A-Za-z0-9_-]{20,100}$/.test(reporter)||!["movie","series","episode","other"].includes(type)||reason.length<2)return json({error:"invalid report"},400);
+  const limiter=auth?.user?.id?"user:"+auth.user.id:reporter;
+  const allowed=await consumeRateLimit(limiter,"report",10,60*60);
   if(!allowed)return json({error:"report limit reached"},429);
+  const detailText=details+(Object.keys(diagnostics).length
+    ?"\n\nDiagnostics: "+JSON.stringify(diagnostics).slice(0,1000)
+    :"");
   const {data,error}=await db.from("reports").insert({
-    reporter_key:reporter,entity_type:type,entity_public_id:publicId,reason,details,
+    reporter_key:reporter,user_id:auth?.user?.id||null,
+    entity_type:type,entity_public_id:publicId,reason,details:detailText.slice(0,1800),
   }).select("report_code,status,created_at").single();
-  if(error) throw error;
+  if(error)throw error;
   try{
     const ch=await channel("reports");
-    await tg("sendMessage",{chat_id:ch.telegram_channel_id,text:`بلاغ جديد\n${data.report_code}\nID: ${publicId||"—"}\nالسبب: ${reason}\nالتفاصيل: ${details||"—"}`});
+    await tg("sendMessage",{chat_id:ch.telegram_channel_id,text:
+      "بلاغ جديد\n"+data.report_code+"\nID: "+(publicId||"—")+
+      "\nالسبب: "+reason+"\nالتفاصيل: "+(detailText||"—")
+    });
   }catch{}
   return json({ok:true,report:data},201);
 }
@@ -6749,7 +6778,7 @@ Deno.serve(async(req:Request)=>{
     if(action==="progress"&&(req.method==="GET"||req.method==="POST")) return progressApi(req);
     if(action==="watch_history"&&req.method==="GET") return watchHistoryApi(req);
     if(req.method==="POST"&&action==="request_content") return publicRequest(req);
-    if(req.method==="GET"&&action==="request_status") return requestStatus(url);
+    if(req.method==="GET"&&action==="request_status") return requestStatus(url,req);
     if(req.method==="POST"&&action==="report") return publicReport(req);
 
     const mt=url.searchParams.get("media"),id=url.searchParams.get("id");
