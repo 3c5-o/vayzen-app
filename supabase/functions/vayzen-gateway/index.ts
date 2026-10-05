@@ -1,4 +1,16 @@
 import { createClient } from "npm:@supabase/supabase-js@2.95.0";
+import {
+  asXtreamArray,
+  categoryMap,
+  classifyCountry,
+  extractCatalogYear,
+  identityKey,
+  normalizeCatalogTitle,
+  qualityFromName,
+  validateXtreamCredentials,
+  xtreamRequest,
+  type XtreamCredentials,
+} from "./xtream.ts";
 
 const MAX_VIDEO_MB = 2000;
 const MAX_VIDEO_BYTES = MAX_VIDEO_MB * 1024 * 1024;
