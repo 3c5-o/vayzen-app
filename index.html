@@ -166,9 +166,14 @@
           <div class="chips" id="movieChips"></div>
           <select class="filter-select" id="movieCountryFilter" aria-label="فلترة الأفلام حسب الدولة"><option value="">كل الدول</option></select>
           <select class="filter-select" id="movieYearFilter" aria-label="فلترة الأفلام حسب السنة"><option value="">كل السنوات</option></select>
+          <select class="filter-select" id="movieSort" aria-label="ترتيب الأفلام">
+            <option value="latest">الأحدث</option><option value="popular">الأكثر مشاهدة</option>
+            <option value="rating">الأعلى تقييمًا</option><option value="year">الأحدث سنة</option>
+          </select>
         </div>
       </div>
       <div class="grid cinematic-grid" id="moviesGrid"></div>
+      <div class="catalog-more"><button class="btn secondary hidden" id="loadMoreMovies">تحميل المزيد</button></div>
     </section>
 
     <section class="page catalog-page" data-page="series">
@@ -182,9 +187,14 @@
           <div class="chips" id="seriesChips"></div>
           <select class="filter-select" id="seriesCountryFilter" aria-label="فلترة المسلسلات حسب الدولة"><option value="">كل الدول</option></select>
           <select class="filter-select" id="seriesYearFilter" aria-label="فلترة المسلسلات حسب السنة"><option value="">كل السنوات</option></select>
+          <select class="filter-select" id="seriesSort" aria-label="ترتيب المسلسلات">
+            <option value="latest">الأحدث</option><option value="popular">الأكثر مشاهدة</option>
+            <option value="rating">الأعلى تقييمًا</option><option value="year">الأحدث سنة</option>
+          </select>
         </div>
       </div>
       <div class="grid cinematic-grid" id="seriesGrid"></div>
+      <div class="catalog-more"><button class="btn secondary hidden" id="loadMoreSeries">تحميل المزيد</button></div>
     </section>
 
     <section class="page search-page" data-page="search">
@@ -193,6 +203,7 @@
         <div class="catalog-count"><b id="searchCount">0</b><span>نتيجة</span></div>
       </div>
       <div class="grid cinematic-grid search-grid" id="searchResultsGrid"></div>
+      <div class="catalog-more"><button class="btn secondary hidden" id="loadMoreSearch">تحميل نتائج أكثر</button></div>
     </section>
 
     <section class="page" data-page="mylist">
