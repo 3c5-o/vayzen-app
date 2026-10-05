@@ -895,7 +895,7 @@ $("#recoveryPasswordForm").addEventListener("submit",async e=>{
     showToast("تم تحديث كلمة المرور. سجل الدخول من جديد");
     openAuth("login");
   }catch(err){showToast(err.message)}finally{btn.disabled=false}
-};
+});
 $("#registerForm").addEventListener("submit",async e=>{
   e.preventDefault();
   const pass=$("#registerPassword").value,confirm=$("#registerConfirm").value;
