@@ -632,16 +632,57 @@ async function consumeRateLimit(key:string,action:string,limit:number,windowSeco
   return true;
 }
 
+type TelegramBridgeConfig={url:string;secret:string;botSecret:string};
+let telegramBridgeCache:{expires:number,value:TelegramBridgeConfig}|null=null;
+
+async function telegramBridgeConfig():Promise<TelegramBridgeConfig>{
+  if(telegramBridgeCache&&telegramBridgeCache.expires>Date.now())return telegramBridgeCache.value;
+  const {data}=await db.from("app_settings").select("value").eq("key","telegram_bridge").maybeSingle();
+  const value:any=data?.value||{};
+  const cfg={
+    url:String(value.url||"").replace(/\/$/,""),
+    secret:String(value.secret||""),
+    botSecret:String(value.bot_secret||BOT_SECRET||""),
+  };
+  telegramBridgeCache={expires:Date.now()+60_000,value:cfg};
+  return cfg;
+}
+
+async function telegramBotSecret(){
+  const cfg=await telegramBridgeConfig();
+  return cfg.botSecret||BOT_SECRET;
+}
+
 async function tg(method:string,body:Record<string,unknown>){
-  if(!BOT_TOKEN) throw new Error("Telegram bot token is not configured");
-  const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`,{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify(body),
-  });
+  let r:Response;
+  if(BOT_TOKEN){
+    r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`,{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(body),
+    });
+  }else{
+    const bridge=await telegramBridgeConfig();
+    if(!bridge.url||!bridge.secret)throw new Error("Telegram bridge is not configured");
+    r=await fetch(`${bridge.url}/telegram/${encodeURIComponent(method)}`,{
+      method:"POST",
+      headers:{"Content-Type":"application/json","x-vayzen-edge-secret":bridge.secret},
+      body:JSON.stringify(body),
+    });
+  }
   const j=await r.json();
   if(!r.ok||!j.ok) throw new Error(j?.description||"Telegram API error");
   return j.result;
+}
+
+async function tgFile(filePath:string){
+  if(BOT_TOKEN)return fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`);
+  const bridge=await telegramBridgeConfig();
+  if(!bridge.url||!bridge.secret)throw new Error("Telegram bridge is not configured");
+  const safePath=filePath.split("/").map(encodeURIComponent).join("/");
+  return fetch(`${bridge.url}/telegram/file/${safePath}`,{
+    headers:{"x-vayzen-edge-secret":bridge.secret},
+  });
 }
 
 
@@ -2710,7 +2751,18 @@ async function tgUploadDocument(chatId:number|string,bytes:Uint8Array,fileName:s
   form.append("chat_id",String(chatId));
   form.append("caption",caption.slice(0,1000));
   form.append("document",new Blob([new Uint8Array(bytes).buffer],{type:"application/json"}),fileName);
-  const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`,{method:"POST",body:form});
+  let r:Response;
+  if(BOT_TOKEN){
+    r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`,{method:"POST",body:form});
+  }else{
+    const bridge=await telegramBridgeConfig();
+    if(!bridge.url||!bridge.secret)throw new Error("Telegram bridge is not configured");
+    r=await fetch(`${bridge.url}/telegram/sendDocument`,{
+      method:"POST",
+      headers:{"x-vayzen-edge-secret":bridge.secret},
+      body:form,
+    });
+  }
   const j=await r.json().catch(()=>null);
   if(!r.ok||!j?.ok)throw new Error(String(j?.description||`Telegram HTTP ${r.status}`));
   return j.result;
@@ -4437,7 +4489,7 @@ async function media(type:string,id:string,req?:Request){
   if(!a) return json({error:"not found"},404);
   if(!a.telegram_file_id) return json({error:"telegram file id missing"},409);
   const file=await tg("getFile",{file_id:a.telegram_file_id});
-  const upstream=await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
+  const upstream=await tgFile(String(file.file_path||""));
   const headers=new Headers(cors);
   const isSubtitle=type==="movie_subtitle"||type==="episode_subtitle";
   if(isSubtitle){
@@ -4937,9 +4989,10 @@ Deno.serve(async(req:Request)=>{
       });
     }
     if(req.method==="GET"&&url.searchParams.has("setup")){
-      if(!BOT_SECRET||url.searchParams.get("setup")!==BOT_SECRET) return json({error:"unauthorized"},401);
+      const currentBotSecret=await telegramBotSecret();
+      if(!currentBotSecret||url.searchParams.get("setup")!==currentBotSecret) return json({error:"unauthorized"},401);
       const webhook=`${SUPABASE_URL}/functions/v1/vayzen-gateway`;
-      const r=await tg("setWebhook",{url:webhook,secret_token:BOT_SECRET,allowed_updates:["message","callback_query"],drop_pending_updates:true});
+      const r=await tg("setWebhook",{url:webhook,secret_token:currentBotSecret,allowed_updates:["message","callback_query"],drop_pending_updates:true});
       return json({ok:true,webhook,telegram:r});
     }
     const action=url.searchParams.get("action");
@@ -4973,7 +5026,8 @@ Deno.serve(async(req:Request)=>{
     if(req.method==="GET"&&mt&&id) return media(mt,id,req);
 
     if(req.method!=="POST") return json({error:"method not allowed"},405);
-    if(!BOT_SECRET||req.headers.get("x-telegram-bot-api-secret-token")!==BOT_SECRET) return json({error:"bad webhook signature"},403);
+    const currentBotSecret=await telegramBotSecret();
+    if(!currentBotSecret||req.headers.get("x-telegram-bot-api-secret-token")!==currentBotSecret) return json({error:"bad webhook signature"},403);
 
     const u=await req.json();
     if(u.callback_query) await callback(u.callback_query);
