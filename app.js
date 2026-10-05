@@ -5,8 +5,15 @@ const DEVICE_KEY="vayzen.device";
 const GUEST_PROGRESS_KEY="vayzen.guest.progress";
 
 const state={
-  movies:[],series:[],favorites:[],progress:[],watchHistory:[],user:null,session:null,
-  query:"",movieGenre:"",seriesGenre:"",movieYear:"",seriesYear:"",movieCountry:"",seriesCountry:"",currentPage:"home",detail:null,detailVariant:"",player:null,nextEpisode:null,searchReturnPage:"home",
+  movies:[],series:[],moviePageItems:[],seriesPageItems:[],searchResults:[],
+  favorites:[],progress:[],watchHistory:[],user:null,session:null,
+  query:"",movieGenre:"",seriesGenre:"",movieYear:"",seriesYear:"",movieCountry:"",seriesCountry:"",
+  movieSort:"latest",seriesSort:"latest",
+  moviePage:1,seriesPage:1,searchPage:1,movieTotal:0,seriesTotal:0,searchTotal:0,
+  movieHasMore:false,seriesHasMore:false,searchHasMore:false,
+  catalogLoading:{movie:false,series:false,search:false},
+  facets:{movie:{genres:[],years:[],countries:[]},series:{genres:[],years:[],countries:[]}},
+  currentPage:"home",detail:null,detailVariant:"",player:null,nextEpisode:null,searchReturnPage:"home",
   heroItems:[],heroIndex:0,
   prefs:{autoplayNext:true,saveProgress:true}
 };
@@ -113,6 +120,12 @@ function percent(type,id){
   const p=progressFor(type,id);
   if(!p||!Number(p.duration_seconds))return 0;
   return Math.max(0,Math.min(100,Number(p.position_seconds)/Number(p.duration_seconds)*100));
+}
+function mergeCatalogCache(type,items){
+  const key=type==="movie"?"movies":"series";
+  const map=new Map(state[key].map(x=>[x.id,x]));
+  for(const item of items||[])if(item?.id)map.set(item.id,{...(map.get(item.id)||{}),...item});
+  state[key]=[...map.values()];
 }
 function itemBy(type,id){return (type==="movie"?state.movies:state.series).find(x=>x.id===id)}
 
